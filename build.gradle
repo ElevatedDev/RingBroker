@@ -1,0 +1,98 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.google.protobuf' version '0.9.4'
+    id 'io.freefair.lombok' version '8.4'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group   = 'io.ringbroker'
+version = '0.1.0-SNAPSHOT'
+
+/* ----------  JVM  ---------- */
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withJavadocJar()
+    withSourcesJar()
+}
+
+application {
+    // for Gradle 7.1+ use:
+    mainClass.set("io.ringbroker.BrokerMain")
+}
+
+/* ----------  Repos & Versions ---------- */
+repositories { mavenCentral() }
+
+ext {
+    grpcVersion = '1.63.0'
+    protobufVersion = '3.25.3'
+    jacksonVersion = '2.17.0'
+    picocliVersion = '4.7.5'
+}
+
+/* ----------  Dependencies ---------- */
+dependencies {
+    // gRPC and Protobuf
+    implementation "io.grpc:grpc-netty-shaded:$grpcVersion"
+    implementation "io.grpc:grpc-stub:$grpcVersion"
+    implementation "io.grpc:grpc-protobuf:$grpcVersion"
+    implementation "com.google.protobuf:protobuf-java:$protobufVersion"
+
+    // Lombok (enabled via plugin)
+    compileOnly "org.projectlombok:lombok"
+    annotationProcessor "org.projectlombok:lombok"
+
+    // Jackson YAML for config parsing
+    implementation "com.fasterxml.jackson.core:jackson-databind:$jacksonVersion"
+    implementation "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:$jacksonVersion"
+
+    // Picocli CLI support
+    implementation "info.picocli:picocli:$picocliVersion"
+    annotationProcessor "info.picocli:picocli-codegen:$picocliVersion"
+
+    // SLF4J API (you can choose a backend like logback)
+    implementation 'org.slf4j:slf4j-api:2.0.9'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.9' // or use logback/log4j instead
+
+    // JUnit 5
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    compileOnly   'javax.annotation:javax.annotation-api:1.3.2'
+}
+
+/* ----------  Protobuf / gRPC code‑gen ---------- */
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:${protobufVersion}" }
+    plugins {
+        grpc { artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}" }
+    }
+    generateProtoTasks {
+        all().each { task ->
+            task.plugins { grpc {} }
+        }
+    }
+}
+
+/* ----------  Application entry‑point ---------- */
+application {
+    mainClass = 'io.ringbroker.BrokerMain'
+}
+
+/* ----------  Tests ---------- */
+test {
+    useJUnitPlatform()
+    jvmArgs '--enable-preview'
+}
+
+/* ----------  Jar manifest ---------- */
+jar {
+    manifest {
+        attributes(
+                'Implementation-Title': 'RingBroker',
+                'Implementation-Version': version,
+                'Main-Class': application.mainClass
+        )
+    }
+}

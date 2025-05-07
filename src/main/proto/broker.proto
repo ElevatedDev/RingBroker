@@ -1,0 +1,92 @@
+syntax = "proto3";
+package io.ringbroker.api;
+
+option java_package = "io.ringbroker.api";
+option java_outer_classname = "BrokerApi";
+
+service Broker {
+  // Core RPCs
+  rpc Publish(Message)                  returns (PublishReply);
+  rpc CommitOffset(CommitRequest)       returns (CommitAck);
+  rpc FetchCommitted(CommittedRequest)  returns (CommittedReply);
+  rpc Fetch(FetchRequest)               returns (FetchReply);
+
+  // Topic-management RPCs
+  rpc CreateTopic(TopicRequest)         returns (TopicReply);
+  rpc DeleteTopic(TopicRequest)         returns (TopicReply);
+  rpc ListTopics(Empty)                 returns (TopicListReply);
+  rpc DescribeTopic(TopicRequest)       returns (TopicDescriptionReply);
+
+  // Server-streaming RPC
+  rpc SubscribeTopic(SubscribeRequest)  returns (stream MessageEvent);
+}
+
+message Empty {}
+
+message TopicRequest {
+  string topic = 1;
+}
+message TopicReply {
+  bool success = 1;
+  string error = 2;
+}
+message TopicListReply {
+  repeated string topics = 1;
+}
+message TopicDescriptionReply {
+  string topic      = 1;
+  int32  partitions = 2;
+  string error      = 3;
+}
+
+message Message {
+  string topic   = 1;
+  int32  retries = 2;
+  bytes  payload = 3;
+  bytes  key     = 4;
+}
+message PublishReply {
+  bool success = 1;
+  string error = 2;
+}
+
+message CommitRequest {
+  string topic    = 1;
+  string group    = 2;
+  int32  partition = 3;
+  int64  offset   = 4;
+}
+message CommitAck {
+  bool success = 1;
+}
+message CommittedRequest {
+  string topic    = 1;
+  string group    = 2;
+  int32  partition = 3;
+}
+message CommittedReply {
+  int64 offset = 1;
+}
+
+message SubscribeRequest {
+  string topic  = 1;
+  string group  = 2;
+  int64  offset = 3;
+}
+message MessageEvent {
+  string topic   = 1;
+  int64  offset  = 2;
+  bytes  key     = 3;
+  bytes  payload = 4;
+}
+
+message FetchRequest {
+  string topic    = 1;
+  string group    = 2;
+  int32  partition = 3;
+  int64  offset    = 4;
+  int32  maxMessages = 5;
+}
+message FetchReply {
+  repeated MessageEvent messages = 1;
+}

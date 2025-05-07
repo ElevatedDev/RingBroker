@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+option java_multiple_files = false;
+option java_package = "io.ringbroker.transport";
+option java_outer_classname = "RemoteBrokerServiceProto";
+
+import "google/protobuf/empty.proto";
+
+// gRPC service definition for forwarding messages between broker nodes
+service RemoteBrokerService {
+  // Forward a message to a remote broker
+  rpc forwardMessage (ForwardRequest) returns (ForwardResponse);
+}
+
+// Request message for forwarding topic messages
+message ForwardRequest {
+  // Topic name
+  string topic = 1;
+  // Optional message key
+  bytes key = 2;
+  // Message payload
+  bytes payload = 3;
+}
+
+// Response message acknowledging receipt of a forwarded message
+message ForwardResponse {
+  // Whether the forward was successful
+  bool success = 1;
+}
