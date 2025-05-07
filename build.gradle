@@ -77,7 +77,7 @@ protobuf {
 
 /* ----------  Application entry‑point ---------- */
 application {
-    mainClass = 'io.ringbroker.BrokerMain'
+    mainClass = 'io.ringbroker.Application'
 }
 
 /* ----------  Tests ---------- */
