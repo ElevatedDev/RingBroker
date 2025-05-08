@@ -10,10 +10,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Multi-producer, single-consumer ring buffer.
+ *
  * @param <E> the type of entry stored in the ring
  */
 public final class RingBuffer<E> {
     private static final VarHandle ARRAY_HANDLE;
+
     static {
         try {
             ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(Object[].class);
@@ -29,7 +31,7 @@ public final class RingBuffer<E> {
     private final AtomicLong claim = new AtomicLong(-1);    // last claimed sequence (for producers)
 
     /**
-     * @param size power-of-two number of slots in the buffer
+     * @param size         power-of-two number of slots in the buffer
      * @param waitStrategy strategy for consumer wait/notification
      */
     public RingBuffer(final int size, final WaitStrategy waitStrategy) {
@@ -54,7 +56,7 @@ public final class RingBuffer<E> {
      * Publish an entry at the given sequence.
      * This makes the entry visible to the consumer.
      *
-     * @param seq the sequence obtained from {@link #next()}
+     * @param seq   the sequence obtained from {@link #next()}
      * @param entry the entry to publish
      */
     public void publish(final long seq, final E entry) {
@@ -83,7 +85,9 @@ public final class RingBuffer<E> {
         return (E) ARRAY_HANDLE.getAcquire(entries, (int) (seq & mask));
     }
 
-    /** @return the highest published sequence in the ring buffer. */
+    /**
+     * @return the highest published sequence in the ring buffer.
+     */
     public long getCursor() {
         return cursor.getValue();
     }

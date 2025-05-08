@@ -2,21 +2,22 @@ package io.ringbroker;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors.Descriptor;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.ringbroker.broker.ingress.ClusteredIngress;
+import io.ringbroker.cluster.NettyClusterClient;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
 import io.ringbroker.cluster.type.Partitioner;
 import io.ringbroker.cluster.type.RemoteBrokerClient;
-import io.ringbroker.config.impl.TopicConfig;
 import io.ringbroker.config.impl.BrokerConfig;
+import io.ringbroker.config.impl.TopicConfig;
 import io.ringbroker.config.type.ConfigLoader;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.registry.TopicRegistry;
-import io.ringbroker.transport.GrpcTransport;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.ringbroker.transport.RemoteBrokerServiceGrpc;
 import io.ringbroker.transport.RemoteBrokerServiceProto;
+import io.ringbroker.transport.type.NettyTransport;
 import lombok.extern.slf4j.Slf4j;
 import org.yaml.snakeyaml.Yaml;
 
@@ -81,7 +82,7 @@ public class Application {
                     if (!nid.equals(cfg.getNodeId())) {
                         final String host = (String) node.get("host");
                         final Integer port = (Integer) node.get("port");
-                        clusterNodes.put(nid, new GrpcRemoteBrokerClient(host, port));
+                        clusterNodes.put(nid, new NettyClusterClient(host, port));
                     }
                 }
             }
@@ -109,39 +110,14 @@ public class Application {
         );
 
         // Start gRPC transport
-        final GrpcTransport grpc = new GrpcTransport(
+        final NettyTransport transport = new NettyTransport(
                 cfg.getGrpcPort(),
                 ingress,
                 store,
                 registry
         );
-        grpc.start();
+        transport.start();
 
         log.info("RingBroker started on gRPC port {}", cfg.getGrpcPort());
-    }
-
-    /**
-     * gRPC-backed implementation of RemoteBrokerClient.
-     */
-    private static class GrpcRemoteBrokerClient implements RemoteBrokerClient {
-        private final ManagedChannel channel;
-        private final RemoteBrokerServiceGrpc.RemoteBrokerServiceBlockingStub stub;
-
-        public GrpcRemoteBrokerClient(final String host, final int port) {
-            this.channel = ManagedChannelBuilder.forAddress(host, port)
-                    .usePlaintext()
-                    .build();
-            this.stub = RemoteBrokerServiceGrpc.newBlockingStub(channel);
-        }
-
-        @Override
-        public void sendMessage(final String topic, final byte[] key, final byte[] payload) {
-            final RemoteBrokerServiceProto.ForwardRequest req = RemoteBrokerServiceProto.ForwardRequest.newBuilder()
-                    .setTopic(topic)
-                    .setKey(ByteString.copyFrom(key))
-                    .setPayload(ByteString.copyFrom(payload))
-                    .build();
-            stub.forwardMessage(req);
-        }
     }
 }

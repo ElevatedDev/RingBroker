@@ -1,0 +1,7 @@
+# conf/broker.yaml
+grpcPort: 9090
+ringSize: 131072       # must be a power of two
+ledgerPath: ledger.seg
+segmentBytes: 134217728    # 128 MiB
+topicsFile: conf/topics.yaml
+ingressThreads: 8

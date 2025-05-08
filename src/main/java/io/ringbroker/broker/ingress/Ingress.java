@@ -9,8 +9,12 @@ import lombok.RequiredArgsConstructor;
 import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Batched ingress with DLQ + schema validation preserved.
@@ -26,11 +30,6 @@ public final class Ingress {
     private final int batchSize;
     private final BlockingQueue<Task> queue = new LinkedBlockingQueue<>();
 
-    private static final class Task {
-        final byte[] payload;
-        Task(final byte[] payload) { this.payload = payload; }
-    }
-
     /**
      * Same signature plus batchSize.
      */
@@ -43,13 +42,20 @@ public final class Ingress {
         final ExecutorService exec = Executors.newFixedThreadPool(
                 threads, Thread.ofVirtual().factory());
 
-        final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int)segmentSize);
+        final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
         final Ingress ingress = new Ingress(registry, ring, mgr, exec, batchSize);
 
         for (int i = 0; i < threads; i++) {
             exec.submit(ingress::writerLoop);
         }
         return ingress;
+    }
+
+    /**
+     * Convenience for non-retry calls
+     */
+    public void publish(final String topic, final byte[] payload) {
+        publish(topic, 0, payload);
     }
 
     @PostConstruct
@@ -84,12 +90,9 @@ public final class Ingress {
         queue.add(new Task(rawPayload));
     }
 
-    /** Convenience for non-retry calls */
-    public void publish(final String topic, final byte[] payload) {
-        publish(topic, 0, payload);
-    }
-
-    /** Writer loop: batch disk writes + ring publishes */
+    /**
+     * Writer loop: batch disk writes + ring publishes
+     */
     private void writerLoop() {
         final List<Task> batch = new ArrayList<>(batchSize);
         try {
@@ -117,6 +120,14 @@ public final class Ingress {
             Thread.currentThread().interrupt();
         } catch (final IOException ioe) {
             ioe.printStackTrace();
+        }
+    }
+
+    private static final class Task {
+        final byte[] payload;
+
+        Task(final byte[] payload) {
+            this.payload = payload;
         }
     }
 }

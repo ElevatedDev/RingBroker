@@ -3,7 +3,9 @@ package io.ringbroker.core.wait;
 import io.ringbroker.core.barrier.Barrier;
 import io.ringbroker.core.sequence.Sequence;
 
-/** Balanced wait strategy that blocks the consumer thread when idle to reduce CPU usage. */
+/**
+ * Balanced wait strategy that blocks the consumer thread when idle to reduce CPU usage.
+ */
 public final class Blocking implements WaitStrategy {
 
     @Override

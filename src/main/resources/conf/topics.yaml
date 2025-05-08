@@ -1,0 +1,6 @@
+# conf/topics.yaml
+- topic: orders/created
+  proto: demo.events.EventsProto.OrderCreated
+
+- topic: orders/cancelled
+  proto: demo.events.EventsProto.OrderCancelled

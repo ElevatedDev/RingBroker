@@ -1,254 +1,128 @@
 # RingBroker
 
-RingBroker is a high-performance, partitioned message broker combining an in-memory ring buffer with a persistent append-only log. It delivers exceptional throughput on commodity hardware, guarantees crash-safe durability, and supports seamless clustering—all with minimal operational overhead.
-
----
-
-## Why RingBroker
-
-- **Cheapest Solution vs Results**
-  By far the cheapest solution for your money, as it requires no external resources, and is self managed to the last byte, no KRaft, no ZooKeeper.
-
-- **Speed**
-  Completely outpaces Kafka on single shard/single partition, and gaps it even further when introducing clusters and more refined segment management.
-
-- **gRPC Based**
-  Even though the broker itself is based in Java, everything is wrapped through gRPC to offer its API to almost any modern programming language, with managed TSL certificates for connections.
-
-- **Easy to use**
-  Virtually everything is already managed by the initial configuration, you avoid extremely complex broker configurations and you get better performance than the other brokers.
-
-- **Scales Linearly**
-  RingBuffer architecture -- refering to Disruptor-like architecture scales Linearly with Node Clusters and Partitions, giving you the best possible processing speed for your hardware.
+RingBroker is a high-performance, partitioned message broker designed for efficient and reliable messaging using a combined in-memory ring buffer and persistent append-only log architecture. It achieves exceptional throughput on standard hardware while providing robust durability, scalability through clustering, and message deduplication capabilities. RingBroker is especially suitable for applications requiring high throughput, low latency, and strong guarantees around message persistence and delivery.
 
 ## Key Features
 
-- **High Throughput & Low Latency**  
-  Disruptor-style ring buffer plus batched disk writes, achieving millions of msgs/sec and sub-millisecond in-memory latencies.
+- **High Throughput and Low Latency:**  
+  Leverages a Disruptor-style ring buffer, achieving millions of messages per second with minimal latency and overhead.
 
-- **Scalable Partitioning**  
-  Pluggable partitioners (round-robin, key-based) enable linear horizontal scaling across N nodes.
+- **Scalable Partitioning:**  
+  Supports configurable partitioning strategies including round-robin and key-based partitioning, allowing for linear horizontal scaling.
 
-- **Crash-Safe Durability**  
-  Append-only segment files with CRC32 checksums and batch flushing, automatic recovery on restart.
+- **Robust Data Durability:**  
+  Implements durability with CRC32 checksums, batch-based disk writes, and automatic crash recovery mechanisms, ensuring data integrity.
 
-- **Built-in Clustering**  
-  YAML-driven clusterNodes list; cross-node partition ownership and gRPC forwarding require no external coordination service.
+- **Clustering Support:**  
+  Provides clustering capabilities for distributed operation, enabling partition ownership management and inter-node replication.
 
-- **Idempotent Delivery**  
-  Optional dedup tracking per partition for exactly-once semantics (critical in financial/audit scenarios).
+- **Idempotent Message Delivery:**  
+  Optional deduplication feature ensures exactly-once delivery semantics, preventing duplicate message processing.
 
-- **gRPC-Protobuf APIs**  
-  Unified publish/subscribe, pull (Fetch), offset commit/fetch, and admin endpoints via gRPC; generates idiomatic Java/Go/Python clients.
+- **Comprehensive gRPC API Suite:**  
+  Includes APIs for publishing and subscribing to messages, administrative tasks (topic creation/deletion), and schema management.
 
-- **Lean & Cost-Effective**  
-  Pure-Java, zero-dependency broker—no ZK, no extra license—reducing hardware and operational costs compared to typical Kafka deployments.
+- **Minimal External Dependencies:**  
+  Lightweight, pure-Java implementation with minimal external dependencies, simplifying deployment and integration.
 
 ---
 
 ## Architectural Overview
 
+RingBroker's architecture consists of several core components:
+
+- **Clustered Ingress:** Handles incoming messages, determining the appropriate partition and node (local or remote).
+- **PartitionContext:** Manages individual partitions, incorporating a ring buffer for message handling and LedgerOrchestrator for persistence.
+- **LedgerOrchestrator:** Manages durable storage, using append-only logs with CRC32 checksums and ensuring data integrity through recovery procedures.
+- **Delivery Threads:** Utilize virtual threads for efficient message delivery to consumers and replication pipelines without significant overhead.
+
 ```
 Producers ──▶ ClusteredIngress ──▶ PartitionContext ──▶ RingBuffer & Ledger ──▶ Consumers
 ```
-
-1. **ClusteredIngress**  
-   Routes each message to its partition owner (local vs remote) and forwards via gRPC when needed.  
-2. **PartitionContext**  
-   Uses a ring buffer for fast in-memory enqueue and dedicated writer thread for batched disk appends.  
-3. **LedgerOrchestrator**  
-   Manages segment files, checksums, and recovery logic.  
-4. **Delivery**  
-   Virtual threads and non-blocking backpressure deliver messages per-partition to subscribers.
-
----
-
-## Benchmarks
-
-**Test Environment:** Dell laptop, Intel i7 Ultra 1.40 GHz, 16 cores/22 threads, SSD
-
-| Broker          | Producer Throughput | Consumer Throughput | Notes                                                      |
-|------------------|---------------------|----------------------|-------------------------------------------------------------|
-| **RingBroker**    | 5.46 M msg/s        | 3.21 M msg/s         | 16 partitions, 8 writer threads, batch=4096, disk-backed    |
-| Apache Kafka     | ~1–3 M msg/s        | ~1–2 M msg/s         | JVM-based; OS page cache; millisecond-level tail latencies  |
-| Redpanda         | ~2–3 M msg/s        | ~2–3 M msg/s         | Native C++; zero-GC; io_uring; lower tail latency           |
-| NATS JetStream   | ~0.16 M msg/s       | ~0.16 M msg/s        | Go; durable mode; low latency over peak throughput          |
-
-> **Cost & Ops:** RingBroker runs with zero external dependencies—no ZK, no extra license—reducing hardware and operational costs compared to typical Kafka deployments.
 
 ---
 
 ## Getting Started
 
-### Prerequisites
+### Building from Source
 
-- Java 21+
-- `protoc` compiler (for regenerating stubs if needed)
-- Gradle (optional) or use the provided `gradlew`
-
-### Build & Run
-
-1. **Clone and build**
+Clone the repository and build using Gradle:
 
 ```bash
-git clone https://github.com/ElevatedDev/RingBroker.git
-cd RingBroker
+git clone https://github.com/ElevatedDev/ringbroker.git
+cd ringbroker
 ./gradlew clean build
 ```
 
-2. **Prepare configuration** (e.g. `broker.yaml`):
+### Running RingBroker
 
-```yaml
-grpcPort:       9090
-clusterSize:    3
-nodeId:         0
-totalPartitions: 16
-ringSize:       1048576      # 1 << 20
-segmentBytes:   134217728    # 128 MB
-ingressThreads: 8
-batchSize:      4096
-idempotentMode: true
-ledgerPath:     /var/lib/ringbroker/data
-topicsFile:     topics.yaml
-clusterNodes:
-  - id: 0
-    host: broker-0.example.com
-    port: 9090
-  - id: 1
-    host: broker-1.example.com
-    port: 9090
-  - id: 2
-    host: broker-2.example.com
-    port: 9090
-```
-
-3. **Define topics** in `topics.yaml`:
-
-```yaml
-topics:
-  - name: orders/created
-    protoClass: com.example.events.OrderCreatedProto
-```
-
-4. **Launch broker**
+Configure via environment variables:
 
 ```bash
-java -jar build/libs/ringbroker.jar broker.yaml
+export BROKER_PORT=9090
+export CLUSTER_SIZE=1
+export NODE_ID=0
+export TOTAL_PARTITIONS=8
+export RING_SIZE=262144
+export SEGMENT_SIZE=536870912
+export WRITER_THREADS=4
+export BATCH_SIZE=1024
+export IDEMPOTENT_MODE=false
+export INITIAL_TOPICS="orders/created,orders/created.DLQ"
+
+java -jar build/libs/ringbroker.jar
 ```
 
 ---
 
 ## API Usage Examples
 
-### Publish (gRPC)
+### Publishing a Message (Java)
 
 ```java
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.ringbroker.api.BrokerApi;
-import io.ringbroker.api.BrokerGrpc;
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+    .usePlaintext().build();
+BrokerGrpc.BrokerBlockingStub client = BrokerGrpc.newBlockingStub(channel);
 
-var channel = ManagedChannelBuilder.forAddress("localhost", 9090)
-    .usePlaintext()
-    .build();
-
-var stub = BrokerGrpc.newBlockingStub(channel);
-
-var msg = BrokerApi.Message.newBuilder()
-    .setTopic("orders/created")
-    .setRetries(0)
-    .setPayload(yourProtoMsg.toByteArray())
-    .setKey(ByteString.copyFromUtf8("order-123"))
-    .build();
-
-var reply = stub.publish(msg);
-System.out.println("Published: " + reply.getSuccess());
-```
-
-### Subscribe (streaming) - for low throughput easy use.
-
-```java
-import io.grpc.stub.StreamObserver;
-import io.ringbroker.api.BrokerApi;
-import io.ringbroker.api.BrokerGrpc;
-
-var asyncStub = BrokerGrpc.newStub(channel);
-
-asyncStub.subscribeTopic(
-    BrokerApi.SubscribeRequest.newBuilder()
+PublishReply reply = client.publish(
+    Message.newBuilder()
         .setTopic("orders/created")
-        .setGroup("consumer-group-1")
-        .build(),
-    new StreamObserver<BrokerApi.MessageEvent>() {
-        public void onNext(BrokerApi.MessageEvent ev) {
-            // process ev.getPayload().toByteArray()
-        }
-        public void onError(Throwable t) {
-            t.printStackTrace();
-        }
-        public void onCompleted() {
-            System.out.println("Stream completed");
-        }
-    }
-);
-```
-
-### Fetch (pull API) -- Near symmetrical consume/produce - no latency
-
-```java
-var fetchReq = BrokerApi.FetchRequest.newBuilder()
-    .setTopic("orders/created")
-    .setGroup("consumer-group-1")
-    .setPartition(0)
-    .setOffset(0)
-    .setMaxMessages(100)
-    .build();
-
-var fetchReply = stub.fetch(fetchReq);
-for (var ev : fetchReply.getMessagesList()) {
-    // handle ev.getPayload()
-}
-```
-
-### Commit & Query Offsets
-
-```java
-stub.commitOffset(
-    BrokerApi.CommitRequest.newBuilder()
-        .setTopic("orders/created")
-        .setGroup("consumer-group-1")
-        .setPartition(0)
-        .setOffset(latestOffset)
+        .setRetries(0)
+        .setKey(ByteString.copyFromUtf8("order-123"))
+        .setPayload(yourPayload)
         .build()
 );
-
-var committed = stub.fetchCommitted(
-    BrokerApi.CommittedRequest.newBuilder()
-        .setTopic("orders/created")
-        .setGroup("consumer-group-1")
-        .setPartition(0)
-        .build()
-);
-System.out.println("Committed offset: " + committed.getOffset());
+System.out.println("Publish successful: " + reply.getSuccess());
 ```
 
-### Topic Management
+### Admin API: Topic Management
 
 ```java
-var adminStub = BrokerGrpc.newBlockingStub(channel);
+AdminGrpc.AdminBlockingStub admin = AdminGrpc.newBlockingStub(channel);
 
-// Create
-var createReply = adminStub.createTopic(
-    BrokerApi.TopicRequest.newBuilder()
+admin.createTopic(
+    CreateTopicRequest.newBuilder()
         .setTopic("events/log")
+        .setPartitions(16)
+        .build()
+);
+```
+
+### Schema Registry: Registering and Fetching Schemas
+
+```java
+SchemaRegistryGrpc.SchemaRegistryBlockingStub schemaClient =
+    SchemaRegistryGrpc.newBlockingStub(channel);
+
+schemaClient.registerSchema(
+    RegisterSchemaRequest.newBuilder()
+        .setTopic("orders/created")
+        .setSchema(descriptorBytes)
         .build()
 );
 
-// Delete
-var deleteReply = adminStub.deleteTopic(
-    BrokerApi.TopicRequest.newBuilder()
-        .setTopic("events/log")
-        .build()
+GetSchemaResponse response = schemaClient.getSchema(
+    GetSchemaRequest.newBuilder().setTopic("orders/created").build()
 );
 ```
 
@@ -256,27 +130,18 @@ var deleteReply = adminStub.deleteTopic(
 
 ## Configuration Reference
 
-| Property            | Type    | Required | Description                                 |
-|---------------------|---------|----------|---------------------------------------------|
-| `grpcPort`          | int     | yes      | gRPC listen port                            |
-| `clusterSize`       | int     | yes      | Total nodes in cluster                      |
-| `nodeId`            | int     | yes      | This node’s unique ID (0 ≤ nodeId < clusterSize) |
-| `totalPartitions`   | int     | yes      | Total partitions across cluster             |
-| `ringSize`          | int     | yes      | In-memory ring buffer size per partition    |
-| `segmentBytes`      | long    | yes      | Disk segment file size (bytes)              |
-| `ingressThreads`    | int     | yes      | Writer threads per partition                |
-| `batchSize`         | int     | yes      | Messages per disk write batch               |
-| `idempotentMode`    | boolean | yes      | Enable exactly-once deduplication           |
-| `ledgerPath`        | string  | yes      | Filesystem path for on-disk segments        |
-| `topicsFile`        | string  | yes      | Path to `topics.yaml`                       |
-| `clusterNodes`      | list    | no       | List of `{id,host,port}` for each broker    |
+| Variable           | Default      | Description                                              |
+|--------------------|--------------|----------------------------------------------------------|
+| `BROKER_PORT`      | `9090`       | gRPC server port                                         |
+| `CLUSTER_SIZE`     | `1`          | Number of nodes in the broker cluster                    |
+| `NODE_ID`          | `0`          | Unique identifier for this broker node                   |
+| `TOTAL_PARTITIONS` | `8`          | Total partitions available in the cluster                |
+| `KEY_PARTITIONING` | `false`      | Partitioning strategy (key-based or round-robin)         |
+| `RING_SIZE`        | `262144`     | Size of each partition's ring buffer                     |
+| `SEGMENT_SIZE`     | `536870912`  | Size of disk segments for persistence                    |
+| `WRITER_THREADS`   | `4`          | Threads for disk write operations per partition          |
+| `BATCH_SIZE`       | `1024`       | Number of messages per disk write batch                  |
+| `IDEMPOTENT_MODE`  | `false`      | Enables or disables message deduplication                |
+| `INITIAL_TOPICS`   | (empty)      | Comma-separated list of topics to initialize on startup  |
 
----
-
-## License
-
-GPU © ElevatedDev — see [LICENSE](LICENSE)
-
----
-
-_Repo: https://github.com/ElevatedDev/RingBroker_
+RingBroker combines the performance advantages of in-memory systems with the durability and reliability of traditional persistent message brokers, offering an optimal solution for demanding messaging scenarios.

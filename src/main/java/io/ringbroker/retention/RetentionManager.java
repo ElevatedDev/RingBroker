@@ -4,28 +4,30 @@ import io.ringbroker.ledger.constant.LedgerConstant;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
-import java.time.*;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Background job that periodically:
- *  - Deletes segment files older than `maxAge`
- *  - Ensures total bytes per topic <= `maxBytes` by oldest-first deletion
+ * - Deletes segment files older than `maxAge`
+ * - Ensures total bytes per topic <= `maxBytes` by oldest-first deletion
  */
 @Slf4j
 @Deprecated
 public final class RetentionManager {
     private final Path baseDir;
     private final Duration maxAge;
-    private final long     maxBytes;
+    private final long maxBytes;
 
     public RetentionManager(final Path baseDir, final Duration maxAge, final long maxBytes) {
         this.baseDir = baseDir;
-        this.maxAge  = maxAge;
+        this.maxAge = maxAge;
         this.maxBytes = maxBytes;
     }
 

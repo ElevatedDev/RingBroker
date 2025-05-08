@@ -16,17 +16,20 @@ import java.util.zip.CRC32C;
 /**
  * A single append-only, memory-mapped log segment.
  * Header layout (little-endian):
- *   [MAGIC(4)] [VERSION(2)] [CRC(4)] [firstOffset(8)] [lastOffset(8)]
+ * [MAGIC(4)] [VERSION(2)] [CRC(4)] [firstOffset(8)] [lastOffset(8)]
  */
 @Slf4j
 public final class LedgerSegment implements AutoCloseable {
     private static final int HEADER_SIZE = 4 + 2 + 4 + 8 + 8;
 
     private final Path file;
-    @Getter private final int capacity;
+    @Getter
+    private final int capacity;
     private final MappedByteBuffer buf;
-    @Getter private long firstOffset;
-    @Getter private long lastOffset;
+    @Getter
+    private long firstOffset;
+    @Getter
+    private long lastOffset;
 
     public static LedgerSegment create(final Path file, final int capacity) throws IOException {
         try (final FileChannel ch = FileChannel.open(file,
@@ -79,7 +82,9 @@ public final class LedgerSegment implements AutoCloseable {
         readHeader();
     }
 
-    /** Append a single record (uses shared header update). */
+    /**
+     * Append a single record (uses shared header update).
+     */
     public synchronized long append(final byte[] data) throws IOException {
         final int required = Integer.BYTES + data.length;
         if (buf.position() + required > capacity) {
@@ -91,7 +96,9 @@ public final class LedgerSegment implements AutoCloseable {
         return offset;
     }
 
-    /** New: append a batch of records in one go (one CRC + force). */
+    /**
+     * New: append a batch of records in one go (one CRC + force).
+     */
     public synchronized long[] appendBatch(final java.util.List<byte[]> msgs) throws IOException {
         final int total = msgs.stream().mapToInt(b -> Integer.BYTES + b.length).sum();
         final int pos = buf.position();
@@ -140,11 +147,13 @@ public final class LedgerSegment implements AutoCloseable {
         }
 
         firstOffset = buf.getLong();
-        lastOffset  = buf.getLong();
+        lastOffset = buf.getLong();
         buf.position(Math.max(HEADER_SIZE, buf.position()));
     }
 
-    /** Shared helper: rewrite lastOffset + CRC, then restore buffer pos. */
+    /**
+     * Shared helper: rewrite lastOffset + CRC, then restore buffer pos.
+     */
     private void updateHeaderCrcAndOffset(final long offset) {
         final int payloadPos = buf.position();                // remember write pos
 

@@ -3,7 +3,9 @@ package io.ringbroker.core.wait;
 import io.ringbroker.core.barrier.Barrier;
 import io.ringbroker.core.sequence.Sequence;
 
-/** Wait-strategy abstraction. */
+/**
+ * Wait-strategy abstraction.
+ */
 public sealed interface WaitStrategy
         permits BusySpin, Blocking, AdaptiveSpin {
 
@@ -13,6 +15,8 @@ public sealed interface WaitStrategy
     long await(long seq, Sequence cursor, Barrier barrier)
             throws InterruptedException;
 
-    /** Wake up any threads blocked in await(). */
+    /**
+     * Wake up any threads blocked in await().
+     */
     void signalAll();
 }

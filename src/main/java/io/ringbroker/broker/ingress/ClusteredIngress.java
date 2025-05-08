@@ -97,12 +97,16 @@ public final class ClusteredIngress {
         );
     }
 
-    /** Publishes a message (non-retry shortcut). */
+    /**
+     * Publishes a message (non-retry shortcut).
+     */
     public void publish(final String topic, final byte[] key, final byte[] payload) {
         publish(topic, key, 0, payload);
     }
 
-    /** Full publish entry point with retries, dedup, and forwarding. */
+    /**
+     * Full publish entry point with retries, dedup, and forwarding.
+     */
     public void publish(final String topic, final byte[] key, final int retries, final byte[] payload) {
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
         final int owner = Math.floorMod(partitionId, clusterSize);
@@ -134,7 +138,9 @@ public final class ClusteredIngress {
         }
     }
 
-    /** Subscribes to a topic across all owned partitions, starting from committed offset. */
+    /**
+     * Subscribes to a topic across all owned partitions, starting from committed offset.
+     */
     public void subscribeTopic(final String topic,
                                final String group,
                                final BiConsumer<Long, byte[]> handler) {

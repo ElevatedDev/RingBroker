@@ -23,14 +23,18 @@ public final class Barrier {
      * Check if an alert has been raised.
      */
     @Getter
-    private volatile boolean  alerted;
+    private volatile boolean alerted;
 
-    /** Called by the RingBuffer consumer to wait for a sequence. */
+    /**
+     * Called by the RingBuffer consumer to wait for a sequence.
+     */
     public long waitFor(final long seq) throws InterruptedException {
         return waitStrategy.await(seq, cursor, this);
     }
 
-    /** Called by producers to wake up any blocked consumer. */
+    /**
+     * Called by producers to wake up any blocked consumer.
+     */
     public void signal() {
         lock.lock();
         try {
@@ -41,13 +45,17 @@ public final class Barrier {
         // No need to call waitStrategy.signalAll(); wait strategies either don't block or use this Barrier.
     }
 
-    /** Mark as alerted and wake up waiters. */
+    /**
+     * Mark as alerted and wake up waiters.
+     */
     public void alert() {
         alerted = true;
         signal();
     }
 
-    /** Called by wait strategies to block the consumer thread. */
+    /**
+     * Called by wait strategies to block the consumer thread.
+     */
     public void block() throws InterruptedException {
         lock.lock();
         try {

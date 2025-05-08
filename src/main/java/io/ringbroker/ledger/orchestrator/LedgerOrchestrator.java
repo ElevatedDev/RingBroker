@@ -1,7 +1,7 @@
 package io.ringbroker.ledger.orchestrator;
 
-import io.ringbroker.ledger.segment.LedgerSegment;
 import io.ringbroker.ledger.constant.LedgerConstant;
+import io.ringbroker.ledger.segment.LedgerSegment;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NonNull;
@@ -21,19 +21,25 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
-import static java.nio.file.StandardOpenOption.*;
+import static java.nio.file.StandardOpenOption.READ;
+import static java.nio.file.StandardOpenOption.WRITE;
 
 @Slf4j
 @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
 public final class LedgerOrchestrator {
-    @NonNull private final Path dir;
-    @Getter private final int segmentSize;
-    @Getter private final long highWaterMark;
+    @NonNull
+    private final Path dir;
+    @Getter
+    private final int segmentSize;
+    @Getter
+    private final long highWaterMark;
 
     // thread-safe holder of the current active segment
     private final AtomicReference<LedgerSegment> active = new AtomicReference<>();
 
-    /** Scan or create the directory, recover HWM, pick the tail segment. */
+    /**
+     * Scan or create the directory, recover HWM, pick the tail segment.
+     */
     public static LedgerOrchestrator bootstrap(@NonNull final Path dir,
                                                final int segmentSize) throws IOException {
         Files.createDirectories(dir);
@@ -72,7 +78,9 @@ public final class LedgerOrchestrator {
         return mgr;
     }
 
-    /** Return current segment or roll to a new one if full. */
+    /**
+     * Return current segment or roll to a new one if full.
+     */
     public LedgerSegment writable() throws IOException {
         final LedgerSegment seg = active.get();
         if (seg == null || seg.isFull()) {

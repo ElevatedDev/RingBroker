@@ -18,26 +18,28 @@ import java.util.stream.Collectors;
  */
 public final class ConfigLoader {
 
-    /** Delegates to BrokerConfig.load(...) */
+    /**
+     * Delegates to BrokerConfig.load(...)
+     */
     public static BrokerConfig load(final String path) throws IOException {
         return BrokerConfig.load(path);
     }
 
     /**
      * Expects a YAML file structured as:
-     *
+     * <p>
      * topics:
-     *   - name: some/topic
-     *     protoClass: com.example.ProtoClass
-     *   - name: other/topic
-     *     protoClass: com.example.OtherProto
+     * - name: some/topic
+     * protoClass: com.example.ProtoClass
+     * - name: other/topic
+     * protoClass: com.example.OtherProto
      */
     @SuppressWarnings("unchecked")
     public static List<TopicConfig> loadTopics(final String path) throws IOException {
         final Yaml yaml = new Yaml();
         try (final InputStream in = Files.newInputStream(Paths.get(path))) {
-            final Map<String,Object> root = yaml.load(in);
-            final var list = (List<Map<String,Object>>) root.get("topics");
+            final Map<String, Object> root = yaml.load(in);
+            final var list = (List<Map<String, Object>>) root.get("topics");
             return list.stream()
                     .map(m -> new TopicConfig(
                             (String) m.get("name"),

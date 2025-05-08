@@ -26,24 +26,26 @@ public final class BrokerConfig {
     private int batchSize;
     private boolean idempotentMode;
 
-    /** Load from a YAML file at the given path. */
+    /**
+     * Load from a YAML file at the given path.
+     */
     @SuppressWarnings("unchecked")
     public static BrokerConfig load(final String path) throws IOException {
         final Yaml yaml = new Yaml();
         try (final InputStream in = Files.newInputStream(Paths.get(path))) {
-            final Map<String,Object> map = yaml.load(in);
+            final Map<String, Object> map = yaml.load(in);
             final BrokerConfig cfg = new BrokerConfig();
-            cfg.grpcPort = (Integer)   map.get("grpcPort");
-            cfg.topicsFile = (String)    map.get("topicsFile");
-            cfg.totalPartitions = (Integer)   map.get("totalPartitions");
-            cfg.nodeId  = (Integer)   map.get("nodeId");
-            cfg.clusterSize  = (Integer)   map.get("clusterSize");
-            cfg.ledgerPath = (String)    map.get("ledgerPath");
-            cfg.ringSize  = (Integer)   map.get("ringSize");
-            cfg.segmentBytes = (Integer)   map.get("segmentBytes");
-            cfg.ingressThreads = (Integer)   map.get("ingressThreads");
-            cfg.batchSize = (Integer)   map.get("batchSize");
-            cfg.idempotentMode = (Boolean)   map.get("idempotentMode");
+            cfg.grpcPort = (Integer) map.get("grpcPort");
+            cfg.topicsFile = (String) map.get("topicsFile");
+            cfg.totalPartitions = (Integer) map.get("totalPartitions");
+            cfg.nodeId = (Integer) map.get("nodeId");
+            cfg.clusterSize = (Integer) map.get("clusterSize");
+            cfg.ledgerPath = (String) map.get("ledgerPath");
+            cfg.ringSize = (Integer) map.get("ringSize");
+            cfg.segmentBytes = (Integer) map.get("segmentBytes");
+            cfg.ingressThreads = (Integer) map.get("ingressThreads");
+            cfg.batchSize = (Integer) map.get("batchSize");
+            cfg.idempotentMode = (Boolean) map.get("idempotentMode");
             return cfg;
         }
     }
