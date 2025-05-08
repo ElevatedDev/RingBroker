@@ -22,25 +22,6 @@ message Envelope {
   }
 }
 
-
-message Empty {}
-
-message TopicRequest {
-  string topic = 1;
-}
-message TopicReply {
-  bool success = 1;
-  string error = 2;
-}
-message TopicListReply {
-  repeated string topics = 1;
-}
-message TopicDescriptionReply {
-  string topic = 1;
-  int32  partitions = 2;
-  string error = 3;
-}
-
 message Message {
   string topic = 1;
   int32  retries = 2;
@@ -93,7 +74,6 @@ message FetchRequest {
 message BatchMessage {
   repeated Message messages = 1;
 }
-
 
 message FetchReply {
   repeated MessageEvent messages = 1;

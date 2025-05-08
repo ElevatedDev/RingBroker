@@ -113,8 +113,7 @@ public class Application {
         final NettyTransport transport = new NettyTransport(
                 cfg.getGrpcPort(),
                 ingress,
-                store,
-                registry
+                store
         );
         transport.start();
 

@@ -6,6 +6,7 @@ import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.WaitStrategy;
+import io.ringbroker.grpc.server.GrpcAdminServer;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;
@@ -71,8 +72,11 @@ public final class TestMain {
         );
 
         // 3) Start our raw-TCP transport
-        final NettyTransport tcpTransport = new NettyTransport(9090, ingress, offsetStore, registry);
+        final NettyTransport tcpTransport = new NettyTransport(9090, ingress, offsetStore);
+        final GrpcAdminServer grpcAdminServer = new GrpcAdminServer(7676, registry);
+
         tcpTransport.start();
+        grpcAdminServer.start();
 
         // 4) Prepare client
         final RawTcpClient client = new RawTcpClient("localhost", 9090);
@@ -207,6 +211,7 @@ public final class TestMain {
         // === Cleanup ===
         client.close();
         tcpTransport.stop();
+        grpcAdminServer.stop();
         log.info("=== Benchmark complete ===");
     }
 }

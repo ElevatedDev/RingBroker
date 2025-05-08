@@ -24,7 +24,6 @@ public class NettyTransport {
     private final int port;
     private final ClusteredIngress ingress;
     private final OffsetStore offsetStore;
-    private final TopicRegistry registry;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;

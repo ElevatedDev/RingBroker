@@ -1,0 +1,39 @@
+syntax = "proto3";
+package io.ringbroker.api;
+
+import "google/protobuf/descriptor.proto";
+
+option java_package = "io.ringbroker.api";
+option java_outer_classname = "TopicAdminApi";
+
+message TopicRequest {
+  string topic = 1;
+}
+
+message TopicReply {
+  bool success = 1;
+  string error = 2;
+}
+
+message TopicListReply {
+  repeated string topics = 1;
+}
+
+message TopicDescriptionReply {
+  string topic = 1;
+  int32  partitions = 2;
+  string error = 3;
+}
+
+message CreateTopicRequest {
+  string topic = 1;
+  google.protobuf.DescriptorProto schema = 2;
+}
+
+service TopicAdminService {
+  rpc CreateTopic(CreateTopicRequest) returns (TopicReply);
+  rpc ListTopics(Empty) returns (TopicListReply);
+  rpc DescribeTopic(TopicRequest) returns (TopicDescriptionReply);
+}
+
+message Empty {}
