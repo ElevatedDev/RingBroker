@@ -34,7 +34,7 @@ public final class TestMain {
     private static final long SEG_BYTES = 128L << 20;
     private static final int WRITER_THREADS = 8;
     private static final int BATCH_SIZE = 12000;
-    private static final long TOTAL_MESSAGES = 10_000_000L;
+    private static final long TOTAL_MESSAGES = 50_000_000L;
     private static final String TOPIC = "orders/created";
     private static final Path DATA = Paths.get("data");
     private static final String SUB_GROUP = "sub-benchmark";
@@ -73,10 +73,8 @@ public final class TestMain {
 
         // 3) Start our raw-TCP transport
         final NettyTransport tcpTransport = new NettyTransport(9090, ingress, offsetStore);
-        final GrpcAdminServer grpcAdminServer = new GrpcAdminServer(7676, registry);
 
         tcpTransport.start();
-        grpcAdminServer.start();
 
         // 4) Prepare client
         final RawTcpClient client = new RawTcpClient("localhost", 9090);
@@ -208,10 +206,9 @@ public final class TestMain {
             ));
         }
 
-        // === Cleanup ===
+        // Cleanup 
         client.close();
         tcpTransport.stop();
-        grpcAdminServer.stop();
         log.info("=== Benchmark complete ===");
     }
 }
