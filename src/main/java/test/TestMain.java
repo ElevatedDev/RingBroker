@@ -206,7 +206,7 @@ public final class TestMain {
             ));
         }
 
-        // Cleanup 
+        // Cleanup
         client.close();
         tcpTransport.stop();
         log.info("=== Benchmark complete ===");

@@ -13,7 +13,7 @@ public class GrpcAdminServer {
     private final TopicRegistry topicRegistry;
     private Server server;
 
-    public GrpcAdminServer(int port, TopicRegistry topicRegistry) {
+    public GrpcAdminServer(final int port, final TopicRegistry topicRegistry) {
         this.port = port;
         this.topicRegistry = topicRegistry;
     }

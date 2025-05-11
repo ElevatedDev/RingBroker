@@ -38,7 +38,7 @@ public class NettyTransport {
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(final SocketChannel ch) {
-                        ChannelPipeline p = ch.pipeline();
+                        final ChannelPipeline p = ch.pipeline();
                         p.addLast(new FlushConsolidationHandler(256, true));
                         // inbound: split the byte stream into frames
                         p.addLast(new ProtobufVarint32FrameDecoder());

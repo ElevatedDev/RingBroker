@@ -36,11 +36,11 @@ public final class Ingress {
     private final byte[][] batchBuf;
     private final ByteBatch batchView;
 
-    private Ingress(TopicRegistry registry,
-                    RingBuffer<byte[]> ring,
-                    LedgerOrchestrator segments,
-                    ExecutorService pool,
-                    int batchSize) {
+    private Ingress(final TopicRegistry registry,
+                    final RingBuffer<byte[]> ring,
+                    final LedgerOrchestrator segments,
+                    final ExecutorService pool,
+                    final int batchSize) {
 
         this.registry = registry;
         this.ring = ring;
@@ -48,24 +48,24 @@ public final class Ingress {
         this.pool = pool;
         this.batchSize = batchSize;
 
-        int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
+        final int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
         this.queue = new SlotRing(capacity);
         this.batchBuf = new byte[batchSize][];
         this.batchView = new ByteBatch(batchBuf);          // same instance reused
     }
 
-    public static Ingress create(TopicRegistry registry,
-                                 RingBuffer<byte[]> ring,
-                                 Path dataDir,
-                                 long segmentSize,
-                                 int threads,
-                                 int batchSize) throws IOException {
+    public static Ingress create(final TopicRegistry registry,
+                                 final RingBuffer<byte[]> ring,
+                                 final Path dataDir,
+                                 final long segmentSize,
+                                 final int threads,
+                                 final int batchSize) throws IOException {
 
-        ExecutorService exec = Executors.newFixedThreadPool(
+        final ExecutorService exec = Executors.newFixedThreadPool(
                 threads, Thread.ofVirtual().factory());
 
-        LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
-        Ingress ingress = new Ingress(registry, ring, mgr, exec, batchSize);
+        final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
+        final Ingress ingress = new Ingress(registry, ring, mgr, exec, batchSize);
 
         /* start writer(s) */
         for (int i = 0; i < threads; i++) {
@@ -74,22 +74,22 @@ public final class Ingress {
         return ingress;
     }
 
-    private static int nextPowerOfTwo(int x) {
-        int highest = Integer.highestOneBit(x);
+    private static int nextPowerOfTwo(final int x) {
+        final int highest = Integer.highestOneBit(x);
         return (x == highest) ? x : highest << 1;
     }
 
     /**
      * Convenience wrapper (no retries).
      */
-    public void publish(String topic, byte[] payload) {
+    public void publish(final String topic, final byte[] payload) {
         publish(topic, 0, payload);
     }
 
     /**
      * Validate topic, route to DLQ if needed, schema-check, then enqueue.
      */
-    public void publish(String topic, int retries, byte[] rawPayload) {
+    public void publish(final String topic, final int retries, final byte[] rawPayload) {
         // 1) validate base topic
         if (!registry.contains(topic)) throw new IllegalArgumentException("topic not registered: " + topic);
 
@@ -100,7 +100,7 @@ public final class Ingress {
         // 3) schema-validate
         try {
             DynamicMessage.parseFrom(registry.descriptor(outTopic), rawPayload);
-        } catch (Exception ex) {
+        } catch (final Exception ex) {
             outTopic = topic + ".DLQ";
             if (!registry.contains(outTopic)) throw new IllegalArgumentException("DLQ not registered: " + outTopic);
         }
@@ -130,7 +130,7 @@ public final class Ingress {
                 batchBuf[count++] = first;
 
                 while (count < batchSize) {
-                    byte[] next = queue.poll();
+                    final byte[] next = queue.poll();
                     if (next == null) break;
                     batchBuf[count++] = next;
                 }
@@ -143,12 +143,12 @@ public final class Ingress {
 
                 /* 5) publish to downstream ring */
                 for (int i = 0; i < count; i++) {
-                    long seq = ring.next();
+                    final long seq = ring.next();
                     ring.publish(seq, batchBuf[i]);
                     batchBuf[i] = null;
                 }
             }
-        } catch (IOException ioe) {
+        } catch (final IOException ioe) {
             ioe.printStackTrace();
         }
     }
@@ -164,7 +164,7 @@ public final class Ingress {
         private final AtomicLong tail = new AtomicLong(0); // producers
         private final AtomicLong head = new AtomicLong(0); // consumers
 
-        SlotRing(int capacityPow2) {
+        SlotRing(final int capacityPow2) {
             this.mask = capacityPow2 - 1;
             this.buffer = new AtomicReferenceArray<>(capacityPow2);
         }
@@ -172,15 +172,15 @@ public final class Ingress {
         /**
          * returns false if full
          */
-        boolean offer(byte[] e) {
+        boolean offer(final byte[] e) {
             long t;
             for (; ; ) {
                 t = tail.get();
-                long wrapPoint = t - buffer.length();
+                final long wrapPoint = t - buffer.length();
                 if (head.get() <= wrapPoint) return false;
                 if (tail.compareAndSet(t, t + 1)) break;
             }
-            int idx = (int) t & mask;
+            final int idx = (int) t & mask;
             buffer.lazySet(idx, e);
             return true;
         }
@@ -195,7 +195,7 @@ public final class Ingress {
                 if (h >= tail.get()) return null;
                 if (head.compareAndSet(h, h + 1)) break;
             }
-            int idx = (int) h & mask;
+            final int idx = (int) h & mask;
             return buffer.getAndSet(idx, null);                                           // may briefly be null (benign)
         }
     }
@@ -208,12 +208,12 @@ public final class Ingress {
         private final byte[][] backing;
         @Setter private int size;
 
-        ByteBatch(byte[][] backing) {
+        ByteBatch(final byte[][] backing) {
             this.backing = backing;
         }
 
         @Override
-        public byte[] get(int index) {
+        public byte[] get(final int index) {
             if (index >= size) throw new IndexOutOfBoundsException();
             return backing[index];
         }

@@ -32,17 +32,17 @@ public class RawTcpClient implements AutoCloseable {
     private final ClientHandler handler = new ClientHandler(inflight);
     private int writeCounter = 0;
 
-    public RawTcpClient(String host, int port) throws InterruptedException {
+    public RawTcpClient(final String host, final int port) throws InterruptedException {
         group = new NioEventLoopGroup(1);
-        Bootstrap b = new Bootstrap()
+        final Bootstrap b = new Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .handler(new ChannelInitializer<Channel>() {
                     @Override
-                    protected void initChannel(Channel ch) {
-                        ChannelPipeline p = ch.pipeline();
+                    protected void initChannel(final Channel ch) {
+                        final ChannelPipeline p = ch.pipeline();
                         // Inbound: split by varint32 length prefix
                         p.addLast(new ProtobufVarint32FrameDecoder());
                         // Inbound: decode bytes into Envelope messages
@@ -69,11 +69,11 @@ public class RawTcpClient implements AutoCloseable {
     }
 
     private CompletableFuture<BrokerApi.Envelope> sendEnv(BrokerApi.Envelope env) {
-        long id = nextCorr.longValue();
+        final long id = nextCorr.longValue();
         nextCorr.increment();
         env = env.toBuilder().setCorrelationId(id).build();
 
-        CompletableFuture<BrokerApi.Envelope> fut = new CompletableFuture<>();
+        final CompletableFuture<BrokerApi.Envelope> fut = new CompletableFuture<>();
         inflight.put(id, fut);
 
         channel.write(env);
@@ -84,12 +84,12 @@ public class RawTcpClient implements AutoCloseable {
     /**
      * 1) Publish one message
      */
-    public CompletableFuture<Void> publishAsync(BrokerApi.Message msg) {
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+    public CompletableFuture<Void> publishAsync(final BrokerApi.Message msg) {
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setPublish(msg)
                 .build();
         return sendEnv(env).thenCompose(reply -> {
-            var ack = reply.getPublishReply();
+            final var ack = reply.getPublishReply();
             if (ack.getSuccess()) return CompletableFuture.completedFuture(null);
             else return CompletableFuture.failedFuture(
                     new RuntimeException("publish failed: " + ack.getError())
@@ -100,12 +100,12 @@ public class RawTcpClient implements AutoCloseable {
     /**
      * 2) Publish a batch of messages
      */
-    public CompletableFuture<Void> publishBatchAsync(List<BrokerApi.Message> msgs) {
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+    public CompletableFuture<Void> publishBatchAsync(final List<BrokerApi.Message> msgs) {
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setBatch(BrokerApi.BatchMessage.newBuilder().addAllMessages(msgs))
                 .build();
         return sendEnv(env).thenCompose(reply -> {
-            var ack = reply.getPublishReply();
+            final var ack = reply.getPublishReply();
             if (ack.getSuccess()) return CompletableFuture.completedFuture(null);
             else return CompletableFuture.failedFuture(
                     new RuntimeException("batch failed: " + ack.getError())
@@ -117,9 +117,9 @@ public class RawTcpClient implements AutoCloseable {
      * 3) Fetch up to maxMsgs from (topic,partition,offset)
      */
     public CompletableFuture<List<BrokerApi.MessageEvent>> fetchAsync(
-            String topic, int partition, long offset, int maxMsgs
+            final String topic, final int partition, final long offset, final int maxMsgs
     ) {
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setFetch(BrokerApi.FetchRequest.newBuilder()
                         .setTopic(topic)
                         .setPartition(partition)
@@ -134,9 +134,9 @@ public class RawTcpClient implements AutoCloseable {
      * 4) Commit an offset
      */
     public CompletableFuture<Void> commitAsync(
-            String topic, String group, int partition, long offset
+            final String topic, final String group, final int partition, final long offset
     ) {
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setCommit(BrokerApi.CommitRequest.newBuilder()
                         .setTopic(topic)
                         .setGroup(group)
@@ -150,9 +150,9 @@ public class RawTcpClient implements AutoCloseable {
      * 5) Get committed offset
      */
     public CompletableFuture<Long> fetchCommittedAsync(
-            String topic, String group, int partition
+            final String topic, final String group, final int partition
     ) {
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setCommitted(BrokerApi.CommittedRequest.newBuilder()
                         .setTopic(topic)
                         .setGroup(group)
@@ -166,11 +166,11 @@ public class RawTcpClient implements AutoCloseable {
      * 6) Subscribe: set callback, then send subscribe request
      */
     public void subscribe(
-            String topic, String group,
-            BiConsumer<Long, byte[]> messageHandler
+            final String topic, final String group,
+            final BiConsumer<Long, byte[]> messageHandler
     ) {
         handler.setSubscribeHandler(messageHandler);
-        BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
+        final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
                 .setSubscribe(BrokerApi.SubscribeRequest.newBuilder()
                         .setTopic(topic)
                         .setGroup(group)
@@ -206,22 +206,22 @@ public class RawTcpClient implements AutoCloseable {
         private volatile BiConsumer<Long, byte[]> subscribeHandler = (seq, b) -> {
         };
 
-        ClientHandler(ConcurrentMap<Long, CompletableFuture<BrokerApi.Envelope>> map) {
+        ClientHandler(final ConcurrentMap<Long, CompletableFuture<BrokerApi.Envelope>> map) {
             this.inflight = map;
         }
 
-        void setSubscribeHandler(BiConsumer<Long, byte[]> h) {
+        void setSubscribeHandler(final BiConsumer<Long, byte[]> h) {
             this.subscribeHandler = h;
         }
 
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, BrokerApi.Envelope env) {
+        protected void channelRead0(final ChannelHandlerContext ctx, final BrokerApi.Envelope env) {
             if (env.hasMessageEvent()) {
-                var ev = env.getMessageEvent();
+                final var ev = env.getMessageEvent();
                 subscribeHandler.accept(ev.getOffset(), ev.getPayload().toByteArray());
             }
 
-            long id = env.getCorrelationId();
+            final long id = env.getCorrelationId();
             final CompletableFuture<BrokerApi.Envelope> f = inflight.remove(id);
             if (f != null) {
                 f.complete(env);
@@ -229,7 +229,7 @@ public class RawTcpClient implements AutoCloseable {
         }
 
         @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        public void exceptionCaught(final ChannelHandlerContext ctx, final Throwable cause) {
             ctx.close();
         }
     }

@@ -20,8 +20,8 @@ public class TopicAdminServiceImpl extends TopicAdminServiceGrpc.TopicAdminServi
     private final TopicRegistry topicRegistry;
 
     @Override
-    public void createTopic(TopicAdminApi.CreateTopicRequest request, StreamObserver<TopicAdminApi.TopicReply> responseObserver) {
-        String topic = request.getTopic();
+    public void createTopic(final TopicAdminApi.CreateTopicRequest request, final StreamObserver<TopicAdminApi.TopicReply> responseObserver) {
+        final String topic = request.getTopic();
 
         if (topicRegistry.contains(topic)) {
             responseObserver.onNext(TopicAdminApi.TopicReply.newBuilder()
@@ -35,14 +35,14 @@ public class TopicAdminServiceImpl extends TopicAdminServiceGrpc.TopicAdminServi
             Descriptor descriptor = null;
 
             if (request.hasSchema()) {
-                DescriptorProto proto = request.getSchema();
-                FileDescriptorProto fileProto = FileDescriptorProto.newBuilder()
+                final DescriptorProto proto = request.getSchema();
+                final FileDescriptorProto fileProto = FileDescriptorProto.newBuilder()
                         .addMessageType(proto)
                         .setName("schema_" + topic + ".proto")
                         .setPackage("dynamic")
                         .build();
 
-                FileDescriptor fileDescriptor = FileDescriptor.buildFrom(fileProto, new FileDescriptor[]{});
+                final FileDescriptor fileDescriptor = FileDescriptor.buildFrom(fileProto, new FileDescriptor[]{});
                 descriptor = fileDescriptor.findMessageTypeByName(proto.getName());
             }
 
@@ -51,7 +51,7 @@ public class TopicAdminServiceImpl extends TopicAdminServiceGrpc.TopicAdminServi
             responseObserver.onNext(TopicAdminApi.TopicReply.newBuilder()
                     .setSuccess(true)
                     .build());
-        } catch (Exception e) {
+        } catch (final Exception e) {
             log.error("Failed to register schema for topic {}: {}", topic, e.getMessage(), e);
             responseObserver.onNext(TopicAdminApi.TopicReply.newBuilder()
                     .setSuccess(false)
@@ -63,9 +63,9 @@ public class TopicAdminServiceImpl extends TopicAdminServiceGrpc.TopicAdminServi
     }
 
     @Override
-    public void listTopics(TopicAdminApi.Empty request, StreamObserver<TopicAdminApi.TopicListReply> responseObserver) {
-        Set<String> topics = topicRegistry.listTopics();
-        TopicAdminApi.TopicListReply reply = TopicAdminApi.TopicListReply.newBuilder()
+    public void listTopics(final TopicAdminApi.Empty request, final StreamObserver<TopicAdminApi.TopicListReply> responseObserver) {
+        final Set<String> topics = topicRegistry.listTopics();
+        final TopicAdminApi.TopicListReply reply = TopicAdminApi.TopicListReply.newBuilder()
                 .addAllTopics(topics)
                 .build();
         responseObserver.onNext(reply);
@@ -73,8 +73,8 @@ public class TopicAdminServiceImpl extends TopicAdminServiceGrpc.TopicAdminServi
     }
 
     @Override
-    public void describeTopic(TopicAdminApi.TopicRequest request, StreamObserver<TopicAdminApi.TopicDescriptionReply> responseObserver) {
-        String topic = request.getTopic();
+    public void describeTopic(final TopicAdminApi.TopicRequest request, final StreamObserver<TopicAdminApi.TopicDescriptionReply> responseObserver) {
+        final String topic = request.getTopic();
 
         if (!topicRegistry.contains(topic)) {
             responseObserver.onNext(TopicAdminApi.TopicDescriptionReply.newBuilder()
