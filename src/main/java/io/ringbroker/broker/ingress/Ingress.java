@@ -14,9 +14,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- * Allocation-free, lock-free ingress (no external libs).
+ * Allocation‑free, lock‑free ingress (no external libs).
  */
 public final class Ingress {
     private static final int MAX_RETRIES = 5;
@@ -51,7 +52,7 @@ public final class Ingress {
         final int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
         this.queue = new SlotRing(capacity);
         this.batchBuf = new byte[batchSize][];
-        this.batchView = new ByteBatch(batchBuf);          // same instance reused
+        this.batchView = new ByteBatch(batchBuf);
     }
 
     public static Ingress create(final TopicRegistry registry,
@@ -120,9 +121,11 @@ public final class Ingress {
             while (!Thread.currentThread().isInterrupted()) {
 
                 /* 1) wait for at least one element */
-                byte[] first;
-                while ((first = queue.poll()) == null) {
-                    Thread.onSpinWait();
+                final byte[] first = queue.poll();
+                if (first == null) {
+                    // queue is empty – back off briefly to avoid endless CPU burn
+                    LockSupport.parkNanos(1_000);   // ≈1 µs
+                    continue;
                 }
 
                 /* 2) drain up to batchSize elements in total */
@@ -145,7 +148,7 @@ public final class Ingress {
                 for (int i = 0; i < count; i++) {
                     final long seq = ring.next();
                     ring.publish(seq, batchBuf[i]);
-                    batchBuf[i] = null;
+                    batchBuf[i] = null; // reclaim slot for next batch
                 }
             }
         } catch (final IOException ioe) {
@@ -154,15 +157,15 @@ public final class Ingress {
     }
 
     /*
-     * Allocation-free bounded lock-free multi-producer / multi-consumer queue
+     * Allocation‑free bounded lock‑free multi‑producer / multi‑consumer queue
      * (heavily simplified Vyukov algorithm).
      * Only *one* array of references is allocated once in the constructor.
-    */
+     */
     private static final class SlotRing {
         private final int mask;
         private final AtomicReferenceArray<byte[]> buffer;
-        private final AtomicLong tail = new AtomicLong(0); // producers
-        private final AtomicLong head = new AtomicLong(0); // consumers
+        private final PaddedAtomicLong tail = new PaddedAtomicLong(0); // producers
+        private final PaddedAtomicLong head = new PaddedAtomicLong(0); // consumers
 
         SlotRing(final int capacityPow2) {
             this.mask = capacityPow2 - 1;
@@ -170,40 +173,52 @@ public final class Ingress {
         }
 
         /**
-         * returns false if full
+         * @return false if full
          */
         boolean offer(final byte[] e) {
             long t;
-            for (; ; ) {
+            for (;;) {
                 t = tail.get();
-                final long wrapPoint = t - buffer.length();
-                if (head.get() <= wrapPoint) return false;
+                if (head.get() <= t - buffer.length()) return false; // full
                 if (tail.compareAndSet(t, t + 1)) break;
             }
             final int idx = (int) t & mask;
-            buffer.lazySet(idx, e);
+            buffer.set(idx, e);   // release‑store – consumer can safely read
             return true;
         }
 
         /**
-         * returns null if empty
+         * @return null if empty
          */
         byte[] poll() {
             long h;
-            for (; ; ) {
+            for (;;) {
                 h = head.get();
-                if (h >= tail.get()) return null;
+                if (h >= tail.get()) return null; // empty
                 if (head.compareAndSet(h, h + 1)) break;
             }
             final int idx = (int) h & mask;
-            return buffer.getAndSet(idx, null);                                           // may briefly be null (benign)
+            final byte[] e = buffer.get(idx);      // guaranteed non‑null
+            buffer.lazySet(idx, null);            // clear slot for producers
+            return e;
         }
     }
 
     /*
-     * Tiny reusable List<byte[]> implementation
-     * backed by the reusable batchBuf array.
-    */
+     * Cache‑line‑padded AtomicLong to stop false sharing between head & tail.
+     */
+    @SuppressWarnings("unused")
+    private static final class PaddedAtomicLong extends AtomicLong {
+        // left padding
+        volatile long p1, p2, p3, p4, p5, p6, p7;
+        PaddedAtomicLong(final long initial) { super(initial); }
+        // right padding
+        volatile long q1, q2, q3, q4, q5, q6, q7;
+    }
+
+    /*
+     * Tiny reusable List<byte[]> implementation backed by the reusable batchBuf array.
+     */
     private static final class ByteBatch extends AbstractList<byte[]> {
         private final byte[][] backing;
         @Setter private int size;
