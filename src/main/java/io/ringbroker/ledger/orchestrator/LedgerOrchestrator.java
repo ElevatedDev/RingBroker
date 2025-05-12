@@ -2,10 +2,8 @@ package io.ringbroker.ledger.orchestrator;
 
 import io.ringbroker.ledger.constant.LedgerConstant;
 import io.ringbroker.ledger.segment.LedgerSegment;
-import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NonNull;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.DataInputStream;
@@ -17,128 +15,143 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32;
-import java.util.zip.Checksum;
 
 import static java.nio.file.StandardOpenOption.READ;
 import static java.nio.file.StandardOpenOption.WRITE;
 
+/**
+ * Owns a directory full of segments; rolls and pre‑allocates transparently.
+ */
 @Slf4j
-@RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-public final class LedgerOrchestrator {
-    @NonNull
+public final class LedgerOrchestrator implements AutoCloseable {
+
     private final Path dir;
-    @Getter
-    private final int segmentSize;
-    @Getter
-    private final long highWaterMark;
+    @Getter private final int segmentSize;
+    @Getter private volatile long highWaterMark;
 
-    // thread-safe holder of the current active segment
+    private final ExecutorService allocator =
+            Executors.newSingleThreadExecutor(
+                    Thread.ofVirtual().name("segment-allocator").factory());
+
     private final AtomicReference<LedgerSegment> active = new AtomicReference<>();
+    private Future<LedgerSegment> nextFuture;
 
-    /**
-     * Scan or create the directory, recover HWM, pick the tail segment.
-     */
-    public static LedgerOrchestrator bootstrap(@NonNull final Path dir,
-                                               final int segmentSize) throws IOException {
+    public static LedgerOrchestrator bootstrap(@NonNull final Path dir, final int segmentSize) throws IOException {
         Files.createDirectories(dir);
 
-        // Recover each existing segment file, then open it
-        final List<LedgerSegment> segs = Files.list(dir)
+        // 1. recover & open existing segments
+        final List<LedgerSegment> segments = Files.list(dir)
                 .filter(p -> p.getFileName().toString().endsWith(LedgerConstant.SEGMENT_EXT))
                 .sorted(Comparator.comparing(Path::toString))
-                .peek(path -> {
-                    try {
-                        recoverSegment(path);
-                    } catch (final IOException e) {
-                        throw new RuntimeException("Recovery failed for " + path, e);
-                    }
-                })
-                .map(path -> {
-                    try {
-                        return LedgerSegment.openExisting(path);
-                    } catch (final IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                })
+                .peek(LedgerOrchestrator::recoverSegment)
+                .map(LedgerOrchestrator::openSegment)
                 .sorted(Comparator.comparingLong(LedgerSegment::getFirstOffset))
                 .toList();
 
-        final long hwm = segs.isEmpty()
-                ? 0L
-                : segs.get(segs.size() - 1).getLastOffset();
-
+        final long hwm = segments.isEmpty() ? 0L : segments.getLast().getLastOffset();
         final LedgerOrchestrator mgr = new LedgerOrchestrator(dir, segmentSize, hwm);
-        final LedgerSegment tail = segs.isEmpty()
-                ? mgr.newSegment()
-                : segs.get(segs.size() - 1);
+        final LedgerSegment tail = segments.isEmpty() ? mgr.createSegment() : segments.getLast();
 
         mgr.active.set(tail);
+        mgr.allocateNext();
         return mgr;
     }
 
-    /**
-     * Return current segment or roll to a new one if full.
-     */
+    private LedgerOrchestrator(final Path dir, final int segmentSize, final long hwm) {
+        this.dir = dir; this.segmentSize = segmentSize; this.highWaterMark = hwm;
+    }
+
     public LedgerSegment writable() throws IOException {
-        final LedgerSegment seg = active.get();
+        LedgerSegment seg = active.get();
         if (seg == null || seg.isFull()) {
-            final LedgerSegment next = newSegment();
-            active.set(next);
-            return next;
+            seg = pollNextOrCreate();
+            active.set(seg);
+            highWaterMark = seg.getLastOffset();
+            allocateNext();
         }
         return seg;
     }
 
-    // must synchronize creation to avoid races
-    private synchronized LedgerSegment newSegment() throws IOException {
-        final String name = System.currentTimeMillis() + LedgerConstant.SEGMENT_EXT;
-        final Path p = dir.resolve(name);
-        log.info("Creating new segment {}", p);
-        return LedgerSegment.create(p, segmentSize);
+    private LedgerSegment pollNextOrCreate() throws IOException {
+        if (nextFuture != null && nextFuture.isDone()) {
+            try { return nextFuture.get(); }
+            catch (final Exception e) {
+                log.warn("pre‑allocation failed", e);
+            }
+        }
+        return createSegment();
     }
 
-    private static void recoverSegment(final Path segmentPath) throws IOException {
-        try (final FileChannel channel = FileChannel.open(segmentPath, READ, WRITE);
-             final DataInputStream in = new DataInputStream(Channels.newInputStream(channel))) {
+    private void allocateNext() {
+        nextFuture = allocator.submit(this::createSegment);
+    }
+
+    private synchronized LedgerSegment createSegment() throws IOException {
+        Path p;
+        do {
+            p = dir.resolve(System.currentTimeMillis() + "-" + ThreadLocalRandom.current().nextInt(1_000_000) + LedgerConstant.SEGMENT_EXT);
+        } while (Files.exists(p));
+        log.info("Creating new segment {}", p);
+        return LedgerSegment.create(p, segmentSize, false);
+    }
+
+    private static LedgerSegment openSegment(final Path p) {
+        try {
+            return LedgerSegment.openExisting(p, false);
+        }
+        catch (final IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void recoverSegment(final Path p) {
+        try (final FileChannel ch = FileChannel.open(p, READ, WRITE);
+             final DataInputStream in = new DataInputStream(Channels.newInputStream(ch))) {
 
             long pos = 0L;
+
             while (true) {
-                final int length;
+                final int len;
                 try {
-                    length = in.readInt();
+                    len = in.readInt();
                 } catch (final EOFException eof) {
-                    // clean EOF at record boundary
                     break;
                 }
 
                 final int storedCrc = in.readInt();
+                final byte[] payload = in.readNBytes(len);
 
-                final byte[] payload = new byte[length];
-                final int actuallyRead = in.read(payload);
-                if (actuallyRead < length) {
-                    truncate(channel, pos);
+                if (payload.length < len) {
+                    truncate(ch, pos);
                     break;
                 }
-
-                final Checksum crc = new CRC32();
-                crc.update(payload, 0, length);
+                final CRC32 crc = new CRC32();
+                crc.update(payload, 0, len);
 
                 if ((int) crc.getValue() != storedCrc) {
-                    truncate(channel, pos);
+                    truncate(ch, pos);
                     break;
                 }
 
-                // advance to next record
-                pos += 4 + 4 + length;
+                pos += Integer.BYTES + Integer.BYTES + len;
             }
+        } catch (final IOException e) {
+            throw new RuntimeException("Recovery failed for " + p, e);
         }
     }
 
-    private static void truncate(final FileChannel channel, final long offset) throws IOException {
-        log.warn("Truncating segment {} at offset {}", channel, offset);
-        channel.truncate(offset);
-        channel.force(false);
+    private static void truncate(final FileChannel ch, final long pos) throws IOException {
+        log.warn("Truncating corrupt segment {} at {}", ch, pos);
+        ch.truncate(pos); ch.force(false);
+    }
+
+    @Override
+    public void close() {
+        allocator.shutdownNow();
+        final LedgerSegment seg = active.get();
+        if (seg != null) try { seg.close(); } catch (final Exception ignore) { }
     }
 }

@@ -3,180 +3,220 @@ package io.ringbroker.ledger.segment;
 import io.ringbroker.ledger.constant.LedgerConstant;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import sun.misc.Unsafe;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.EnumSet;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.CRC32;
 import java.util.zip.CRC32C;
 
 /**
- * A single append-only, memory-mapped log segment.
- * Header layout (little-endian):
- * [MAGIC(4)] [VERSION(2)] [CRC(4)] [firstOffset(8)] [lastOffset(8)]
+ * Append-only, memory-mapped segment optimised for single-threaded writers.
  */
 @Slf4j
 public final class LedgerSegment implements AutoCloseable {
-    private static final int HEADER_SIZE = 4 + 2 + 4 + 8 + 8;
 
-    private final Path file;
-    @Getter
-    private final int capacity;
+    /* ── layout ─────────────────────────────────────────────────────────── */
+    private static final int MAGIC_POS          = 0;                               // int  (4)
+    private static final int VERSION_POS        = MAGIC_POS + Integer.BYTES;       // short(2)
+    private static final int CRC_POS            = VERSION_POS + Short.BYTES;       // int  (4)
+    private static final int FIRST_OFFSET_POS   = CRC_POS + Integer.BYTES;         // long (8)
+    private static final int LAST_OFFSET_POS    = FIRST_OFFSET_POS + Long.BYTES;   // long (8)
+
+    private static final int HEADER_SIZE = LAST_OFFSET_POS + Long.BYTES;           // 26 bytes
+
+    private static final Unsafe UNSAFE = initUnsafe();
+    private static long fieldOffset(final java.lang.reflect.Field f) {
+        return UNSAFE.objectFieldOffset(f);
+    }
+
+    private static final long FIRST_OFF_OFFSET;
+    private static final long LAST_OFF_OFFSET;
+    static {
+        try {
+            FIRST_OFF_OFFSET = fieldOffset(LedgerSegment.class.getDeclaredField("firstOffset"));
+            LAST_OFF_OFFSET  = fieldOffset(LedgerSegment.class.getDeclaredField("lastOffset"));
+        } catch (final NoSuchFieldException e) { throw new ExceptionInInitializerError(e); }
+    }
+
+    private static final ThreadLocal<CRC32>  CRC32_TL  = ThreadLocal.withInitial(CRC32::new);
+    private static final ThreadLocal<CRC32C> CRC32C_TL = ThreadLocal.withInitial(CRC32C::new);
+
+    /* ── instance fields ────────────────────────────────────────────────── */
+    @Getter private final Path file;
+    @Getter private final int capacity;
     private final MappedByteBuffer buf;
-    @Getter
-    private long firstOffset;
-    @Getter
-    private long lastOffset;
+    private final boolean skipRecordCrc;
 
-    public static LedgerSegment create(final Path file, final int capacity) throws IOException {
+    @Getter private volatile long firstOffset;
+    @Getter private volatile long lastOffset;
+
+    /* ── factory methods ────────────────────────────────────────────────── */
+    public static LedgerSegment create(final Path file, final int capacity, final boolean skipRecordCrc) throws IOException {
         try (final FileChannel ch = FileChannel.open(file,
-                EnumSet.of(
-                        StandardOpenOption.CREATE_NEW,
-                        StandardOpenOption.READ,
-                        StandardOpenOption.WRITE))) {
-
+                EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE))) {
             ch.truncate(capacity);
             final MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, 0, capacity);
-            map.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            map.order(ByteOrder.LITTLE_ENDIAN);
 
-            // write header skeleton
-            map.putInt(LedgerConstant.MAGIC)
-                    .putShort(LedgerConstant.VERSION)
-                    .putInt(0)     // CRC placeholder
-                    .putLong(0L)   // firstOffset placeholder
-                    .putLong(0L);  // lastOffset placeholder
+            // header skeleton
+            map.putInt(LedgerConstant.MAGIC)      // MAGIC
+                    .putShort(LedgerConstant.VERSION)  // VERSION
+                    .putInt(0)                         // CRC placeholder
+                    .putLong(0L)                       // firstOffset
+                    .putLong(0L);                      // lastOffset
 
-            // compute & write initial CRC
-            final ByteBuffer headerCopy = map.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            headerCopy.position(0).limit(HEADER_SIZE);
-            final byte[] headerBytes = new byte[HEADER_SIZE];
-            headerCopy.get(headerBytes);
-            // zero out CRC bytes
-            for (int i = 4 + 2; i < 4 + 2 + 4; i++) headerBytes[i] = 0;
-            final CRC32C crc = new CRC32C();
-
-            crc.update(headerBytes);
-            map.position(4 + 2);
-            map.putInt((int) crc.getValue());
-
+            writeHeaderCrc(map);
+            map.position(HEADER_SIZE);
             map.force();
-            return new LedgerSegment(file, capacity, map);
+            return new LedgerSegment(file, capacity, map, skipRecordCrc);
         }
     }
 
-    public static LedgerSegment openExisting(final Path file) throws IOException {
-        final FileChannel ch = FileChannel.open(file,
-                EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE));
-        final MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, 0, ch.size());
-        map.order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        return new LedgerSegment(file, (int) ch.size(), map);
+    public static LedgerSegment openExisting(final Path file, final boolean skipRecordCrc) throws IOException {
+        try (final FileChannel ch = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            final MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, 0, ch.size());
+            map.order(ByteOrder.LITTLE_ENDIAN);
+            final LedgerSegment seg = new LedgerSegment(file, (int) ch.size(), map, skipRecordCrc);
+            map.position((int) ch.size());
+            return seg;
+        }
     }
 
-    private LedgerSegment(final Path file, final int capacity, final MappedByteBuffer map) throws IOException {
+    private LedgerSegment(final Path file, final int capacity, final MappedByteBuffer buf, final boolean skipRecordCrc) throws IOException {
         this.file = file;
         this.capacity = capacity;
-        this.buf = map;
+        this.buf = buf;
+        this.skipRecordCrc = skipRecordCrc;
+
         readHeader();
     }
 
-    /**
-     * Append a single record (uses shared header update).
-     */
-    public synchronized long append(final byte[] data) throws IOException {
-        final int required = Integer.BYTES + data.length;
-        if (buf.position() + required > capacity) {
-            throw new IOException("segment full");
+    /* ── public API ─────────────────────────────────────────────────────── */
+
+    /** Append a single record; caller must be the only writer thread. */
+    public long append(final byte[] data) throws IOException {
+        final int needed = Integer.BYTES + Integer.BYTES + data.length;
+        if (buf.position() + needed > capacity) throw new IOException("segment full");
+
+        // write length
+        buf.putInt(data.length);
+
+        // write CRC (or zero)
+        if (!skipRecordCrc) {
+            final CRC32 crc = CRC32_TL.get(); crc.reset();
+            crc.update(data, 0, data.length);
+            buf.putInt((int) crc.getValue());
+        } else {
+            buf.putInt(0);
         }
-        buf.putInt(data.length).put(data);
-        final long offset = ++lastOffset;
-        updateHeaderCrcAndOffset(offset);
+
+        // payload
+        buf.put(data);
+
+        final long offset = lastOffset + 1;
+        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET, offset);
+        if (firstOffset == 0) UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET, offset);
+
+        updateHeader(offset);
         return offset;
     }
 
-    /**
-     * New: append a batch of records in one go (one CRC + force).
-     */
-    public synchronized long[] appendBatch(final java.util.List<byte[]> msgs) throws IOException {
-        final int total = msgs.stream().mapToInt(b -> Integer.BYTES + b.length).sum();
-        final int pos = buf.position();
-        if (pos + total > capacity) {
-            throw new IOException("segment full");
-        }
+    /** Batch append; still single-threaded writer assumption. */
+    public long[] appendBatch(final List<byte[]> messages) throws IOException {
+        final int total = messages.stream().mapToInt(m -> Integer.BYTES + Integer.BYTES + m.length).sum();
+        if (buf.position() + total > capacity) throw new IOException("segment full");
 
-        final long[] offsets = new long[msgs.size()];
-        for (int i = 0; i < msgs.size(); i++) {
-            final byte[] b = msgs.get(i);
-            buf.putInt(b.length).put(b);
-            offsets[i] = ++lastOffset;
+        final long[] offsets = new long[messages.size()];
+        for (int i = 0; i < messages.size(); i++) {
+            final byte[] m = messages.get(i);
+            buf.putInt(m.length);
+            if (!skipRecordCrc) {
+                final CRC32 crc = CRC32_TL.get(); crc.reset(); crc.update(m, 0, m.length);
+                buf.putInt((int) crc.getValue());
+            } else {
+                buf.putInt(0);
+            }
+            buf.put(m);
+            final long off = lastOffset + 1;
+            UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET, off);
+            if (firstOffset == 0 && i == 0) UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET, off);
+            offsets[i] = off;
         }
-
-        updateHeaderCrcAndOffset(lastOffset);
+        updateHeader(lastOffset);
         return offsets;
     }
 
+    /** True if there isn’t even space for minimal record. */
     public boolean isFull() {
-        return buf.position() + Integer.BYTES >= capacity;
+        return capacity - buf.position() < Integer.BYTES + Integer.BYTES + 1;
     }
 
     @Override
     public void close() {
         buf.force();
+        UNSAFE.invokeCleaner(buf);
     }
 
     private void readHeader() throws IOException {
-        buf.position(0);
-        final int magic = buf.getInt();
-        final short ver = buf.getShort();
-        if (magic != LedgerConstant.MAGIC || ver != LedgerConstant.VERSION) {
-            throw new IOException("Invalid segment header: " + file);
-        }
+        buf.position(MAGIC_POS);
+        final int magic = buf.getInt(); final short ver = buf.getShort();
+        if (magic != LedgerConstant.MAGIC || ver != LedgerConstant.VERSION)
+            throw new IOException("bad header: " + file);
 
         final int storedCrc = buf.getInt();
-        final ByteBuffer headerCopy = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        headerCopy.position(0).limit(HEADER_SIZE);
-        final byte[] bytes = new byte[HEADER_SIZE];
-        headerCopy.get(bytes);
-        for (int i = 4 + 2; i < 4 + 2 + 4; i++) bytes[i] = 0;
-        final CRC32C crc = new CRC32C();
-        crc.update(bytes);
-        if ((int) crc.getValue() != storedCrc) {
-            throw new IOException("Header CRC mismatch: " + file);
-        }
+        final int posSnap = buf.position();
+        writeHeaderCrc(buf);
+        buf.position(CRC_POS);
+        final int calc = buf.getInt();
+        if (calc != storedCrc) throw new IOException("header CRC mismatch: " + file);
+        buf.position(posSnap);
 
         firstOffset = buf.getLong();
-        lastOffset = buf.getLong();
-        buf.position(Math.max(HEADER_SIZE, buf.position()));
+        lastOffset  = buf.getLong();
+        buf.position(HEADER_SIZE);
     }
 
-    /**
-     * Shared helper: rewrite lastOffset + CRC, then restore buffer pos.
-     */
-    private void updateHeaderCrcAndOffset(final long offset) {
-        final int payloadPos = buf.position();                // remember write pos
+    private static void writeHeaderCrc(final MappedByteBuffer map) {
+        final ByteBuffer dup = map.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+        dup.position(0).limit(HEADER_SIZE);
+        final byte[] tmp = new byte[HEADER_SIZE];
+        dup.get(tmp);
 
-        // write new lastOffset
-        buf.position(4 + 2 + 4 + 8);                    // skip MAGIC,VER,CRC,firstOffset
-        buf.putLong(offset);
+        // zero CRC field
+        for (int i = CRC_POS; i < CRC_POS + Integer.BYTES; i++) tmp[i] = 0;
+        final CRC32C crc = CRC32C_TL.get(); crc.reset(); crc.update(tmp, 0, tmp.length);
+        map.putInt(CRC_POS, (int) crc.getValue());
+    }
 
-        // recompute CRC over header
-        final ByteBuffer copy = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        copy.position(0).limit(HEADER_SIZE);
-        final byte[] header = new byte[HEADER_SIZE];
-        copy.get(header);
+    private void updateHeader(final long newLastOffset) {
+        final int savePos = buf.position();
 
-        // zero out CRC bytes
-        for (int i = 4 + 2; i < 4 + 2 + 4; i++) header[i] = 0;
-        final CRC32C crc = new CRC32C();
-        crc.update(header);
+        // firstOffset (write once)
+        if (buf.getLong(FIRST_OFFSET_POS) == 0L) buf.putLong(FIRST_OFFSET_POS, firstOffset);
 
-        // write fresh CRC
-        buf.position(4 + 2);
-        buf.putInt((int) crc.getValue());
+        // last offset always
+        buf.putLong(LAST_OFFSET_POS, newLastOffset);
+        writeHeaderCrc(buf);
+        buf.position(savePos);
+    }
 
-        buf.force();
-        buf.position(payloadPos);
+    private static Unsafe initUnsafe() {
+        try {
+            final Field f = Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            return (Unsafe) f.get(null);
+        } catch (final Exception e) {
+            throw new RuntimeException("Unable to access Unsafe", e);
+        }
     }
 }
