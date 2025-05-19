@@ -73,7 +73,7 @@ public final class RingBuffer<E> {
     /**
      * Get the entry at the given sequence, waiting if necessary until it is available.
      *
-     * @param seq the sequence to retrieve (must be <= published cursor)
+     * @param seq the sequence to retrieve (must be &lt;= published cursor)
      * @return the entry at that sequence
      * @throws InterruptedException if interrupted while waiting
      */

@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Background job that periodically:
  * - Deletes segment files older than `maxAge`
- * - Ensures total bytes per topic <= `maxBytes` by oldest-first deletion
+ * - Ensures total bytes per topic &lt;= `maxBytes` by oldest-first deletion
  */
 @Slf4j
 @Deprecated
