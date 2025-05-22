@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 
 @Slf4j
 public final class TestMain {
@@ -42,11 +43,18 @@ public final class TestMain {
     public static void main(final String[] args) throws Exception {
         // 1) Clean data directory
         if (Files.exists(DATA)) {
-            Files.walk(DATA)
-                    .sorted(Comparator.reverseOrder())
-                    .map(Path::toFile)
-                    .forEach(java.io.File::delete);
+            try (final Stream<Path> stream = Files.walk(DATA)) {
+                stream
+                        .sorted(Comparator.reverseOrder())
+                        .map(Path::toFile)
+                        .forEach(file -> {
+                            if (!file.delete()) {
+                                log.warn("Failed to delete file: {}", file.getAbsolutePath());
+                            }
+                        });
+            }
         }
+
         Files.createDirectories(DATA);
 
         // 2) Build registry, offset store, ingress

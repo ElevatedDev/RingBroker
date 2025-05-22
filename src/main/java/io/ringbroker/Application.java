@@ -21,9 +21,11 @@ import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 /**
  * Main class to start the RingBroker application.
@@ -42,11 +44,18 @@ public class Application {
 
         // Prepare ledger directory
         final Path dataDir = Paths.get(cfg.getLedgerPath());
+
         if (Files.exists(dataDir)) {
-            Files.walk(dataDir)
-                    .sorted((a, b) -> b.compareTo(a))  // reverse order
-                    .map(Path::toFile)
-                    .forEach(java.io.File::delete);
+            try (final Stream<Path> stream = Files.walk(dataDir)) {
+                stream
+                        .sorted(Comparator.reverseOrder())
+                        .map(Path::toFile)
+                        .forEach(file -> {
+                            if (!file.delete()) {
+                                log.warn("Failed to delete file: {}", file.getAbsolutePath());
+                            }
+                        });
+            }
         }
 
         Files.createDirectories(dataDir);
