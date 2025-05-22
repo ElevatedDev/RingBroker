@@ -1,9 +1,6 @@
 package io.ringbroker;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors.Descriptor;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.NettyClusterClient;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
@@ -15,8 +12,6 @@ import io.ringbroker.config.type.ConfigLoader;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.registry.TopicRegistry;
-import io.ringbroker.transport.RemoteBrokerServiceGrpc;
-import io.ringbroker.transport.RemoteBrokerServiceProto;
 import io.ringbroker.transport.type.NettyTransport;
 import lombok.extern.slf4j.Slf4j;
 import org.yaml.snakeyaml.Yaml;
@@ -26,9 +21,11 @@ import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 /**
  * Main class to start the RingBroker application.
@@ -47,11 +44,18 @@ public class Application {
 
         // Prepare ledger directory
         final Path dataDir = Paths.get(cfg.getLedgerPath());
+
         if (Files.exists(dataDir)) {
-            Files.walk(dataDir)
-                    .sorted((a, b) -> b.compareTo(a))  // reverse order
-                    .map(Path::toFile)
-                    .forEach(java.io.File::delete);
+            try (final Stream<Path> stream = Files.walk(dataDir)) {
+                stream
+                        .sorted(Comparator.reverseOrder())
+                        .map(Path::toFile)
+                        .forEach(file -> {
+                            if (!file.delete()) {
+                                log.warn("Failed to delete file: {}", file.getAbsolutePath());
+                            }
+                        });
+            }
         }
 
         Files.createDirectories(dataDir);

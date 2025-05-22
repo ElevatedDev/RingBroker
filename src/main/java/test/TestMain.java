@@ -6,7 +6,6 @@ import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.WaitStrategy;
-import io.ringbroker.grpc.server.GrpcAdminServer;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;
@@ -25,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 
 @Slf4j
 public final class TestMain {
@@ -43,11 +43,18 @@ public final class TestMain {
     public static void main(final String[] args) throws Exception {
         // 1) Clean data directory
         if (Files.exists(DATA)) {
-            Files.walk(DATA)
-                    .sorted(Comparator.reverseOrder())
-                    .map(Path::toFile)
-                    .forEach(java.io.File::delete);
+            try (final Stream<Path> stream = Files.walk(DATA)) {
+                stream
+                        .sorted(Comparator.reverseOrder())
+                        .map(Path::toFile)
+                        .forEach(file -> {
+                            if (!file.delete()) {
+                                log.warn("Failed to delete file: {}", file.getAbsolutePath());
+                            }
+                        });
+            }
         }
+
         Files.createDirectories(DATA);
 
         // 2) Build registry, offset store, ingress
@@ -186,25 +193,25 @@ public final class TestMain {
         }
 
         // === E) Subscribe test ===
-        {
-            final AtomicLong received = new AtomicLong(0);
-            final Instant s0 = Instant.now();
-            client.subscribe(TOPIC, SUB_GROUP, (seq, body) -> {
-                if (received.incrementAndGet() >= TOTAL_MESSAGES) {
-                    // done
-                }
-            });
-            // spin until done
-            while (received.get() < TOTAL_MESSAGES) {
-                Thread.sleep(1);
-            }
-            final Instant s1 = Instant.now();
-            final double secs = Duration.between(s0, s1).toMillis() / 1000.0;
-            log.info(String.format(
-                    "[TCP-SUBSCRIBE] Received %,d msgs in %.2fs = %.1f msgs/s",
-                    received.get(), secs, received.get() / secs
-            ));
-        }
+//        {
+//            final AtomicLong received = new AtomicLong(0);
+//            final Instant s0 = Instant.now();
+//            client.subscribe(TOPIC, SUB_GROUP, (seq, body) -> {
+//                if (received.incrementAndGet() >= TOTAL_MESSAGES) {
+//                    // done
+//                }
+//            });
+//            // spin until done
+//            while (received.get() < TOTAL_MESSAGES) {
+//                Thread.sleep(1);
+//            }
+//            final Instant s1 = Instant.now();
+//            final double secs = Duration.between(s0, s1).toMillis() / 1000.0;
+//            log.info(String.format(
+//                    "[TCP-SUBSCRIBE] Received %,d msgs in %.2fs = %.1f msgs/s",
+//                    received.get(), secs, received.get() / secs
+//            ));
+//        }
 
         // Cleanup
         client.close();

@@ -1,9 +1,9 @@
 plugins {
     id 'java'
     id 'application'
-    id 'com.google.protobuf' version '0.9.4'
-    id 'io.freefair.lombok' version '8.4'
-    id 'com.github.johnrengelman.shadow' version '8.1.1'
+    id 'com.google.protobuf' version '0.9.5'
+    id 'io.freefair.lombok' version '8.13.1'
+    id 'com.gradleup.shadow' version '8.3.6'
 }
 
 group   = 'io.ringbroker'
@@ -27,11 +27,11 @@ application {
 repositories { mavenCentral() }
 
 ext {
-    grpcVersion = '1.63.0'
-    protobufVersion = '3.25.3'
-    jacksonVersion = '2.17.0'
-    picocliVersion = '4.7.5'
-    nettyVersion = '4.1.99.Final'
+    grpcVersion = '1.72.0'
+    protobufVersion = '4.31.0'
+    jacksonVersion = '2.19.0'
+    picocliVersion = '4.7.7'
+    nettyVersion = '4.2.1.Final'
 }
 
 /* ----------  Dependencies ---------- */
