@@ -1,9 +1,6 @@
 package io.ringbroker;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors.Descriptor;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.NettyClusterClient;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
@@ -15,8 +12,6 @@ import io.ringbroker.config.type.ConfigLoader;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.registry.TopicRegistry;
-import io.ringbroker.transport.RemoteBrokerServiceGrpc;
-import io.ringbroker.transport.RemoteBrokerServiceProto;
 import io.ringbroker.transport.type.NettyTransport;
 import lombok.extern.slf4j.Slf4j;
 import org.yaml.snakeyaml.Yaml;

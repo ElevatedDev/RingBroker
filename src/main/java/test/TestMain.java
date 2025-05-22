@@ -6,7 +6,6 @@ import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.WaitStrategy;
-import io.ringbroker.grpc.server.GrpcAdminServer;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;

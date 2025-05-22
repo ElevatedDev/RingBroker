@@ -13,7 +13,6 @@ import io.netty.handler.flush.FlushConsolidationHandler;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.offset.OffsetStore;
-import io.ringbroker.registry.TopicRegistry;
 import io.ringbroker.transport.impl.NettyServerRequestHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
