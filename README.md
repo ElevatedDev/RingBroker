@@ -194,6 +194,6 @@ This design isolates high-throughput message flows from low-volume admin logic.
 
 ## License
 
-GPU © ElevatedDev — see [LICENSE](LICENSE)
+GPL © ElevatedDev — see [LICENSE](LICENSE)
 
 ---
