@@ -2,7 +2,7 @@ package io.ringbroker.transport.type;
 
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.protobuf.ProtobufDecoder;
@@ -28,8 +28,10 @@ public class NettyTransport {
     private EventLoopGroup workerGroup;
 
     public void start() throws InterruptedException {
-        bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup();
+        final IoHandlerFactory factory = NioIoHandler.newFactory();
+
+        bossGroup = new MultiThreadIoEventLoopGroup(1, factory);
+        workerGroup = new MultiThreadIoEventLoopGroup(0, factory);
 
         final ServerBootstrap b = new ServerBootstrap();
         b.group(bossGroup, workerGroup)
