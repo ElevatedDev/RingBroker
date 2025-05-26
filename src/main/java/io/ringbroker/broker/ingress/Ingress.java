@@ -8,12 +8,13 @@ import lombok.Setter;
 
 import javax.annotation.PostConstruct;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.file.Path;
 import java.util.AbstractList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -162,14 +163,24 @@ public final class Ingress {
      * Only *one* array of references is allocated once in the constructor.
      */
     private static final class SlotRing {
+        private static final VarHandle MEMORY_HANDLE;
+
+        static {
+            try {
+                MEMORY_HANDLE = MethodHandles.arrayElementVarHandle(byte[][].class);
+            } catch (Exception e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
         private final int mask;
-        private final AtomicReferenceArray<byte[]> buffer;
+        private final byte[][] buffer;
         private final PaddedAtomicLong tail = new PaddedAtomicLong(0); // producers
         private final PaddedAtomicLong head = new PaddedAtomicLong(0); // consumers
 
         SlotRing(final int capacityPow2) {
             this.mask = capacityPow2 - 1;
-            this.buffer = new AtomicReferenceArray<>(capacityPow2);
+            this.buffer = new byte[capacityPow2][];
         }
 
         /**
@@ -179,11 +190,12 @@ public final class Ingress {
             long t;
             for (;;) {
                 t = tail.get();
-                if (head.get() <= t - buffer.length()) return false; // full
+                if (head.get() <= t - buffer.length) return false; // full
                 if (tail.compareAndSet(t, t + 1)) break;
             }
-            final int idx = (int) t & mask;
-            buffer.set(idx, e);   // release‑store – consumer can safely read
+            int idx = (int) t & mask;
+            // release-store: makes the element visible to the consumer
+            MEMORY_HANDLE.setRelease(buffer, idx, e);
             return true;
         }
 
@@ -197,12 +209,15 @@ public final class Ingress {
                 if (h >= tail.get()) return null; // empty
                 if (head.compareAndSet(h, h + 1)) break;
             }
-            final int idx = (int) h & mask;
-            final byte[] e = buffer.get(idx);      // guaranteed non‑null
-            buffer.lazySet(idx, null);            // clear slot for producers
+            int idx = (int) h & mask;
+            // acquire-load: ensure we see the fully published element
+            byte[] e = (byte[]) MEMORY_HANDLE.getAcquire(buffer, idx);
+            // plain store to clear slot for producers
+            MEMORY_HANDLE.set(buffer, idx, null);
             return e;
         }
     }
+
 
     /*
      * Cache‑line‑padded AtomicLong to stop false sharing between head & tail.
