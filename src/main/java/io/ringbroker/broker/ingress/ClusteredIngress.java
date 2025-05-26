@@ -9,6 +9,7 @@ import io.ringbroker.offset.OffsetStore;
 import io.ringbroker.registry.TopicRegistry;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -162,6 +163,12 @@ public final class ClusteredIngress {
         }
     }
 
+    public void shutdown() throws IOException {
+        // for each local Ingress:
+        for (final Ingress ingress : ingressMap.values()) {
+            ingress.close();
+        }
+    }
 
     private String computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
         final int keyHash = (key != null ? Arrays.hashCode(key) : 0);

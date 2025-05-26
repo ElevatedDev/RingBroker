@@ -4,6 +4,7 @@ import com.google.protobuf.DynamicMessage;
 import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.ledger.orchestrator.LedgerOrchestrator;
 import io.ringbroker.registry.TopicRegistry;
+import lombok.Getter;
 import lombok.Setter;
 
 import javax.annotation.PostConstruct;
@@ -20,6 +21,7 @@ import java.util.concurrent.locks.LockSupport;
 /**
  * Allocation‑free, lock‑free ingress (no external libs).
  */
+@Getter
 public final class Ingress {
     private static final int MAX_RETRIES = 5;
     private static final int QUEUE_CAPACITY_FACTOR = 4;   // queue = FACTOR × batchSize
@@ -157,66 +159,80 @@ public final class Ingress {
         }
     }
 
+    public void close() throws IOException {
+        this.segments.writable().close();
+    }
+
     /*
      * Allocation‑free bounded lock‑free multi‑producer / multi‑consumer queue
      * (heavily simplified Vyukov algorithm).
      * Only *one* array of references is allocated once in the constructor.
      */
-    private static final class SlotRing {
-        private static final VarHandle MEMORY_HANDLE;
+    static final class SlotRing {
+        private static final VarHandle SEQ, BUF;
 
         static {
-            try {
-                MEMORY_HANDLE = MethodHandles.arrayElementVarHandle(byte[][].class);
-            } catch (Exception e) {
-                throw new ExceptionInInitializerError(e);
-            }
+            SEQ = MethodHandles.arrayElementVarHandle(long[].class);
+            BUF = MethodHandles.arrayElementVarHandle(byte[][].class);
         }
 
         private final int mask;
-        private final byte[][] buffer;
-        private final PaddedAtomicLong tail = new PaddedAtomicLong(0); // producers
-        private final PaddedAtomicLong head = new PaddedAtomicLong(0); // consumers
+        private final long[] seq;
+        private final byte[][] buf;
+        private final AtomicLong tail = new AtomicLong();
+        private final AtomicLong head = new AtomicLong();
 
-        SlotRing(final int capacityPow2) {
-            this.mask = capacityPow2 - 1;
-            this.buffer = new byte[capacityPow2][];
+        SlotRing(int capacityPow2) {
+            mask = capacityPow2 - 1;
+            seq  = new long[capacityPow2];
+            buf  = new byte[capacityPow2][];
+            for (int i = 0; i < capacityPow2; i++) seq[i] = i;
         }
 
-        /**
-         * @return false if full
-         */
-        boolean offer(final byte[] e) {
+        boolean offer(byte[] e) {
             long t;
-            for (;;) {
+            while (true) {
                 t = tail.get();
-                if (head.get() <= t - buffer.length) return false; // full
-                if (tail.compareAndSet(t, t + 1)) break;
+                long idx = t & mask;
+                long s   = (long) SEQ.getVolatile(seq, (int) idx);
+                long dif = s - t;
+                if (dif == 0) {
+                    if (tail.compareAndSet(t, t + 1)) break;
+                } else if (dif < 0) {
+                    return false;              // queue full
+                } else {
+                    Thread.onSpinWait();
+                }
             }
-            int idx = (int) t & mask;
-            // release-store: makes the element visible to the consumer
-            MEMORY_HANDLE.setRelease(buffer, idx, e);
+            int i = (int) (t & mask);
+            BUF.setRelease(buf, i, e);         // ① write payload
+            SEQ.setRelease(seq, i, t + 1);     // ② publish slot
             return true;
         }
 
-        /**
-         * @return null if empty
-         */
         byte[] poll() {
             long h;
-            for (;;) {
+            while (true) {
                 h = head.get();
-                if (h >= tail.get()) return null; // empty
-                if (head.compareAndSet(h, h + 1)) break;
+                long idx = h & mask;
+                long s   = (long) SEQ.getVolatile(seq, (int) idx);
+                long dif = s - (h + 1);
+                if (dif == 0) {
+                    if (head.compareAndSet(h, h + 1)) break;
+                } else if (dif < 0) {
+                    return null;               // queue empty
+                } else {
+                    Thread.onSpinWait();
+                }
             }
-            int idx = (int) h & mask;
-            // acquire-load: ensure we see the fully published element
-            byte[] e = (byte[]) MEMORY_HANDLE.getAcquire(buffer, idx);
-            // plain store to clear slot for producers
-            MEMORY_HANDLE.set(buffer, idx, null);
+            int i = (int) (h & mask);
+            byte[] e = (byte[]) BUF.getAcquire(buf, i);
+            SEQ.setRelease(seq, i, h + mask + 1); // ③ mark slot empty
+            BUF.set(buf, i, null);
             return e;
         }
     }
+
 
 
     /*
