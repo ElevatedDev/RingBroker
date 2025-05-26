@@ -28,7 +28,7 @@ repositories { mavenCentral() }
 
 ext {
     grpcVersion = '1.72.0'
-    protobufVersion = '4.31.0'
+    protobufVersion = '3.25.7'
     jacksonVersion = '2.19.0'
     picocliVersion = '4.7.7'
     nettyVersion = '4.2.1.Final'
