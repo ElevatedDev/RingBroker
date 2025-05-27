@@ -32,7 +32,6 @@ public final class TestMain {
     private static final int RING_SIZE = 1 << 20;
     private static final WaitStrategy WAIT_STRATEGY = new AdaptiveSpin();
     private static final long SEG_BYTES = 128L << 20;
-    private static final int WRITER_THREADS = 8;
     private static final int BATCH_SIZE = 12000;
     private static final long TOTAL_MESSAGES = 50_000_000L;
     private static final String TOPIC = "orders/created";
@@ -72,7 +71,6 @@ public final class TestMain {
                 RING_SIZE,
                 WAIT_STRATEGY,
                 SEG_BYTES,
-                WRITER_THREADS,
                 BATCH_SIZE,
                 false,
                 offsetStore
