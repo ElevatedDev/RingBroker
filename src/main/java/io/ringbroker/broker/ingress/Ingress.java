@@ -164,18 +164,19 @@ public final class Ingress {
      * Only *one* array of references is allocated once in the constructor.
      */
     static final class SlotRing {
-        private static final VarHandle SEQ, BUF;
+        private static final VarHandle SEQUENCE_HANDLE, BUFFER_HANDLE;
 
         static {
-            SEQ = MethodHandles.arrayElementVarHandle(long[].class);
-            BUF = MethodHandles.arrayElementVarHandle(byte[][].class);
+            SEQUENCE_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
+            BUFFER_HANDLE = MethodHandles.arrayElementVarHandle(byte[][].class);
         }
 
         private final int mask;
         private final long[] seq;
         private final byte[][] buf;
-        private final AtomicLong tail = new AtomicLong();
-        private final AtomicLong head = new AtomicLong();
+
+        private final PaddedAtomicLong tail = new PaddedAtomicLong(0);
+        private final PaddedAtomicLong head = new PaddedAtomicLong(0);
 
         SlotRing(int capacityPow2) {
             mask = capacityPow2 - 1;
@@ -189,7 +190,7 @@ public final class Ingress {
             while (true) {
                 t = tail.get();
                 long idx = t & mask;
-                long s   = (long) SEQ.getVolatile(seq, (int) idx);
+                long s   = (long) SEQUENCE_HANDLE.getVolatile(seq, (int) idx);
                 long dif = s - t;
                 if (dif == 0) {
                     if (tail.compareAndSet(t, t + 1)) break;
@@ -200,8 +201,8 @@ public final class Ingress {
                 }
             }
             int i = (int) (t & mask);
-            BUF.setRelease(buf, i, e);         // ① write payload
-            SEQ.setRelease(seq, i, t + 1);     // ② publish slot
+            BUFFER_HANDLE.setRelease(buf, i, e);         // ① write payload
+            SEQUENCE_HANDLE.setRelease(seq, i, t + 1);     // ② publish slot
             return true;
         }
 
@@ -210,7 +211,7 @@ public final class Ingress {
             while (true) {
                 h = head.get();
                 long idx = h & mask;
-                long s   = (long) SEQ.getVolatile(seq, (int) idx);
+                long s   = (long) SEQUENCE_HANDLE.getVolatile(seq, (int) idx);
                 long dif = s - (h + 1);
                 if (dif == 0) {
                     if (head.compareAndSet(h, h + 1)) break;
@@ -221,14 +222,12 @@ public final class Ingress {
                 }
             }
             int i = (int) (h & mask);
-            byte[] e = (byte[]) BUF.getAcquire(buf, i);
-            SEQ.setRelease(seq, i, h + mask + 1); // ③ mark slot empty
-            BUF.set(buf, i, null);
+            byte[] e = (byte[]) BUFFER_HANDLE.getAcquire(buf, i);
+            SEQUENCE_HANDLE.setRelease(seq, i, h + mask + 1); // ③ mark slot empty
+            BUFFER_HANDLE.set(buf, i, null);
             return e;
         }
     }
-
-
 
     /*
      * Cache‑line‑padded AtomicLong to stop false sharing between head & tail.
