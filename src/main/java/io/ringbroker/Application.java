@@ -107,7 +107,6 @@ public class Application {
                 cfg.getRingSize(),
                 new AdaptiveSpin(),
                 cfg.getSegmentBytes(),
-                cfg.getIngressThreads(),
                 cfg.getBatchSize(),
                 cfg.isIdempotentMode(),
                 store

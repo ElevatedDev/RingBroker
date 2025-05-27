@@ -48,7 +48,6 @@ public final class ClusteredIngress {
                                           final int ringSize,
                                           final WaitStrategy waitStrategy,
                                           final long segmentSize,
-                                          final int threadsPerPartition,
                                           final int batchSize,
                                           final boolean idempotentMode,
                                           final OffsetStore offsetStore) throws IOException {
@@ -69,7 +68,6 @@ public final class ClusteredIngress {
                         ring,
                         partDir,
                         segmentSize,
-                        threadsPerPartition,
                         batchSize
                 );
                 ingressMap.put(pid, ingress);

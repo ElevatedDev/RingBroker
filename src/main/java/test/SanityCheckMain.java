@@ -71,7 +71,6 @@ public class SanityCheckMain {
                 1 << 20,                         // flushBytes
                 new AdaptiveSpin(),
                 SEGMENT_BYTES,
-                WRITER_THREADS,
                 BATCH_SIZE,
                 /* flushOnWrite */ false,
                 new InMemoryOffsetStore()

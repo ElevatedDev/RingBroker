@@ -62,19 +62,14 @@ public final class Ingress {
                                  final RingBuffer<byte[]> ring,
                                  final Path dataDir,
                                  final long segmentSize,
-                                 final int threads,
                                  final int batchSize) throws IOException {
 
-        final ExecutorService exec = Executors.newFixedThreadPool(
-                threads, Thread.ofVirtual().factory());
+        final ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor();
 
         final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
         final Ingress ingress = new Ingress(registry, ring, mgr, exec, batchSize);
 
-        /* start writer(s) */
-        for (int i = 0; i < threads; i++) {
-            exec.submit(ingress::writerLoop);
-        }
+        exec.submit(ingress::writerLoop);
         return ingress;
     }
 
