@@ -1,6 +1,9 @@
 package io.ringbroker.broker.ingress;
 
+import com.google.protobuf.CodedInputStream;
+import com.google.protobuf.Descriptors;
 import com.google.protobuf.DynamicMessage;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.ledger.orchestrator.LedgerOrchestrator;
 import io.ringbroker.registry.TopicRegistry;
@@ -90,18 +93,22 @@ public final class Ingress {
      */
     public void publish(final String topic, final int retries, final byte[] rawPayload) {
         // 1) validate base topic
-        if (!registry.contains(topic)) throw new IllegalArgumentException("topic not registered: " + topic);
+        if (!registry.contains(topic)) {
+            throw new IllegalArgumentException("topic not registered: " + topic);
+        }
 
-        // 2) DLQ routing
+        // 2) DLQ routing based on retry count
         String outTopic = retries > MAX_RETRIES ? topic + ".DLQ" : topic;
-        if (!registry.contains(outTopic)) throw new IllegalArgumentException("topic not registered: " + outTopic);
+        if (!registry.contains(outTopic)) {
+            throw new IllegalArgumentException("topic not registered: " + outTopic);
+        }
 
-        // 3) schema-validate
-        try {
-            DynamicMessage.parseFrom(registry.descriptor(outTopic), rawPayload);
-        } catch (final Exception ex) {
+        // 3) schema‐validate without throwing out
+        if (!isWireValid(rawPayload, registry.descriptor(outTopic))) {
             outTopic = topic + ".DLQ";
-            if (!registry.contains(outTopic)) throw new IllegalArgumentException("DLQ not registered: " + outTopic);
+            if (!registry.contains(outTopic)) {
+                throw new IllegalArgumentException("DLQ not registered: " + outTopic);
+            }
         }
 
         // 4) enqueue without allocation; spin if queue is momentarily full
@@ -157,6 +164,29 @@ public final class Ingress {
     public void close() throws IOException {
         this.segments.writable().close();
     }
+
+    /**
+     * Returns true if payload is a well‐formed instance of the given descriptor’s message
+     * (i.e. no truncated stream, bad varint, negative length, etc.). Never throws.
+     */
+    private static boolean isWireValid(byte[] raw, final Descriptors.Descriptor descriptor) {
+        CodedInputStream in = CodedInputStream.newInstance(raw);
+        try {
+            // Try to merge into a DynamicMessage.Builder; this will throw on any wire‐format error.
+            DynamicMessage.newBuilder(descriptor)
+                    .mergeFrom(in)
+                    .buildPartial();
+            // Also ensure we consumed exactly all bytes
+            return in.isAtEnd();
+        } catch (InvalidProtocolBufferException e) {
+            return false;
+        }
+
+        catch (IOException exception) {
+            return false;
+        }
+    }
+
 
     /*
      * Allocation‑free bounded lock‑free multi‑producer / multi‑consumer queue
