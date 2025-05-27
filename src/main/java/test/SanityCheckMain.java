@@ -7,6 +7,7 @@ import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.DataInputStream;
 import java.io.EOFException;
@@ -15,7 +16,10 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -28,6 +32,7 @@ import java.util.zip.CRC32;
  *  – verify the in-memory subscription sees every record
  *  – replay every segment on disk and confirm the same IDs partition-by-partition
  */
+@Slf4j
 public class SanityCheckMain {
 
     /* ---------- test parameters ---------- */
@@ -42,11 +47,7 @@ public class SanityCheckMain {
     private static final String GROUP = "sanity-latch";
     private static final Path   DATA  = Paths.get("data");
 
-    /* ---------- main ---------- */
-
     public static void main(String[] args) throws Exception {
-
-        /* 0) clean data dir ------------------------------------------------- */
         if (Files.exists(DATA)) {
             try (Stream<Path> w = Files.walk(DATA)) {
                 w.sorted(Comparator.reverseOrder())
@@ -55,7 +56,6 @@ public class SanityCheckMain {
         }
         Files.createDirectories(DATA);
 
-        /* 1) registry + broker --------------------------------------------- */
         TopicRegistry registry = new TopicRegistry.Builder()
                 .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
                 .build();
@@ -76,17 +76,14 @@ public class SanityCheckMain {
                 new InMemoryOffsetStore()
         );
 
-        /* expected IDs per partition --------------------------------------- */
         RoundRobinPartitioner psel = new RoundRobinPartitioner();
         Map<Integer, Set<String>> expected = new HashMap<>();
         for (int p = 0; p < PARTITIONS; p++) expected.put(p, new HashSet<>());
 
-        /* latch for subscriber --------------------------------------------- */
         CountDownLatch latch = new CountDownLatch(TOTAL_MSGS);
         ingress.subscribeTopic(TOPIC, GROUP, (seq, payload) -> latch.countDown());
 
-        /* 2) publish ------------------------------------------------------- */
-        System.out.println("=== publishing " + TOTAL_MSGS + " messages ===");
+        log.info("=== publishing {} messages ===", TOTAL_MSGS);
         for (int i = 0; i < TOTAL_MSGS; i++) {
             String id  = "msg-" + i;
             byte[] key = id.getBytes(StandardCharsets.UTF_8);
@@ -102,21 +99,15 @@ public class SanityCheckMain {
             ingress.publish(TOPIC, key, 0, evt.toByteArray());
         }
 
-        /* writers push tail batches immediately (patch already in place)    */
-
-        /* 3) wait for subscriber ------------------------------------------- */
-        System.out.println("waiting for in-memory delivery…");
+        log.info("waiting for in-memory delivery…");
         if (!latch.await(30, TimeUnit.SECONDS)) {
-            System.err.printf("❌ saw only %d/%d messages%n",
-                    TOTAL_MSGS - latch.getCount(), TOTAL_MSGS);
+            log.error("saw only {}/{} messages", TOTAL_MSGS - latch.getCount(), TOTAL_MSGS);
             System.exit(1);
         }
-        System.out.println("✅ all messages delivered in-memory");
+        log.info("all messages delivered in-memory");
 
-        /* 4) shutdown (forces fsync) --------------------------------------- */
         ingress.shutdown();
 
-        /* 5) replay segments per partition --------------------------------- */
         Map<Integer, Set<String>> seen = new HashMap<>();
         for (int p = 0; p < PARTITIONS; p++) {
             seen.put(p, new HashSet<>());
@@ -130,26 +121,25 @@ public class SanityCheckMain {
             }
         }
 
-        /* 6) compare ------------------------------------------------------- */
         boolean pass = true;
-        System.out.println("\n=== partition results ===");
+        log.info("\n=== partition results ===");
         for (int p = 0; p < PARTITIONS; p++) {
             Set<String> exp = expected.get(p), got = seen.get(p);
-            System.out.printf("partition-%2d: exp=%3d, got=%3d%n", p, exp.size(), got.size());
+            log.info("partition-{}: exp={}, got={}", p, exp.size(), got.size());
             if (!exp.equals(got)) {
+                log.error("  missing: {}", diff(exp, got));
+                log.error("  extra  : {}", diff(got, exp));
                 pass = false;
-                System.err.println("  missing: " + diff(exp, got));
-                System.err.println("  extra  : " + diff(got, exp));
             }
         }
 
-        System.out.println(pass
-                ? "\n✅ SANITY-PASS: all routing + writes succeeded."
-                : "\n❌ SANITY-FAIL: see mismatches above.");
-        if (!pass) System.exit(1);
+        if (pass) {
+            log.info("\nSANITY-PASS: all routing + writes succeeded.");
+        } else {
+            log.error("\nSANITY-FAIL: see mismatches above.");
+            System.exit(1);
+        }
     }
-
-    /* ---------- helpers --------------------------------------------------- */
 
     /** read a 32-bit little-endian int from the stream */
     private static int readIntLE(DataInputStream in) throws IOException {
@@ -181,7 +171,7 @@ public class SanityCheckMain {
                 CRC32 crc = new CRC32();
                 crc.update(buf, 0, len);
                 if ((int) crc.getValue() != storedCrc) {
-                    System.err.printf("CRC mismatch in %s%n", seg.getFileName());
+                    log.error("CRC mismatch in {}", seg.getFileName());
                     break;
                 }
 
