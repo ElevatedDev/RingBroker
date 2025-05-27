@@ -43,7 +43,6 @@ public final class BrokerConfig {
             cfg.ledgerPath = (String) map.get("ledgerPath");
             cfg.ringSize = (Integer) map.get("ringSize");
             cfg.segmentBytes = (Integer) map.get("segmentBytes");
-            cfg.ingressThreads = (Integer) map.get("ingressThreads");
             cfg.batchSize = (Integer) map.get("batchSize");
             cfg.idempotentMode = (Boolean) map.get("idempotentMode");
             return cfg;
