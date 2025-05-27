@@ -3,7 +3,7 @@ package test;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.protobuf.ProtobufDecoder;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
@@ -23,6 +23,8 @@ import java.util.function.BiConsumer;
  * A raw-TCP client using Protobuf varint32 framing to communicate with the RingBroker server.
  */
 public class RawTcpClient implements AutoCloseable {
+
+    private static final IoHandlerFactory SHARED_FACTORY = NioIoHandler.newFactory();
     private static final int FLUSH_BATCH_SIZE = 1;
 
     private final Channel channel;
@@ -33,16 +35,18 @@ public class RawTcpClient implements AutoCloseable {
     private int writeCounter = 0;
 
     public RawTcpClient(final String host, final int port) throws InterruptedException {
-        group = new NioEventLoopGroup(1);
+        group = new MultiThreadIoEventLoopGroup(1, SHARED_FACTORY);
+
         final Bootstrap b = new Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .handler(new ChannelInitializer<Channel>() {
+                .handler(new ChannelInitializer<>() {
                     @Override
                     protected void initChannel(final Channel ch) {
                         final ChannelPipeline p = ch.pipeline();
+
                         // Inbound: split by varint32 length prefix
                         p.addLast(new ProtobufVarint32FrameDecoder());
                         // Inbound: decode bytes into Envelope messages

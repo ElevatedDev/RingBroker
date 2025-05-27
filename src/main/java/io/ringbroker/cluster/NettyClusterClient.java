@@ -1,10 +1,8 @@
 package io.ringbroker.cluster;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
@@ -14,11 +12,15 @@ import io.ringbroker.cluster.type.RemoteBrokerClient;
 import java.net.InetSocketAddress;
 
 public final class NettyClusterClient implements RemoteBrokerClient {
+
+    private static final IoHandlerFactory SHARED_FACTORY = NioIoHandler.newFactory();
+
     private final Channel channel;
     private final EventLoopGroup group;
 
     public NettyClusterClient(final String host, final int port) throws InterruptedException {
-        group = new NioEventLoopGroup();
+        group = new MultiThreadIoEventLoopGroup(SHARED_FACTORY);
+
         final Bootstrap bootstrap = new Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel.class)
@@ -30,6 +32,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
                                 .addLast(new ProtobufEncoder());
                     }
                 });
+
         channel = bootstrap.connect(new InetSocketAddress(host, port)).sync().channel();
     }
 
@@ -41,6 +44,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
                 .setKey(com.google.protobuf.ByteString.copyFrom(key))
                 .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
                 .build();
+
         channel.writeAndFlush(BrokerApi.Envelope.newBuilder().setPublish(m).build());
     }
 
