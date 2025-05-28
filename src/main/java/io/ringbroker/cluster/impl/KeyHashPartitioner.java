@@ -5,8 +5,15 @@ import io.ringbroker.cluster.type.Partitioner;
 import java.util.Arrays;
 
 /**
- * Hashes the message key to pick a partition,
- * so that all messages with the same key land in the same partition.
+ * {@code KeyHashPartitioner} is an implementation of the {@link Partitioner} interface that assigns
+ * messages to partitions based on the hash of their key. This ensures that all messages with the same key
+ * are consistently routed to the same partition, providing key-based partitioning semantics.
+ * <p>
+ * If the key is {@code null} or empty, partition 0 is selected by default.
+ * The partition is determined by computing the hash code of the key (using {@link Arrays#hashCode(byte[])}),
+ * and then applying {@link Math#floorMod(int, int)} to ensure a non-negative partition index within the range
+ * of available partitions.
+ * </p>
  */
 public final class KeyHashPartitioner implements Partitioner {
 
