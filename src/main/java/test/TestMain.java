@@ -3,7 +3,7 @@ package test;
 import com.google.protobuf.ByteString;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
-import io.ringbroker.cluster.impl.RoundRobinPartitioner;
+import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.InMemoryOffsetStore;

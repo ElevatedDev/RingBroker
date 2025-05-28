@@ -1,4 +1,3 @@
-// src/main/java/io/ringbroker/config/ConfigLoader.java
 package io.ringbroker.config.type;
 
 import io.ringbroker.config.impl.BrokerConfig;
@@ -14,32 +13,57 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Utility to load BrokerConfig and TopicConfig from YAML files.
+ * Utility class for loading broker and topic configuration from YAML files.
+ * <p>
+ * {@code ConfigLoader} provides static methods to load {@link BrokerConfig} and a list of {@link TopicConfig}
+ * from their respective YAML configuration files. It delegates broker configuration loading to {@link BrokerConfig#load(String)},
+ * and parses topic definitions from a YAML file structured with a {@code topics} list.
+ * <p>
+ * Example usage:
+ * <pre>
+ *   BrokerConfig brokerConfig = ConfigLoader.load("/path/to/broker.yaml");
+ *   List<TopicConfig> topics = ConfigLoader.loadTopics("/path/to/topics.yaml");
+ * </pre>
+ * </p>
  */
 public final class ConfigLoader {
 
     /**
-     * Delegates to BrokerConfig.load(...)
+     * Loads broker configuration from a YAML file by delegating to {@link BrokerConfig#load(String)}.
+     *
+     * @param path the path to the broker YAML configuration file
+     * @return a populated {@link BrokerConfig} instance
+     * @throws IOException if the file cannot be read or parsed
      */
     public static BrokerConfig load(final String path) throws IOException {
         return BrokerConfig.load(path);
     }
 
     /**
-     * Expects a YAML file structured as:
+     * Loads a list of topic configurations from a YAML file.
      * <p>
+     * The YAML file is expected to have the following structure:
+     * <pre>
      * topics:
-     * - name: some/topic
-     * protoClass: com.example.ProtoClass
-     * - name: other/topic
-     * protoClass: com.example.OtherProto
+     *   - name: some/topic
+     *     protoClass: com.example.ProtoClass
+     *   - name: other/topic
+     *     protoClass: com.example.OtherProto
+     * </pre>
+     *
+     * @param path the path to the topics YAML configuration file
+     * @return a list of {@link TopicConfig} instances
+     * @throws IOException if the file cannot be read or parsed
+     * @throws ClassCastException if the YAML structure does not match the expected format
      */
     @SuppressWarnings("unchecked")
     public static List<TopicConfig> loadTopics(final String path) throws IOException {
         final Yaml yaml = new Yaml();
+
         try (final InputStream in = Files.newInputStream(Paths.get(path))) {
             final Map<String, Object> root = yaml.load(in);
             final var list = (List<Map<String, Object>>) root.get("topics");
+
             return list.stream()
                     .map(m -> new TopicConfig(
                             (String) m.get("name"),

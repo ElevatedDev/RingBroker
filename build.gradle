@@ -4,6 +4,7 @@ plugins {
     id 'com.google.protobuf' version '0.9.5'
     id 'io.freefair.lombok' version '8.13.1'
     id 'com.gradleup.shadow' version '8.3.6'
+    id 'me.champeau.jmh' version '0.7.3'
 }
 
 group   = 'io.ringbroker'
@@ -32,6 +33,7 @@ ext {
     jacksonVersion = '2.19.0'
     picocliVersion = '4.7.7'
     nettyVersion = '4.2.1.Final'
+    jmhVersion = '1.37'
 }
 
 /* ----------  Dependencies ---------- */
@@ -62,6 +64,10 @@ dependencies {
     // JUnit 5
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
     compileOnly   'javax.annotation:javax.annotation-api:1.3.2'
+
+    // JMH dependencies
+    jmh "org.openjdk.jmh:jmh-core:${jmhVersion}"
+    jmh "org.openjdk.jmh:jmh-generator-annprocess:${jmhVersion}"
 }
 
 /* ----------  Protobuf / gRPC code‑gen ---------- */
@@ -98,3 +104,18 @@ jar {
         )
     }
 }
+
+/* ----------  JMH Configuration ---------- */
+jmh {
+    includes = ['.*Benchmark.*']  // Include classes with "Benchmark" in their name
+    resultFormat = 'JSON'         // Output format for results
+    resultsFile = project.file("${project.buildDir}/reports/jmh/results.json")
+    timeOnIteration = '1s'        // Time per iteration
+    warmupIterations = 2          // Number of warmup iterations
+    iterations = 5                // Number of measurement iterations
+    fork = 2                      // Number of forks
+    failOnError = true            // Fail build on errors during benchmarking
+    forceGC = true                // Force GC between iterations
+    jvmArgsAppend = ['--enable-preview'] // Add any JVM args needed for your project
+}
+
