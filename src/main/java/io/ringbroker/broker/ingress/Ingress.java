@@ -42,8 +42,6 @@ import java.util.concurrent.locks.LockSupport;
  *   Ingress ingress = Ingress.create(registry, ring, dataDir, segmentSize, batchSize);
  *   // Use ingress to ingest data batches
  * </pre>
- *
- * @author (your name)
  */
 @Getter
 public final class Ingress {
@@ -293,8 +291,8 @@ public final class Ingress {
 
             final int bufferIndex = (int) (tailSnapshot & mask);
 
-            BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);         // ① write payload
-            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);     // ② publish slot
+            BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);         // write payload
+            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);     // publish slot
 
             return true;
         }
@@ -321,7 +319,7 @@ public final class Ingress {
             final int bufferIndex = (int) (headSnapshot & mask);
             final byte[] element = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
 
-            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + mask + 1); // ③ mark slot empty
+            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + mask + 1); // mark slot empty
             BUFFER_HANDLE.set(buffer, bufferIndex, null);
 
             return element;
