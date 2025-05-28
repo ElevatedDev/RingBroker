@@ -2,10 +2,10 @@ package io.ringbroker;
 
 import com.google.protobuf.Descriptors.Descriptor;
 import io.ringbroker.broker.ingress.ClusteredIngress;
-import io.ringbroker.cluster.NettyClusterClient;
-import io.ringbroker.cluster.impl.RoundRobinPartitioner;
-import io.ringbroker.cluster.type.Partitioner;
-import io.ringbroker.cluster.type.RemoteBrokerClient;
+import io.ringbroker.cluster.client.RemoteBrokerClient;
+import io.ringbroker.cluster.client.impl.NettyClusterClient;
+import io.ringbroker.cluster.partitioner.Partitioner;
+import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.config.impl.BrokerConfig;
 import io.ringbroker.config.impl.TopicConfig;
 import io.ringbroker.config.type.ConfigLoader;

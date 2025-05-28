@@ -2,7 +2,7 @@ package test;
 
 import com.google.protobuf.Timestamp;
 import io.ringbroker.broker.ingress.ClusteredIngress;
-import io.ringbroker.cluster.impl.RoundRobinPartitioner;
+import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;

@@ -1,8 +1,8 @@
 package io.ringbroker.broker.ingress;
 
 import io.ringbroker.broker.delivery.Delivery;
-import io.ringbroker.cluster.type.Partitioner;
-import io.ringbroker.cluster.type.RemoteBrokerClient;
+import io.ringbroker.cluster.client.RemoteBrokerClient;
+import io.ringbroker.cluster.partitioner.Partitioner;
 import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.OffsetStore;
