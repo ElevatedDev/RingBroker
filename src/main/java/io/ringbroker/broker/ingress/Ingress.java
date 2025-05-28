@@ -19,12 +19,40 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Allocation‑free, lock‑free ingress (no external libs).
+ * Allocation‑free, lock‑free ingress for high-throughput data ingestion.
+ * <p>
+ * This class manages the ingestion of data into a ring buffer, batching incoming messages
+ * and coordinating with a ledger orchestrator for persistence. It is designed to minimize
+ * allocations and avoid locks, using a custom MPMC (multi-producer, multi-consumer) queue
+ * and batch buffer reuse. The class is thread-safe and optimized for low-latency, high-volume
+ * data streams.
+ * <p>
+ * Key features:
+ * <ul>
+ *   <li>Lock-free, allocation-free batching and queuing of messages</li>
+ *   <li>Integration with a {@link RingBuffer} for fast in-memory storage</li>
+ *   <li>Coordination with a {@link LedgerOrchestrator} for durable persistence</li>
+ *   <li>Custom reusable batch buffer to avoid per-batch allocations</li>
+ *   <li>Configurable batch size and queue capacity</li>
+ *   <li>Executor service for background processing</li>
+ * </ul>
+ * <p>
+ * Usage:
+ * <pre>
+ *   Ingress ingress = Ingress.create(registry, ring, dataDir, segmentSize, batchSize);
+ *   // Use ingress to ingest data batches
+ * </pre>
+ *
+ * @author (your name)
  */
 @Getter
 public final class Ingress {
+
+    private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+
     private static final int MAX_RETRIES = 5;
     private static final int QUEUE_CAPACITY_FACTOR = 4;   // queue = FACTOR × batchSize
+    private static final long PARK_NANOS = 1_000; // ≈1 µs
 
     private final TopicRegistry registry;
     private final RingBuffer<byte[]> ring;
@@ -37,7 +65,7 @@ public final class Ingress {
      */
     private final int batchSize;
     private final SlotRing queue;
-    private final byte[][] batchBuf;
+    private final byte[][] batchBuffer;
     private final ByteBatch batchView;
 
     private Ingress(final TopicRegistry registry,
@@ -54,39 +82,77 @@ public final class Ingress {
 
         final int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
         this.queue = new SlotRing(capacity);
-        this.batchBuf = new byte[batchSize][];
-        this.batchView = new ByteBatch(batchBuf);
+        this.batchBuffer = new byte[batchSize][];
+        this.batchView = new ByteBatch(batchBuffer);
     }
 
+    /**
+     * Creates and initializes an {@code Ingress} instance with the provided configuration.
+     * <p>
+     * This static factory method sets up the required executor service, bootstraps the ledger orchestrator,
+     * and starts the background writer loop for batch processing. The returned {@code Ingress} instance
+     * is ready for use.
+     *
+     * @param registry    the topic registry for topic validation and schema lookup
+     * @param ring        the ring buffer for downstream message publishing
+     * @param dataDir     the directory for ledger segment storage
+     * @param segmentSize the size of each ledger segment in bytes
+     * @param batchSize   the maximum number of messages per batch
+     * @return a fully initialized {@code Ingress} instance
+     * @throws IOException if the ledger orchestrator cannot be bootstrapped
+     */
     public static Ingress create(final TopicRegistry registry,
                                  final RingBuffer<byte[]> ring,
                                  final Path dataDir,
                                  final long segmentSize,
                                  final int batchSize) throws IOException {
 
-        final ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor();
 
         final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
-        final Ingress ingress = new Ingress(registry, ring, mgr, exec, batchSize);
+        final Ingress ingress = new Ingress(registry, ring, mgr, EXECUTOR, batchSize);
 
-        exec.submit(ingress::writerLoop);
+        EXECUTOR.submit(ingress::writerLoop);
+
         return ingress;
     }
 
+    /**
+     * Returns the next power of two greater than or equal to the given integer.
+     * If the input is already a power of two, it returns the input itself.
+     *
+     * @param x the input integer
+     * @return the next power of two greater than or equal to x
+     */
     private static int nextPowerOfTwo(final int x) {
         final int highest = Integer.highestOneBit(x);
+
         return (x == highest) ? x : highest << 1;
     }
 
     /**
-     * Convenience wrapper (no retries).
+     * Publishes a message to the specified topic with no retries.
+     * <p>
+     * This is a convenience wrapper for {@link #publish(String, int, byte[])}
+     * that sets the retry count to zero.
+     *
+     * @param topic   the topic to publish to
+     * @param payload the message payload as a byte array
      */
     public void publish(final String topic, final byte[] payload) {
         publish(topic, 0, payload);
     }
 
     /**
-     * Validate topic, route to DLQ if needed, schema-check, then enqueue.
+     * Publishes a message to the specified topic, with support for retries and DLQ routing.
+     * <p>
+     * This method validates the topic, routes to a Dead Letter Queue (DLQ) if the retry count exceeds
+     * the maximum allowed, performs schema validation, and enqueues the message for processing.
+     * If the queue is full, the method spins until space is available.
+     *
+     * @param topic      the topic to publish to
+     * @param retries    the number of previous delivery attempts
+     * @param rawPayload the message payload as a byte array
+     * @throws IllegalArgumentException if the topic or DLQ is not registered
      */
     public void publish(final String topic, final int retries, final byte[] rawPayload) {
         // 1) validate base topic
@@ -110,10 +176,22 @@ public final class Ingress {
         }
     }
 
+    /**
+     * Dependency injection hook. No operation performed.
+     * This method is intended for frameworks that require a post-construction initialization step.
+     */
     @PostConstruct
     @SuppressWarnings("unused")
     private void init() { /* DI hook – no-op */ }
 
+    /**
+     * Continuously drains the queue, batches messages, persists them to disk, and publishes to the ring buffer.
+     * <p>
+     * This method runs in a background thread, waiting for messages to arrive in the queue. It collects up to
+     * {@code batchSize} messages into a batch, appends the batch to the ledger for persistence, and then publishes
+     * each message to the downstream ring buffer for further processing. The method is designed to be lock-free
+     * and allocation-free for high-throughput scenarios.
+     */
     private void writerLoop() {
         try {
             while (!Thread.currentThread().isInterrupted()) {
@@ -122,18 +200,20 @@ public final class Ingress {
                 final byte[] first = queue.poll();
                 if (first == null) {
                     // queue is empty – back off briefly to avoid endless CPU burn
-                    LockSupport.parkNanos(1_000);   // ≈1 µs
+                    LockSupport.parkNanos(PARK_NANOS);   // ≈1 µs
                     continue;
                 }
 
                 /* 2) drain up to batchSize elements in total */
                 int count = 0;
-                batchBuf[count++] = first;
+                batchBuffer[count++] = first;
 
                 while (count < batchSize) {
                     final byte[] next = queue.poll();
+
                     if (next == null) break;
-                    batchBuf[count++] = next;
+
+                    batchBuffer[count++] = next;
                 }
 
                 /* 3) expose array as List<byte[]> without copying */
@@ -145,15 +225,20 @@ public final class Ingress {
                 /* 5) publish to downstream ring */
                 for (int i = 0; i < count; i++) {
                     final long seq = ring.next();
-                    ring.publish(seq, batchBuf[i]);
-                    batchBuf[i] = null; // reclaim slot for next batch
+                    ring.publish(seq, batchBuffer[i]);
+                    batchBuffer[i] = null; // reclaim slot for next batch
                 }
             }
-        } catch (final IOException ioe) {
-            ioe.printStackTrace();
+        } catch (final IOException exception) {
+            exception.printStackTrace();
         }
     }
 
+    /**
+     * Closes the writable segment of the ledger orchestrator, releasing any resources held.
+     *
+     * @throws IOException if an I/O error occurs during closing
+     */
     public void close() throws IOException {
         this.segments.writable().close();
     }
@@ -172,60 +257,74 @@ public final class Ingress {
         }
 
         private final int mask;
-        private final long[] seq;
-        private final byte[][] buf;
+        private final long[] sequence;
+        private final byte[][] buffer;
 
         private final PaddedAtomicLong tail = new PaddedAtomicLong(0);
         private final PaddedAtomicLong head = new PaddedAtomicLong(0);
 
-        SlotRing(int capacityPow2) {
+        SlotRing(final int capacityPow2) {
             mask = capacityPow2 - 1;
-            seq  = new long[capacityPow2];
-            buf  = new byte[capacityPow2][];
-            for (int i = 0; i < capacityPow2; i++) seq[i] = i;
+
+            sequence = new long[capacityPow2];
+            buffer = new byte[capacityPow2][];
+
+            for (int i = 0; i < capacityPow2; i++) sequence[i] = i;
         }
 
-        boolean offer(byte[] e) {
-            long t;
+        boolean offer(final byte[] element) {
+            long tailSnapshot;
+
             while (true) {
-                t = tail.get();
-                long idx = t & mask;
-                long s   = (long) SEQUENCE_HANDLE.getVolatile(seq, (int) idx);
-                long dif = s - t;
-                if (dif == 0) {
-                    if (tail.compareAndSet(t, t + 1)) break;
-                } else if (dif < 0) {
+                tailSnapshot = tail.get();
+
+                final long index = tailSnapshot & mask;
+                final long sequence = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, (int) index);
+                final long difference = sequence - tailSnapshot;
+
+                if (difference == 0) {
+                    if (tail.compareAndSet(tailSnapshot, tailSnapshot + 1)) break;
+                } else if (difference < 0) {
                     return false;              // queue full
                 } else {
                     Thread.onSpinWait();
                 }
             }
-            int i = (int) (t & mask);
-            BUFFER_HANDLE.setRelease(buf, i, e);         // ① write payload
-            SEQUENCE_HANDLE.setRelease(seq, i, t + 1);     // ② publish slot
+
+            final int bufferIndex = (int) (tailSnapshot & mask);
+
+            BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);         // ① write payload
+            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);     // ② publish slot
+
             return true;
         }
 
         byte[] poll() {
-            long h;
+            long headSnapshot;
+
             while (true) {
-                h = head.get();
-                long idx = h & mask;
-                long s   = (long) SEQUENCE_HANDLE.getVolatile(seq, (int) idx);
-                long dif = s - (h + 1);
-                if (dif == 0) {
-                    if (head.compareAndSet(h, h + 1)) break;
-                } else if (dif < 0) {
+                headSnapshot = head.get();
+
+                final long index = headSnapshot & mask;
+                final long sequence = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, (int) index);
+                final long difference = sequence - (headSnapshot + 1);
+
+                if (difference == 0) {
+                    if (head.compareAndSet(headSnapshot, headSnapshot + 1)) break;
+                } else if (difference < 0) {
                     return null;               // queue empty
                 } else {
                     Thread.onSpinWait();
                 }
             }
-            int i = (int) (h & mask);
-            byte[] e = (byte[]) BUFFER_HANDLE.getAcquire(buf, i);
-            SEQUENCE_HANDLE.setRelease(seq, i, h + mask + 1); // ③ mark slot empty
-            BUFFER_HANDLE.set(buf, i, null);
-            return e;
+
+            final int bufferIndex = (int) (headSnapshot & mask);
+            final byte[] element = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
+
+            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + mask + 1); // ③ mark slot empty
+            BUFFER_HANDLE.set(buffer, bufferIndex, null);
+
+            return element;
         }
     }
 
@@ -236,17 +335,23 @@ public final class Ingress {
     private static final class PaddedAtomicLong extends AtomicLong {
         // left padding
         volatile long p1, p2, p3, p4, p5, p6, p7;
-        PaddedAtomicLong(final long initial) { super(initial); }
         // right padding
         volatile long q1, q2, q3, q4, q5, q6, q7;
+
+        PaddedAtomicLong(final long initial) {
+            super(initial);
+        }
     }
 
     /*
      * Tiny reusable List<byte[]> implementation backed by the reusable batchBuf array.
      */
     private static final class ByteBatch extends AbstractList<byte[]> {
+
         private final byte[][] backing;
-        @Setter private int size;
+
+        @Setter
+        private int size;
 
         ByteBatch(final byte[][] backing) {
             this.backing = backing;
@@ -255,6 +360,7 @@ public final class Ingress {
         @Override
         public byte[] get(final int index) {
             if (index >= size) throw new IndexOutOfBoundsException();
+
             return backing[index];
         }
 
