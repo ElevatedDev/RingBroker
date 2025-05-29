@@ -7,7 +7,7 @@ plugins {
     id 'me.champeau.jmh' version '0.7.3'
 }
 
-group   = 'io.ringbroker'
+group = 'io.ringbroker'
 version = '0.1.0-SNAPSHOT'
 
 /* ----------  JVM  ---------- */
@@ -36,6 +36,7 @@ ext {
     jmhVersion = '1.37'
     slf4jVersion = '2.0.17'
     jupiterVersion = '5.12.2'
+    junitPlatformVersion = '1.12.2'  // Added matching platform version
     annotationVersion = '1.3.2'
 }
 
@@ -66,7 +67,9 @@ dependencies {
 
     // JUnit 5
     testImplementation "org.junit.jupiter:junit-jupiter:$jupiterVersion"
-    compileOnly   "javax.annotation:javax.annotation-api:$annotationVersion"
+    testImplementation "org.junit.platform:junit-platform-launcher:$junitPlatformVersion"
+
+    compileOnly "javax.annotation:javax.annotation-api:$annotationVersion"
 
     // JMH dependencies
     jmh "org.openjdk.jmh:jmh-core:${jmhVersion}"
