@@ -15,6 +15,7 @@ public class Benchmarker {
         final Options opt = new OptionsBuilder()
                 .include("io.ringbroker.benchmark.*Benchmark")
                 .exclude(Benchmarker.class.getSimpleName())
+                .exclude(RawTcpClient.class.getSimpleName())
                 .build();
 
         new Runner(opt).run();
