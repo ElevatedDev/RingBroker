@@ -21,7 +21,6 @@ import java.util.Map;
  *   BrokerConfig config = BrokerConfig.load("/path/to/broker.yaml");
  *   int port = config.getGrpcPort();
  * </pre>
- * </p>
  *
  * <b>Configuration properties:</b>
  * <ul>
@@ -60,7 +59,6 @@ public final class BrokerConfig {
      * with the configuration properties defined in the file. The expected properties include grpcPort,
      * topicsFile, totalPartitions, nodeId, clusterSize, ledgerPath, ringSize, segmentBytes, batchSize,
      * and idempotentMode.
-     * </p>
      *
      * @param path the path to the YAML configuration file
      * @return a populated {@code BrokerConfig} instance

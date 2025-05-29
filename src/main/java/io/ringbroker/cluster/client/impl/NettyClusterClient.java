@@ -31,7 +31,6 @@ import java.net.InetSocketAddress;
  *   client.sendMessage("topic", keyBytes, payloadBytes);
  *   client.close();
  * </pre>
- * </p>
  */
 public final class NettyClusterClient implements RemoteBrokerClient {
 

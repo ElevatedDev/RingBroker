@@ -12,20 +12,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-/**
- * Utility class for loading broker and topic configuration from YAML files.
- * <p>
- * {@code ConfigLoader} provides static methods to load {@link BrokerConfig} and a list of {@link TopicConfig}
- * from their respective YAML configuration files. It delegates broker configuration loading to {@link BrokerConfig#load(String)},
- * and parses topic definitions from a YAML file structured with a {@code topics} list.
- * <p>
- * Example usage:
- * <pre>
- *   BrokerConfig brokerConfig = ConfigLoader.load("/path/to/broker.yaml");
- *   List<TopicConfig> topics = ConfigLoader.loadTopics("/path/to/topics.yaml");
- * </pre>
- * </p>
- */
 public final class ConfigLoader {
 
     /**
@@ -52,8 +38,6 @@ public final class ConfigLoader {
      * </pre>
      *
      * @param path the path to the topics YAML configuration file
-     * @return a list of {@link TopicConfig} instances
-     * @throws IOException if the file cannot be read or parsed
      * @throws ClassCastException if the YAML structure does not match the expected format
      */
     @SuppressWarnings("unchecked")
