@@ -1,8 +1,9 @@
+// ── src/main/java/io/ringbroker/cluster/client/impl/NettyClusterClient.java
 package io.ringbroker.cluster.client.impl;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioIoHandler;
+import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
@@ -11,62 +12,49 @@ import io.ringbroker.cluster.client.RemoteBrokerClient;
 
 import java.net.InetSocketAddress;
 
-/**
- * {@code NettyClusterClient} is a concrete implementation of {@link RemoteBrokerClient} that uses Netty
- * to forward messages to another broker node in a distributed cluster. It establishes a persistent
- * TCP connection to a remote broker using Netty's asynchronous networking framework and encodes messages
- * using Protocol Buffers.
- * <p>
- * This client is responsible for:
- * <ul>
- *   <li>Establishing and managing a Netty channel to the remote broker.</li>
- *   <li>Encoding messages with a length field and Protocol Buffers for transmission.</li>
- *   <li>Forwarding messages to the remote broker using the {@code sendMessage} method.</li>
- *   <li>Gracefully closing the connection and releasing resources when no longer needed.</li>
- * </ul>
- * <p>
- * Usage example:
- * <pre>
- *   NettyClusterClient client = new NettyClusterClient("host", port);
- *   client.sendMessage("topic", keyBytes, payloadBytes);
- *   client.close();
- * </pre>
- */
 public final class NettyClusterClient implements RemoteBrokerClient {
-
-    private static final IoHandlerFactory SHARED_FACTORY = NioIoHandler.newFactory();
-
     private final Channel channel;
-    private final EventLoopGroup group;
+    private final EventLoopGroup   group;
 
     public NettyClusterClient(final String host, final int port) throws InterruptedException {
-        group = new MultiThreadIoEventLoopGroup(SHARED_FACTORY);
+        this.group = new NioEventLoopGroup(1);
 
         final Bootstrap bootstrap = new Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel.class)
                 .handler(new ChannelInitializer<>() {
-                    @Override
-                    protected void initChannel(final Channel ch) {
+                    @Override protected void initChannel(final Channel ch) {
                         ch.pipeline()
                                 .addLast(new LengthFieldPrepender(4))
                                 .addLast(new ProtobufEncoder());
                     }
                 });
 
-        channel = bootstrap.connect(new InetSocketAddress(host, port)).sync().channel();
+        this.channel = bootstrap.connect(new InetSocketAddress(host, port))
+                .sync().channel();
     }
 
     @Override
-    public void sendMessage(final String topic, final byte[] key, final byte[] payload) {
-        final var message = BrokerApi.Message.newBuilder()
+    public void sendMessage(final String topic,
+                            final byte[] key,
+                            final byte[] payload) {
+
+        var msg = BrokerApi.Message.newBuilder()
                 .setTopic(topic)
                 .setRetries(0)
-                .setKey(com.google.protobuf.ByteString.copyFrom(key))
+                .setKey(key == null ? com.google.protobuf.ByteString.EMPTY
+                        : com.google.protobuf.ByteString.copyFrom(key))
                 .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
                 .build();
 
-        channel.writeAndFlush(BrokerApi.Envelope.newBuilder().setPublish(message).build());
+        channel.writeAndFlush(
+                BrokerApi.Envelope.newBuilder().setPublish(msg).build());
+    }
+
+    /** Zero-copy replication path. */
+    @Override
+    public void sendEnvelope(final BrokerApi.Envelope envelope) {
+        channel.writeAndFlush(envelope);
     }
 
     public void close() {

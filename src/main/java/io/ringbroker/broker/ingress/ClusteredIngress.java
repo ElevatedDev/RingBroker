@@ -1,9 +1,13 @@
 package io.ringbroker.broker.ingress;
 
+import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.delivery.Delivery;
+import io.ringbroker.broker.role.BrokerRole;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
+import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.Partitioner;
-import io.ringbroker.core.ring.RingBuffer;
+import io.ringbroker.core.ring.memory.RingBuffer;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.OffsetStore;
 import io.ringbroker.registry.TopicRegistry;
@@ -46,6 +50,9 @@ public final class ClusteredIngress {
     private final Map<Integer, Delivery> deliveryMap;                   // per-partition delivery
     private final OffsetStore offsetStore;
     private final TopicRegistry registry;
+    private final BrokerRole myRole;
+    private final ReplicaSetResolver replicaResolver;
+    private final FlashReplicator replicator;
 
     public static ClusteredIngress create(final TopicRegistry registry,
                                           final Partitioner partitioner,
@@ -59,7 +66,10 @@ public final class ClusteredIngress {
                                           final long segmentSize,
                                           final int batchSize,
                                           final boolean idempotentMode,
-                                          final OffsetStore offsetStore) throws IOException {
+                                          final OffsetStore offsetStore,
+                                          final BrokerRole brokerRole,
+                                          final ReplicaSetResolver replicaResolver,
+                                          final FlashReplicator replicator) throws IOException {
 
         final Map<Integer, Ingress> ingressMap = new HashMap<>();
         final Map<Integer, Delivery> deliveryMap = new HashMap<>();
@@ -72,13 +82,17 @@ public final class ClusteredIngress {
                 final Path partDir = baseDataDir.resolve("partition-" + pid);
                 final RingBuffer<byte[]> ring = new RingBuffer<>(ringSize, waitStrategy);
 
+                boolean durable = brokerRole == BrokerRole.PERSISTENCE;
+
                 final Ingress ingress = Ingress.create(
                         registry,
                         ring,
                         partDir,
                         segmentSize,
-                        batchSize
+                        batchSize,
+                        durable
                 );
+
                 ingressMap.put(pid, ingress);
 
                 final Delivery delivery = new Delivery(ring);
@@ -101,7 +115,10 @@ public final class ClusteredIngress {
                 seenMessageIds,
                 deliveryMap,
                 offsetStore,
-                registry
+                registry,
+                brokerRole,
+                replicaResolver,
+                replicator
         );
     }
 
@@ -125,40 +142,79 @@ public final class ClusteredIngress {
      * @param retries  the number of retry attempts for publishing
      * @param payload  the message payload
      */
-    public void publish(final String topic, final byte[] key, final int retries, final byte[] payload) {
+    public void publish(final String topic,
+                        final byte[] key,
+                        final int    retries,
+                        final byte[] payload) {
+
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
-        final int owner = Math.floorMod(partitionId, clusterSize);
+        final int owner       = Math.floorMod(partitionId, clusterSize);
 
+        // 1. local persistence broker owns partition
         if (owner == myNodeId) {
-            if (idempotentMode) {
-                final Set<String> seen = Objects.requireNonNull(seenMessageIds.get(partitionId));
-                final String msgId = computeMessageId(partitionId, key, payload);
-
-                if (!seen.add(msgId)) {
-                    log.debug("Duplicate skipped: partition={} id={}", partitionId, msgId);
-                    return;
-                }
-            }
-
-            final Ingress ingress = ingressMap.get(partitionId);
-
-            if (ingress == null) {
-                log.error("No local Ingress for partition {}", partitionId);
-                return;
-            }
-
-            ingress.publish(topic, retries, payload);
-        } else {
-            final RemoteBrokerClient client = clusterNodes.get(owner);
-
-            if (client == null) {
-                log.error("No RemoteBrokerClient for node {} (partition {})", owner, partitionId);
-                return;
-            }
-
-            client.sendMessage(topic, key, payload);
+            handleLocalPublish(partitionId, topic, retries, payload, key);
+            return;
         }
+
+        // 2. I'm an ingestion broker -> replicate to the current replica set
+        if (myRole == BrokerRole.INGESTION) {
+            var msg = BrokerApi.Message.newBuilder()
+                    .setTopic(topic)
+                    .setRetries(retries)
+                    .setKey(key == null ? com.google.protobuf.ByteString.EMPTY
+                            : com.google.protobuf.ByteString.copyFrom(key))
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                    .build();
+
+            var env = BrokerApi.Envelope.newBuilder().setPublish(msg).build();
+            var replicas = replicaResolver.replicas(partitionId);
+
+            replicator.replicate(env, replicas);
+            return;
+        }
+
+        final RemoteBrokerClient client = clusterNodes.get(owner);
+        if (client == null) {
+            log.error("No RemoteBrokerClient for node {} (partition {})", owner, partitionId);
+            return;
+        }
+
+        client.sendMessage(topic, key, payload);
     }
+
+    /**
+     * Handles a publish request when this node is the owner of {@code partitionId}.
+     * Performs the same steps the old inline code did:
+     *  1. Optional idempotent duplicate check
+     *  2. Look-up the local {@link Ingress}
+     *  3. Forward the call to {@code ingress.publish(...)}
+     */
+    private void handleLocalPublish(final int    partitionId,
+                                    final String topic,
+                                    final int    retries,
+                                    final byte[] payload,
+                                    final byte[] key) {
+
+        if (idempotentMode) {
+            final Set<String> seen = Objects.requireNonNull(
+                    seenMessageIds.get(partitionId), "seen set missing");
+
+            final String msgId = computeMessageId(partitionId, key, payload);
+            if (!seen.add(msgId)) {
+                log.debug("Duplicate skipped: partition={} id={}", partitionId, msgId);
+                return;
+            }
+        }
+
+        final Ingress ingress = ingressMap.get(partitionId);
+        if (ingress == null) {
+            log.error("No local Ingress for partition {}", partitionId);
+            return;
+        }
+
+        ingress.publish(topic, retries, payload);
+    }
+
 
     /**
      * Subscribes to a topic across all owned partitions, starting from the committed offset for each partition.

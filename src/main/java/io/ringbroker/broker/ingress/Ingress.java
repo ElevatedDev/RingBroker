@@ -1,16 +1,20 @@
 package io.ringbroker.broker.ingress;
 
 import com.google.protobuf.DynamicMessage;
-import io.ringbroker.core.ring.RingBuffer;
+import io.ringbroker.core.ring.memory.RingBuffer;
+import io.ringbroker.ledger.append.Appendable;
 import io.ringbroker.ledger.orchestrator.LedgerOrchestrator;
+import io.ringbroker.ledger.replica.ReplicatedLedger;
 import io.ringbroker.registry.TopicRegistry;
 import lombok.Getter;
 import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.AbstractList;
 import java.util.concurrent.ExecutorService;
@@ -44,6 +48,7 @@ import java.util.concurrent.locks.LockSupport;
  * </pre>
  */
 @Getter
+@Slf4j
 public final class Ingress {
 
     private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -65,10 +70,12 @@ public final class Ingress {
     private final SlotRing queue;
     private final byte[][] batchBuffer;
     private final ByteBatch batchView;
+    private final Appendable durableLedger;
 
     private Ingress(final TopicRegistry registry,
                     final RingBuffer<byte[]> ring,
                     final LedgerOrchestrator segments,
+                    final Appendable durableLedger,
                     final ExecutorService pool,
                     final int batchSize) {
 
@@ -82,6 +89,7 @@ public final class Ingress {
         this.queue = new SlotRing(capacity);
         this.batchBuffer = new byte[batchSize][];
         this.batchView = new ByteBatch(batchBuffer);
+        this.durableLedger = durableLedger;
     }
 
     /**
@@ -99,21 +107,28 @@ public final class Ingress {
      * @return a fully initialized {@code Ingress} instance
      * @throws IOException if the ledger orchestrator cannot be bootstrapped
      */
-    public static Ingress create(final TopicRegistry registry,
+    public static Ingress create(final TopicRegistry      registry,
                                  final RingBuffer<byte[]> ring,
-                                 final Path dataDir,
-                                 final long segmentSize,
-                                 final int batchSize) throws IOException {
+                                 final Path               dataDir,
+                                 final long               segmentSize,
+                                 final int                batchSize,
+                                 final boolean            durable) throws IOException {
 
+        final LedgerOrchestrator mgr =
+                LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
 
-        final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
-        final Ingress ingress = new Ingress(registry, ring, mgr, EXECUTOR, batchSize);
+        Appendable crashSafe = null;
+
+        if (durable) {
+            crashSafe = new ReplicatedLedger(dataDir, segmentSize);
+        }
+
+        final Ingress ingress =
+                new Ingress(registry, ring, mgr, crashSafe, EXECUTOR, batchSize);
 
         EXECUTOR.submit(ingress::writerLoop);
-
         return ingress;
     }
-
     /**
      * Returns the next power of two greater than or equal to the given integer.
      * If the input is already a power of two, it returns the input itself.
@@ -194,41 +209,42 @@ public final class Ingress {
         try {
             while (!Thread.currentThread().isInterrupted()) {
 
-                /* 1) wait for at least one element */
+                /* 1) block until at least one element is present */
                 final byte[] first = queue.poll();
                 if (first == null) {
-                    // queue is empty – back off briefly to avoid endless CPU burn
-                    LockSupport.parkNanos(PARK_NANOS);   // ≈1 µs
+                    LockSupport.parkNanos(PARK_NANOS);
                     continue;
                 }
 
-                /* 2) drain up to batchSize elements in total */
+                /* 2) drain up to batchSize msgs */
                 int count = 0;
                 batchBuffer[count++] = first;
-
                 while (count < batchSize) {
-                    final byte[] next = queue.poll();
-
+                    byte[] next = queue.poll();
                     if (next == null) break;
-
                     batchBuffer[count++] = next;
                 }
 
-                /* 3) expose array as List<byte[]> without copying */
                 batchView.setSize(count);
 
-                /* 4) disk append */
-                segments.writable().appendBatch(batchView);
+                /* 3) disk append – two paths */
+                if (durableLedger != null) {
+                    for (int i = 0; i < count; i++) {
+                        durableLedger.append(ByteBuffer.wrap(batchBuffer[i]));
+                    }
+                } else {
+                    segments.writable().appendBatch(batchView);
+                }
 
-                /* 5) publish to downstream ring */
+                /* 4) publish to downstream ring */
                 for (int i = 0; i < count; i++) {
-                    final long seq = ring.next();
+                    long seq = ring.next();
                     ring.publish(seq, batchBuffer[i]);
-                    batchBuffer[i] = null; // reclaim slot for next batch
+                    batchBuffer[i] = null;
                 }
             }
-        } catch (final IOException exception) {
-            exception.printStackTrace();
+        } catch (IOException | RuntimeException ex) {
+            log.error("Ingress writer failed", ex);
         }
     }
 

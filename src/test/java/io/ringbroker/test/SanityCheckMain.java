@@ -2,6 +2,9 @@ package io.ringbroker.test;
 
 import com.google.protobuf.Timestamp;
 import io.ringbroker.broker.ingress.ClusteredIngress;
+import io.ringbroker.broker.role.BrokerRole;
+import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.offset.InMemoryOffsetStore;
@@ -54,6 +57,14 @@ class SanityCheckMain {
                 .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
                 .build();
 
+        final ReplicaSetResolver resolver = new ReplicaSetResolver(
+                1,
+                List::of);
+
+        final FlashReplicator replicator  = new FlashReplicator(
+                1,
+                Map.of());
+
         final ClusteredIngress ingress = ClusteredIngress.create(
                 registry,
                 new RoundRobinPartitioner(),
@@ -67,7 +78,10 @@ class SanityCheckMain {
                 SEGMENT_BYTES,
                 BATCH_SIZE,
                 /* flushOnWrite */ false,
-                new InMemoryOffsetStore()
+                new InMemoryOffsetStore(),
+                BrokerRole.PERSISTENCE,
+                resolver,
+                replicator
         );
 
         final RoundRobinPartitioner psel = new RoundRobinPartitioner();
