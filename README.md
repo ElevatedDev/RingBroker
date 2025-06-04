@@ -81,6 +81,7 @@ Example `broker.yaml`:
 ```yaml
 grpcPort:       9090
 clusterSize:    3
+replicationFactor: 2
 nodeId:         0
 totalPartitions: 16
 ringSize:       1048576
@@ -179,6 +180,7 @@ This design isolates high-throughput message flows from low-volume admin logic.
 |------------------|---------|------------------------------------------|
 | `grpcPort`       | int     | Port for gRPC admin interface            |
 | `clusterSize`    | int     | Total number of nodes in the cluster     |
+| `replicationFactor`| int   | Number of replicas per partition        |
 | `nodeId`         | int     | This node's ID (0-based)                 |
 | `totalPartitions`| int     | Number of partitions globally            |
 | `ringSize`       | int     | In-memory ring size (slots per partition)|

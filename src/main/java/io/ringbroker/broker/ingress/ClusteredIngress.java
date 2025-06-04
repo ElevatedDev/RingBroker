@@ -3,6 +3,7 @@ package io.ringbroker.broker.ingress;
 import io.ringbroker.broker.delivery.Delivery;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
 import io.ringbroker.cluster.partitioner.Partitioner;
+import io.ringbroker.cluster.manager.ClusterManager;
 import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.OffsetStore;
@@ -38,9 +39,10 @@ public final class ClusteredIngress {
     private final Partitioner partitioner;
     private final int totalPartitions;
     private final int myNodeId;
-    private final int clusterSize;
     private final Map<Integer, Ingress> ingressMap;                     // one Ingress per local partition
+    private final int clusterSize;
     private final Map<Integer, RemoteBrokerClient> clusterNodes;        // stubs to other brokers
+    private final ClusterManager clusterManager;
     private final boolean idempotentMode;
     private final Map<Integer, Set<String>> seenMessageIds;             // only used if idempotentMode
     private final Map<Integer, Delivery> deliveryMap;                   // per-partition delivery
@@ -58,6 +60,7 @@ public final class ClusteredIngress {
                                           final WaitStrategy waitStrategy,
                                           final long segmentSize,
                                           final int batchSize,
+                                          final int replicationFactor,
                                           final boolean idempotentMode,
                                           final OffsetStore offsetStore) throws IOException {
 
@@ -90,13 +93,16 @@ public final class ClusteredIngress {
             }
         }
 
+        final ClusterManager mgr = new ClusterManager(clusterNodes, myNodeId, replicationFactor);
+
         return new ClusteredIngress(
                 partitioner,
                 totalPartitions,
                 myNodeId,
-                clusterSize,
                 ingressMap,
+                clusterSize,
                 clusterNodes,
+                mgr,
                 idempotentMode,
                 seenMessageIds,
                 deliveryMap,
@@ -127,7 +133,7 @@ public final class ClusteredIngress {
      */
     public void publish(final String topic, final byte[] key, final int retries, final byte[] payload) {
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
-        final int owner = Math.floorMod(partitionId, clusterSize);
+        final int owner = clusterManager.getLeader(partitionId);
 
         if (owner == myNodeId) {
             if (idempotentMode) {
@@ -149,7 +155,7 @@ public final class ClusteredIngress {
 
             ingress.publish(topic, retries, payload);
         } else {
-            final RemoteBrokerClient client = clusterNodes.get(owner);
+            final RemoteBrokerClient client = clusterManager.clientFor(owner);
 
             if (client == null) {
                 log.error("No RemoteBrokerClient for node {} (partition {})", owner, partitionId);

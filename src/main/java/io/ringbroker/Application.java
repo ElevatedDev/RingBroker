@@ -108,6 +108,7 @@ public class Application {
                 new AdaptiveSpin(),
                 cfg.getSegmentBytes(),
                 cfg.getBatchSize(),
+                cfg.getReplicationFactor(),
                 cfg.isIdempotentMode(),
                 store
         );

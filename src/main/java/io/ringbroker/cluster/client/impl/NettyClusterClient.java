@@ -69,6 +69,12 @@ public final class NettyClusterClient implements RemoteBrokerClient {
         channel.writeAndFlush(BrokerApi.Envelope.newBuilder().setPublish(message).build());
     }
 
+    @Override
+    public void sendHeartbeat(final int fromNode) {
+        // Heartbeats reuse the Envelope frame with no payload
+        channel.writeAndFlush(BrokerApi.Envelope.newBuilder().build());
+    }
+
     public void close() {
         channel.close();
         group.shutdownGracefully();

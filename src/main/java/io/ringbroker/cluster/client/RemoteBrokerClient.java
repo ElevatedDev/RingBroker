@@ -19,4 +19,13 @@ public interface RemoteBrokerClient {
      * @param payload message payload bytes
      */
     void sendMessage(String topic, byte[] key, byte[] payload);
+
+    /**
+     * Sends a heartbeat to the remote broker.
+     *
+     * @param fromNode the ID of the sending node
+     */
+    default void sendHeartbeat(int fromNode) {
+        // optional operation
+    }
 }

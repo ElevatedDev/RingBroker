@@ -51,6 +51,7 @@ public final class BrokerConfig {
     private int ingressThreads;
     private int batchSize;
     private boolean idempotentMode;
+    private int replicationFactor;
 
     /**
      * Loads broker configuration from a YAML file at the specified path.
@@ -82,6 +83,8 @@ public final class BrokerConfig {
             cfg.segmentBytes = (Integer) map.get("segmentBytes");
             cfg.batchSize = (Integer) map.get("batchSize");
             cfg.idempotentMode = (Boolean) map.get("idempotentMode");
+            Object rf = map.get("replicationFactor");
+            cfg.replicationFactor = rf == null ? 1 : (Integer) rf;
 
             return cfg;
         }

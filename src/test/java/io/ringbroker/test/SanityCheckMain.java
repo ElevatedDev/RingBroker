@@ -66,7 +66,8 @@ class SanityCheckMain {
                 new AdaptiveSpin(),
                 SEGMENT_BYTES,
                 BATCH_SIZE,
-                /* flushOnWrite */ false,
+                1,
+                false,
                 new InMemoryOffsetStore()
         );
 
