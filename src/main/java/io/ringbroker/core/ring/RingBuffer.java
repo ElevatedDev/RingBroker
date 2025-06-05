@@ -9,7 +9,7 @@ import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Multi-producer, single-consumer ring buffer.
+ * Multi‐producer, single‐consumer ring buffer.
  *
  * @param <E> the type of entry stored in the ring
  */
@@ -28,10 +28,10 @@ public final class RingBuffer<E> {
     private final int mask;
     private final Sequence cursor = new Sequence(-1);       // last published sequence
     private final Barrier barrier;
-    private final AtomicLong claim = new AtomicLong(-1);    // last claimed sequence (for producers)
+    private final AtomicLong claim = new AtomicLong(-1);     // last claimed sequence (for publishers)
 
     /**
-     * @param size         power-of-two number of slots in the buffer
+     * @param size         power‐of‐two number of slots in the buffer
      * @param waitStrategy strategy for consumer wait/notification
      */
     public RingBuffer(final int size, final WaitStrategy waitStrategy) {
@@ -45,44 +45,45 @@ public final class RingBuffer<E> {
 
     /**
      * Reserve the next sequence number for publishing.
-     * Multi-producer safe.
+     * Multi‐producer safe. Each producer gets a unique sequence by incrementing atomically.
      */
     public long next() {
-        // Atomically increment the claim counter to get a unique sequence
         return claim.incrementAndGet();
     }
 
     /**
      * Publish an entry at the given sequence.
-     * This makes the entry visible to the consumer.
+     * This makes the entry visible to the consumer, but with only one volatile write
+     * instead of a CAS loop for every producer.
      *
      * @param seq   the sequence obtained from {@link #next()}
      * @param entry the entry to publish
      */
     public void publish(final long seq, final E entry) {
-        // Set the entry in the array (release semantics to ensure visibility)
-        ARRAY_HANDLE.setRelease(entries, (int) (seq & mask), entry);
-        // Move the cursor to seq (only when it was seq-1, ensuring order)
-        while (!cursor.cas(seq - 1, seq)) {
+        final int index = (int) (seq & mask);
+        ARRAY_HANDLE.setRelease(entries, index, entry);
+
+        while (cursor.getValue() != seq - 1) {
             Thread.onSpinWait();
         }
-        // Signal any waiting consumer that a new entry is available
+
+        cursor.setValue(seq);
         barrier.signal();
     }
 
     /**
      * Get the entry at the given sequence, waiting if necessary until it is available.
      *
-     * @param seq the sequence to retrieve (must be &lt;= published cursor)
+     * @param seq the sequence to retrieve (must be <= published cursor)
      * @return the entry at that sequence
-     * @throws InterruptedException if interrupted while waiting
      */
     @SuppressWarnings("unchecked")
     public E get(final long seq) throws InterruptedException {
         // Wait until the ring's cursor has advanced to at least seq
         barrier.waitFor(seq);
         // Load the entry (acquire semantics to ensure we see the published entry)
-        return (E) ARRAY_HANDLE.getAcquire(entries, (int) (seq & mask));
+        final int index = (int) (seq & mask);
+        return (E) ARRAY_HANDLE.getAcquire(entries, index);
     }
 
     /**
