@@ -130,7 +130,6 @@ public final class ClusteredIngress {
     public void publish(final String topic, final byte[] key, final byte[] payload) {
         final long defaultCorrelationId = (myRole == BrokerRole.INGESTION) ? System.nanoTime() : 0L;
 
-        log.warn("ClusteredIngress.publish(topic,key,payload) called without explicit correlationId. Using default: {}", defaultCorrelationId);
         publish(defaultCorrelationId, topic, key, 0, payload);
     }
 
