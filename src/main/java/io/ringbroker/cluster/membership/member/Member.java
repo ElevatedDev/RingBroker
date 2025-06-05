@@ -4,7 +4,9 @@ import io.ringbroker.broker.role.BrokerRole;
 
 import java.net.InetSocketAddress;
 
-/** Immutable membership entry, updated on each valid heartbeat. */
+/**
+ * Immutable membership entry, updated on each valid heartbeat.
+ */
 public record Member(int brokerId,
                      BrokerRole role,
                      InetSocketAddress address,

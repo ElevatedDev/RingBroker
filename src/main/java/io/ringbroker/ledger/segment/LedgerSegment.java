@@ -14,7 +14,6 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.zip.CRC32;
 import java.util.zip.CRC32C;
@@ -28,26 +27,30 @@ import java.util.zip.CRC32C;
  */
 @Slf4j
 public final class LedgerSegment implements AutoCloseable {
-
-    /* ─── Layout Constants ────────────────────────────────────────────────── */
-    private static final int MAGIC_POS        = 0;                     // int   (4 bytes)
-    private static final int VERSION_POS      = MAGIC_POS + Integer.BYTES; // short (2 bytes)
-    private static final int CRC_POS          = VERSION_POS + Short.BYTES;   // int   (4 bytes) - CRC32C of header (excluding this field)
+    private static final int MAGIC_POS = 0;                     // int   (4 bytes)
+    private static final int VERSION_POS = MAGIC_POS + Integer.BYTES; // short (2 bytes)
+    private static final int CRC_POS = VERSION_POS + Short.BYTES;   // int   (4 bytes) - CRC32C of header (excluding this field)
     private static final int FIRST_OFFSET_POS = CRC_POS + Integer.BYTES;   // long  (8 bytes) - Global offset of the first record
-    private static final int LAST_OFFSET_POS  = FIRST_OFFSET_POS + Long.BYTES; // long  (8 bytes) - Global offset of the last record
+    private static final int LAST_OFFSET_POS = FIRST_OFFSET_POS + Long.BYTES; // long  (8 bytes) - Global offset of the last record
 
-    /** Total size of the segment header. */
+    /**
+     * Total size of the segment header.
+     */
     public static final int HEADER_SIZE = LAST_OFFSET_POS + Long.BYTES;  // 26 bytes total
 
-    /** Minimum size of a record: length (4) + crc (4) + at least 1 byte payload. */
+    /**
+     * Minimum size of a record: length (4) + crc (4) + at least 1 byte payload.
+     */
     private static final int MIN_RECORD_OVERHEAD = Integer.BYTES + Integer.BYTES;
     private static final int MIN_RECORD_SIZE = MIN_RECORD_OVERHEAD + 1;
 
-
-    /* ─── Unsafe & Offsets ────────────────────────────────────────────────── */
     private static final Unsafe UNSAFE = initUnsafe();
-    private static final long FIRST_OFF_OFFSET_IN_OBJECT; // Unsafe offset for 'firstOffset' field
-    private static final long LAST_OFF_OFFSET_IN_OBJECT;  // Unsafe offset for 'lastOffset' field
+
+    private static final long FIRST_OFF_OFFSET_IN_OBJECT;
+    private static final long LAST_OFF_OFFSET_IN_OBJECT;
+
+    private static final ThreadLocal<CRC32> RECORD_CRC32_TL = ThreadLocal.withInitial(CRC32::new);
+    private static final ThreadLocal<CRC32C> HEADER_CRC32C_TL = ThreadLocal.withInitial(CRC32C::new);
 
     static {
         try {
@@ -58,21 +61,23 @@ public final class LedgerSegment implements AutoCloseable {
         }
     }
 
-    /* ─── Thread-Local CRC instances ──────────────────────────────────────── */
-    private static final ThreadLocal<CRC32> RECORD_CRC32_TL = ThreadLocal.withInitial(CRC32::new);
-    private static final ThreadLocal<CRC32C> HEADER_CRC32C_TL = ThreadLocal.withInitial(CRC32C::new);
-
-
-    /* ─── Instance Fields ─────────────────────────────────────────────────── */
-    @Getter private final Path file;
-    @Getter private final int capacity;
+    @Getter
+    private final Path file;
+    @Getter
+    private final int capacity;
     private final MappedByteBuffer buf;
     private final boolean skipRecordCrc;
 
-    /** Global offset of the first record in this segment. 0 if segment is empty. */
-    @Getter private volatile long firstOffset;
-    /** Global offset of the last record in this segment. 0 if segment is empty. */
-    @Getter private volatile long lastOffset;
+    /**
+     * Global offset of the first record in this segment. 0 if segment is empty.
+     */
+    @Getter
+    private volatile long firstOffset;
+    /**
+     * Global offset of the last record in this segment. 0 if segment is empty.
+     */
+    @Getter
+    private volatile long lastOffset;
 
 
     private LedgerSegment(final Path file, final int capacity, final MappedByteBuffer buf, final boolean skipRecordCrc) throws IOException {
@@ -100,8 +105,8 @@ public final class LedgerSegment implements AutoCloseable {
      * Creates a new, empty ledger segment file.
      * The file is pre-allocated to the given capacity and the header is written and forced to disk.
      *
-     * @param file Path to the segment file to be created.
-     * @param capacity Total capacity of the segment file in bytes.
+     * @param file          Path to the segment file to be created.
+     * @param capacity      Total capacity of the segment file in bytes.
      * @param skipRecordCrc If true, CRC for individual records will not be calculated or written (CRC field will be 0).
      * @return A new {@link LedgerSegment} instance.
      * @throws IOException If an I/O error occurs during file creation or mapping.
@@ -139,7 +144,7 @@ public final class LedgerSegment implements AutoCloseable {
      * This method assumes that {@link LedgerOrchestrator} has already been
      * called on the file to ensure its integrity and truncate any corrupt/partial data.
      *
-     * @param file Path to the existing segment file.
+     * @param file          Path to the existing segment file.
      * @param skipRecordCrc If true, CRC for newly appended records will not be calculated.
      * @return A {@link LedgerSegment} instance for the existing file.
      * @throws IOException If an I/O error occurs or header validation fails.
@@ -155,6 +160,30 @@ public final class LedgerSegment implements AutoCloseable {
 
             return new LedgerSegment(file, (int) fileSize, map, skipRecordCrc);
         }
+    }
+
+    private static void calculateAndWriteHeaderCrc(final MappedByteBuffer map) {
+        final int crc = calculateHeaderCrc(map);
+        map.putInt(CRC_POS, crc);
+    }
+
+    private static int calculateHeaderCrc(final MappedByteBuffer map) {
+        final ByteBuffer view = map.asReadOnlyBuffer();
+        view.order(map.order());
+        view.position(MAGIC_POS);
+
+        final byte[] headerBytes = new byte[HEADER_SIZE];
+        view.get(headerBytes);
+
+        // Zero out the CRC field in the copied bytes for calculation
+        for (int i = CRC_POS; i < CRC_POS + Integer.BYTES; i++) {
+            headerBytes[i] = 0;
+        }
+
+        final CRC32C crcCalculator = HEADER_CRC32C_TL.get();
+        crcCalculator.reset();
+        crcCalculator.update(headerBytes, 0, HEADER_SIZE);
+        return (int) crcCalculator.getValue();
     }
 
     private void readAndVerifyHeader() throws IOException {
@@ -225,31 +254,6 @@ public final class LedgerSegment implements AutoCloseable {
         return buf.position();
     }
 
-
-    private static void calculateAndWriteHeaderCrc(final MappedByteBuffer map) {
-        final int crc = calculateHeaderCrc(map);
-        map.putInt(CRC_POS, crc);
-    }
-
-    private static int calculateHeaderCrc(final MappedByteBuffer map) {
-        final ByteBuffer view = map.asReadOnlyBuffer();
-        view.order(map.order());
-        view.position(MAGIC_POS);
-
-        final byte[] headerBytes = new byte[HEADER_SIZE];
-        view.get(headerBytes); // Read the current header state
-
-        // Zero out the CRC field in the copied bytes for calculation
-        for (int i = CRC_POS; i < CRC_POS + Integer.BYTES; i++) {
-            headerBytes[i] = 0;
-        }
-
-        final CRC32C crcCalculator = HEADER_CRC32C_TL.get();
-        crcCalculator.reset();
-        crcCalculator.update(headerBytes, 0, HEADER_SIZE);
-        return (int) crcCalculator.getValue();
-    }
-
     /**
      * Appends a single record to the segment. This operation is not necessarily durable
      * until {@link MappedByteBuffer#force()} is called.
@@ -293,9 +297,10 @@ public final class LedgerSegment implements AutoCloseable {
         if (this.firstOffset == 0) {
             UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET_IN_OBJECT, newGlobalOffset);
         }
-        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET_IN_OBJECT, newGlobalOffset);
 
+        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET_IN_OBJECT, newGlobalOffset);
         updateHeaderOnDisk();
+
         return newGlobalOffset;
     }
 
@@ -314,7 +319,7 @@ public final class LedgerSegment implements AutoCloseable {
         }
 
         int totalSpaceNeeded = 0;
-        for (byte[] msg : messages) {
+        for (final byte[] msg : messages) {
             totalSpaceNeeded += (MIN_RECORD_OVERHEAD + msg.length);
         }
 
@@ -391,6 +396,11 @@ public final class LedgerSegment implements AutoCloseable {
         return offsets;
     }
 
+    /**
+     * Updates the segment header on disk with the current first and last offsets.
+     * This method is called after appending records to ensure the header reflects
+     * the latest state of the segment.
+     */
     private void updateHeaderOnDisk() {
         final int savedPosition = buf.position();
         try {
@@ -409,6 +419,7 @@ public final class LedgerSegment implements AutoCloseable {
 
     /**
      * Checks if the segment is full, meaning there isn't enough space for even a minimal record.
+     *
      * @return True if the segment is full, false otherwise.
      */
     public boolean isFull() {
@@ -424,12 +435,12 @@ public final class LedgerSegment implements AutoCloseable {
         if (buf != null) {
             try {
                 buf.force();
-            } catch (Exception e) {
+            } catch (final Exception e) {
                 log.warn("Failed to force buffer during close for segment: {}", file, e);
             }
             try {
                 UNSAFE.invokeCleaner(buf);
-            } catch (Exception e) {
+            } catch (final Exception e) {
                 log.warn("Failed to invoke cleaner on MappedByteBuffer for segment: {}", file, e);
             }
         }

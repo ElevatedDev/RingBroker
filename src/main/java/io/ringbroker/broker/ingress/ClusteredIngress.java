@@ -1,5 +1,6 @@
 package io.ringbroker.broker.ingress;
 
+import com.google.protobuf.ByteString;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.delivery.Delivery;
 import io.ringbroker.broker.role.BrokerRole;
@@ -7,7 +8,7 @@ import io.ringbroker.cluster.client.RemoteBrokerClient;
 import io.ringbroker.cluster.membership.replicator.FlashReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.Partitioner;
-import io.ringbroker.core.ring.memory.RingBuffer;
+import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.OffsetStore;
 import io.ringbroker.registry.TopicRegistry;
@@ -43,11 +44,11 @@ public final class ClusteredIngress {
     private final int totalPartitions;
     private final int myNodeId;
     private final int clusterSize;
-    private final Map<Integer, Ingress> ingressMap;                     // one Ingress per local partition
-    private final Map<Integer, RemoteBrokerClient> clusterNodes;        // stubs to other brokers
+    private final Map<Integer, Ingress> ingressMap;
+    private final Map<Integer, RemoteBrokerClient> clusterNodes;
     private final boolean idempotentMode;
-    private final Map<Integer, Set<String>> seenMessageIds;             // only used if idempotentMode
-    private final Map<Integer, Delivery> deliveryMap;                   // per-partition delivery
+    private final Map<Integer, Set<String>> seenMessageIds;
+    private final Map<Integer, Delivery> deliveryMap;
     private final OffsetStore offsetStore;
     private final TopicRegistry registry;
     private final BrokerRole myRole;
@@ -63,7 +64,7 @@ public final class ClusteredIngress {
                                           final Path baseDataDir,
                                           final int ringSize,
                                           final WaitStrategy waitStrategy,
-                                          final long segmentSize,
+                                          final long segmentCapacity,
                                           final int batchSize,
                                           final boolean idempotentMode,
                                           final OffsetStore offsetStore,
@@ -78,21 +79,20 @@ public final class ClusteredIngress {
                 : Collections.emptyMap();
 
         for (int pid = 0; pid < totalPartitions; pid++) {
-            if (pid % clusterSize == myNodeId) {
+            if (Math.floorMod(pid, clusterSize) == myNodeId) { // Node owns this partition
                 final Path partDir = baseDataDir.resolve("partition-" + pid);
                 final RingBuffer<byte[]> ring = new RingBuffer<>(ringSize, waitStrategy);
 
-                boolean durable = brokerRole == BrokerRole.PERSISTENCE;
+                final boolean forceDurableWritesForLocalIngress = (brokerRole == BrokerRole.PERSISTENCE);
 
                 final Ingress ingress = Ingress.create(
                         registry,
                         ring,
                         partDir,
-                        segmentSize,
+                        segmentCapacity,
                         batchSize,
-                        durable
+                        forceDurableWritesForLocalIngress
                 );
-
                 ingressMap.put(pid, ingress);
 
                 final Delivery delivery = new Delivery(ring);
@@ -123,60 +123,109 @@ public final class ClusteredIngress {
     }
 
     /**
-     * Publishes a message (non-retry shortcut).
+     * Publishes a message (non-retry shortcut, assuming correlationId needs to be handled).
+     * This simplified publish might be problematic if correlationId is mandatory for all paths.
+     * It's primarily for internal use or cases where correlation is managed differently.
      */
     public void publish(final String topic, final byte[] key, final byte[] payload) {
-        publish(topic, key, 0, payload);
+        final long defaultCorrelationId = (myRole == BrokerRole.INGESTION) ? System.nanoTime() : 0L;
+
+        log.warn("ClusteredIngress.publish(topic,key,payload) called without explicit correlationId. Using default: {}", defaultCorrelationId);
+        publish(defaultCorrelationId, topic, key, 0, payload);
     }
 
     /**
      * Publishes a message to the appropriate partition, handling retries, deduplication, and forwarding.
-     * <p>
-     * The partition is selected using the configured {@link Partitioner}. If the current node owns the partition,
-     * the message is published locally, with optional idempotency checks to avoid duplicates. If another node owns
-     * the partition, the message is forwarded to the appropriate remote broker client.
-     * </p>
      *
+     * @param correlationId The correlation ID from the incoming request or generated for replication.
      * @param topic    the topic to publish to
      * @param key      the message key used for partitioning
-     * @param retries  the number of retry attempts for publishing
+     * @param retries  the number of retry attempts for publishing (from original client)
      * @param payload  the message payload
      */
-    public void publish(final String topic,
+    public void publish(final long correlationId,
+                        final String topic,
                         final byte[] key,
-                        final int    retries,
+                        final int retries,
                         final byte[] payload) {
 
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
-        final int owner       = Math.floorMod(partitionId, clusterSize);
+        final int ownerNode = Math.floorMod(partitionId, clusterSize);
 
-        // 1. local persistence broker owns partition
-        if (owner == myNodeId) {
+        // Scenario 1: This node is the designated primary owner for the partition.
+        if (ownerNode == myNodeId) {
+            log.debug("Node {}: Handling message locally for owned partition {}. CorrId: {}, Topic: {}",
+                    myNodeId, partitionId, correlationId, topic);
             handleLocalPublish(partitionId, topic, retries, payload, key);
+
+            // Now replicate to other persistence replicas (remove ourselves if present)
+            final List<Integer> replicas = replicaResolver.replicas(partitionId);
+            replicas.removeIf(id -> id == myNodeId);
+
+            if (!replicas.isEmpty()) {
+                final BrokerApi.Message.Builder msgBuilder = BrokerApi.Message.newBuilder()
+                        .setTopic(topic)
+                        .setRetries(retries)
+                        .setKey(key == null ? ByteString.EMPTY : ByteString.copyFrom(key))
+                        .setPayload(ByteString.copyFrom(payload))
+                        .setPartitionId(partitionId);
+
+                final BrokerApi.Envelope envToReplicate = BrokerApi.Envelope.newBuilder()
+                        .setCorrelationId(correlationId)
+                        .setPublish(msgBuilder.build())
+                        .build();
+
+                try {
+                    replicator.replicate(envToReplicate, replicas);
+                } catch (final InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting for replication quorum", ie);
+                } catch (final Exception e) {
+                    log.error("Node {}: Replication quorum failed for partition {} (corrId: {}). Error: {}",
+                            myNodeId, partitionId, correlationId, e.getMessage(), e);
+                    throw new RuntimeException("Replication quorum failed: " + e.getMessage(), e);
+                }
+            }
             return;
         }
 
-        // 2. I'm an ingestion broker -> replicate to the current replica set
+        // Scenario 2: This node is INGESTION, and partition owned by another node.
         if (myRole == BrokerRole.INGESTION) {
-            var msg = BrokerApi.Message.newBuilder()
+            final BrokerApi.Message.Builder msgBuilder = BrokerApi.Message.newBuilder()
                     .setTopic(topic)
                     .setRetries(retries)
-                    .setKey(key == null ? com.google.protobuf.ByteString.EMPTY
-                            : com.google.protobuf.ByteString.copyFrom(key))
-                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                    .setKey(key == null ? ByteString.EMPTY : ByteString.copyFrom(key))
+                    .setPayload(ByteString.copyFrom(payload))
+                    .setPartitionId(partitionId);
+
+            final BrokerApi.Envelope envToReplicate = BrokerApi.Envelope.newBuilder()
+                    .setCorrelationId(correlationId)
+                    .setPublish(msgBuilder.build())
                     .build();
 
-            var env = BrokerApi.Envelope.newBuilder().setPublish(msg).build();
-            var replicas = replicaResolver.replicas(partitionId);
-
-            replicator.replicate(env, replicas);
+            final List<Integer> replicas = replicaResolver.replicas(partitionId);
+            log.debug("INGESTION node {}: Replicating message for partition {} (corrId: {}) to replicas: {}",
+                    myNodeId, partitionId, correlationId, replicas);
+            try {
+                replicator.replicate(envToReplicate, replicas);
+            } catch (final InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for replication quorum", ie);
+            } catch (final Exception e) {
+                log.error("INGESTION node {}: Replication quorum failed for partition {} (corrId: {}). Error: {}",
+                        myNodeId, partitionId, correlationId, e.getMessage(), e);
+                throw new RuntimeException("Replication quorum failed: " + e.getMessage(), e);
+            }
             return;
         }
+        final RemoteBrokerClient client = clusterNodes.get(ownerNode);
 
-        final RemoteBrokerClient client = clusterNodes.get(owner);
         if (client == null) {
-            log.error("No RemoteBrokerClient for node {} (partition {})", owner, partitionId);
-            return;
+            log.error("Node {}: No RemoteBrokerClient for owner node {} (partition {}). Cannot forward message with corrId: {}.",
+                    myNodeId, ownerNode, partitionId, correlationId);
+
+            throw new IllegalStateException("Cannot forward message: No client for owner node " + ownerNode +
+                    " for partition " + partitionId);
         }
 
         client.sendMessage(topic, key, payload);
@@ -184,50 +233,37 @@ public final class ClusteredIngress {
 
     /**
      * Handles a publish request when this node is the owner of {@code partitionId}.
-     * Performs the same steps the old inline code did:
-     *  1. Optional idempotent duplicate check
-     *  2. Look-up the local {@link Ingress}
-     *  3. Forward the call to {@code ingress.publish(...)}
+     * Performs optional idempotent duplicate check and forwards to the local {@link Ingress}.
      */
-    private void handleLocalPublish(final int    partitionId,
-                                    final String topic,
-                                    final int    retries,
-                                    final byte[] payload,
-                                    final byte[] key) {
+    public void handleLocalPublish(final int partitionId,
+                                   final String topic,
+                                   final int retries,
+                                   final byte[] payload,
+                                   final byte[] key) {
 
         if (idempotentMode) {
             final Set<String> seen = Objects.requireNonNull(
-                    seenMessageIds.get(partitionId), "seen set missing");
+                    seenMessageIds.get(partitionId), "Seen set missing for partition " + partitionId);
 
             final String msgId = computeMessageId(partitionId, key, payload);
             if (!seen.add(msgId)) {
-                log.debug("Duplicate skipped: partition={} id={}", partitionId, msgId);
+                log.debug("Node {}: Duplicate message skipped: partition={}, id={}", myNodeId, partitionId, msgId);
                 return;
             }
         }
 
         final Ingress ingress = ingressMap.get(partitionId);
         if (ingress == null) {
-            log.error("No local Ingress for partition {}", partitionId);
-            return;
+            log.error("Node {}: No local Ingress for owned partition {}. Message for topic {} may be lost.",
+                    myNodeId, partitionId, topic);
+            throw new IllegalStateException("Internal error: No Ingress for owned partition " + partitionId);
         }
-
         ingress.publish(topic, retries, payload);
     }
 
 
     /**
-     * Subscribes to a topic across all owned partitions, starting from the committed offset for each partition.
-     * <p>
-     * For each owned partition, retrieves the last committed offset for the given topic and group,
-     * then subscribes to the corresponding Delivery instance starting from that offset. Each message
-     * received is passed to the provided handler, and the offset is committed after processing.
-     * </p>
-     *
-     * @param topic   the topic to subscribe to
-     * @param group   the consumer group identifier
-     * @param handler the handler to process each message (receives sequence number and message bytes)
-     * @throws IllegalArgumentException if the topic is not registered
+     * Subscribes to a topic across all owned partitions, starting from the committed offset for each.
      */
     public void subscribeTopic(final String topic,
                                final String group,
@@ -240,10 +276,10 @@ public final class ClusteredIngress {
             final int partitionId = entry.getKey();
             final Delivery delivery = entry.getValue();
 
-            final long committed = offsetStore.fetch(topic, group, partitionId);
-            final long startOffset = Math.max(committed, 0L);
+            // Fetch committed offset, ensuring it's not negative.
+            final long committed = Math.max(0L, offsetStore.fetch(topic, group, partitionId));
 
-            delivery.subscribe(startOffset, (sequence, message) -> {
+            delivery.subscribe(committed, (sequence, message) -> {
                 handler.accept(sequence, message);
                 offsetStore.commit(topic, group, partitionId, sequence);
             });
@@ -252,35 +288,21 @@ public final class ClusteredIngress {
 
     /**
      * Shuts down all local Ingress instances, releasing any resources held.
-     * <p>
-     * This method should be called during broker shutdown to ensure proper cleanup.
-     * </p>
-     *
-     * @throws IOException if an I/O error occurs while closing an Ingress
      */
     public void shutdown() throws IOException {
+        log.info("Node {}: Shutting down ClusteredIngress, closing all local Ingress instances.", myNodeId);
         for (final Ingress ingress : ingressMap.values()) {
             ingress.close();
         }
+        log.info("Node {}: All local Ingress instances closed.", myNodeId);
     }
 
     /**
      * Computes a unique message identifier for deduplication purposes.
-     * <p>
-     * The identifier is constructed using the partition ID, the hash of the key (if present),
-     * and the hash of the payload. This helps ensure that messages with the same key and payload
-     * in the same partition are considered duplicates in idempotent mode.
-     * </p>
-     *
-     * @param partitionId the partition to which the message belongs
-     * @param key         the message key (may be null)
-     * @param payload     the message payload
-     * @return a string representing the unique message identifier
      */
     private String computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
         final int keyHash = (key != null ? Arrays.hashCode(key) : 0);
         final int payloadHash = Arrays.hashCode(payload);
-
         return partitionId + "-" + keyHash + "-" + payloadHash;
     }
 }

@@ -47,97 +47,6 @@ class SanityCheckMain {
     private static final String TOPIC = "orders/created";
     private static final String GROUP = "sanity-latch";
 
-    @Test
-    void endToEndSanityTest(@TempDir final Path tempDir) throws Exception {
-        final Path dataDir = tempDir.resolve("data");
-
-        Files.createDirectories(dataDir);
-
-        final TopicRegistry registry = new TopicRegistry.Builder()
-                .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
-                .build();
-
-        final ReplicaSetResolver resolver = new ReplicaSetResolver(
-                1,
-                List::of);
-
-        final FlashReplicator replicator  = new FlashReplicator(
-                1,
-                Map.of());
-
-        final ClusteredIngress ingress = ClusteredIngress.create(
-                registry,
-                new RoundRobinPartitioner(),
-                PARTITIONS,
-                /* nodeId   */ 0,
-                /* cluster  */ 1,   // single-node
-                Collections.emptyMap(),
-                dataDir,
-                1 << 20,    // flushBytes
-                new AdaptiveSpin(),
-                SEGMENT_BYTES,
-                BATCH_SIZE,
-                /* flushOnWrite */ false,
-                new InMemoryOffsetStore(),
-                BrokerRole.PERSISTENCE,
-                resolver,
-                replicator
-        );
-
-        final RoundRobinPartitioner psel = new RoundRobinPartitioner();
-        final Map<Integer, Set<String>> expected = new HashMap<>();
-
-        for (int partition = 0; partition < PARTITIONS; partition++) expected.put(partition, new HashSet<>());
-
-        final CountDownLatch latch = new CountDownLatch(TOTAL_MSGS);
-        ingress.subscribeTopic(TOPIC, GROUP, (seq, payload) -> latch.countDown());
-
-        for (int i = 0; i < TOTAL_MSGS; i++) {
-            final String id = "msg-" + i;
-            final byte[] key = id.getBytes(StandardCharsets.UTF_8);
-
-            expected.get(psel.selectPartition(key, PARTITIONS)).add(id);
-
-            final var event = EventsProto.OrderCreated.newBuilder()
-                    .setOrderId(id)
-                    .setCustomer("sanity")
-                    .setCreatedAt(Timestamp.getDefaultInstance())
-                    .build();
-
-            ingress.publish(TOPIC, key, 0, event.toByteArray());
-        }
-
-        assertTrue(latch.await(30, TimeUnit.SECONDS),
-                () -> String.format("saw only %d/%d messages", TOTAL_MSGS - latch.getCount(), TOTAL_MSGS));
-
-        ingress.shutdown();
-
-        final Map<Integer, Set<String>> seen = new HashMap<>();
-
-        for (int partition = 0; partition < PARTITIONS; partition++) {
-            seen.put(partition, new HashSet<>());
-
-            final Path dir = dataDir.resolve("partition-" + partition);
-
-            if (!Files.isDirectory(dir)) continue;
-
-            try (final Stream<Path> segs = Files.list(dir)) {
-                for (final Path seg : segs.filter(f -> f.toString().endsWith(".seg")).sorted().toList()) {
-                    parseSegmentLittleEndian(seg, seen.get(partition));
-                }
-            }
-        }
-
-        for (int p = 0; p < PARTITIONS; p++) {
-            final Set<String> exp = expected.get(p);
-            final Set<String> got = seen.get(p);
-
-            assertEquals(exp, got, "Partition " + p + " mismatch.\n" +
-                    "Missing: " + diff(exp, got) + "\nExtra: " + diff(got, exp));
-        }
-
-    }
-
     /**
      * read a 32-bit little-endian int from the stream
      */
@@ -192,5 +101,97 @@ class SanityCheckMain {
         final Set<String> d = new TreeSet<>(a);
         d.removeAll(b);
         return d;
+    }
+
+    @Test
+    void endToEndSanityTest(@TempDir final Path tempDir) throws Exception {
+        final Path dataDir = tempDir.resolve("data");
+
+        Files.createDirectories(dataDir);
+
+        final TopicRegistry registry = new TopicRegistry.Builder()
+                .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
+                .build();
+
+        final ReplicaSetResolver resolver = new ReplicaSetResolver(
+                1,
+                List::of);
+
+        final FlashReplicator replicator = new FlashReplicator(
+                1,
+                Map.of(),
+                -1);
+
+        final ClusteredIngress ingress = ClusteredIngress.create(
+                registry,
+                new RoundRobinPartitioner(),
+                PARTITIONS,
+                /* nodeId   */ 0,
+                /* cluster  */ 1,   // single-node
+                Collections.emptyMap(),
+                dataDir,
+                1 << 20,    // flushBytes
+                new AdaptiveSpin(),
+                SEGMENT_BYTES,
+                BATCH_SIZE,
+                /* flushOnWrite */ false,
+                new InMemoryOffsetStore(),
+                BrokerRole.PERSISTENCE,
+                resolver,
+                replicator
+        );
+
+        final RoundRobinPartitioner psel = new RoundRobinPartitioner();
+        final Map<Integer, Set<String>> expected = new HashMap<>();
+
+        for (int partition = 0; partition < PARTITIONS; partition++) expected.put(partition, new HashSet<>());
+
+        final CountDownLatch latch = new CountDownLatch(TOTAL_MSGS);
+        ingress.subscribeTopic(TOPIC, GROUP, (seq, payload) -> latch.countDown());
+
+        for (int i = 0; i < TOTAL_MSGS; i++) {
+            final String id = "msg-" + i;
+            final byte[] key = id.getBytes(StandardCharsets.UTF_8);
+
+            expected.get(psel.selectPartition(key, PARTITIONS)).add(id);
+
+            final var event = EventsProto.OrderCreated.newBuilder()
+                    .setOrderId(id)
+                    .setCustomer("sanity")
+                    .setCreatedAt(Timestamp.getDefaultInstance())
+                    .build();
+
+            ingress.publish(TOPIC, key, event.toByteArray());
+        }
+
+        assertTrue(latch.await(30, TimeUnit.SECONDS),
+                () -> String.format("saw only %d/%d messages", TOTAL_MSGS - latch.getCount(), TOTAL_MSGS));
+
+        ingress.shutdown();
+
+        final Map<Integer, Set<String>> seen = new HashMap<>();
+
+        for (int partition = 0; partition < PARTITIONS; partition++) {
+            seen.put(partition, new HashSet<>());
+
+            final Path dir = dataDir.resolve("partition-" + partition);
+
+            if (!Files.isDirectory(dir)) continue;
+
+            try (final Stream<Path> segs = Files.list(dir)) {
+                for (final Path seg : segs.filter(f -> f.toString().endsWith(".seg")).sorted().toList()) {
+                    parseSegmentLittleEndian(seg, seen.get(partition));
+                }
+            }
+        }
+
+        for (int p = 0; p < PARTITIONS; p++) {
+            final Set<String> exp = expected.get(p);
+            final Set<String> got = seen.get(p);
+
+            assertEquals(exp, got, "Partition " + p + " mismatch.\n" +
+                    "Missing: " + diff(exp, got) + "\nExtra: " + diff(got, exp));
+        }
+
     }
 }

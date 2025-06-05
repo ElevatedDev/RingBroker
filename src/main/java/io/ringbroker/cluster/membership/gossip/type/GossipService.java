@@ -9,10 +9,14 @@ import java.util.Map;
  */
 public interface GossipService extends AutoCloseable {
 
-    /** Live immutable view keyed by {@code brokerId}. */
+    /**
+     * Live immutable view keyed by {@code brokerId}.
+     */
     Map<Integer, Member> view();
 
-    /** Starts network I/O and schedulers. */
+    /**
+     * Starts network I/O and schedulers.
+     */
     void start();
 
     @Override

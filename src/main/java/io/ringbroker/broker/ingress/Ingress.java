@@ -1,7 +1,7 @@
 package io.ringbroker.broker.ingress;
 
 import com.google.protobuf.DynamicMessage;
-import io.ringbroker.core.ring.memory.RingBuffer;
+import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.ledger.orchestrator.LedgerOrchestrator;
 import io.ringbroker.ledger.segment.LedgerSegment;
 import io.ringbroker.registry.TopicRegistry;
@@ -105,7 +105,7 @@ public final class Ingress {
      * @return a fully initialized {@code Ingress} instance
      * @throws IOException if the ledger orchestrator cannot be bootstrapped
      */
-    public static Ingress create(final TopicRegistry      registry,
+    public static Ingress create(final TopicRegistry registry,
                                  final RingBuffer<byte[]> ring,
                                  final Path dataDir,
                                  final long segmentSize,
@@ -121,6 +121,7 @@ public final class Ingress {
         EXECUTOR.submit(ingress::writerLoop);
         return ingress;
     }
+
     /**
      * Returns the next power of two greater than or equal to the given integer.
      * If the input is already a power of two, it returns the input itself.
@@ -207,7 +208,7 @@ public final class Ingress {
                 batchBuffer[count++] = first;
 
                 while (count < batchSize) {
-                    byte[] next = queue.poll();
+                    final byte[] next = queue.poll();
                     if (next == null) break;
                     batchBuffer[count++] = next;
                 }
@@ -222,14 +223,14 @@ public final class Ingress {
                 }
 
                 for (int i = 0; i < count; i++) {
-                    long seq = ring.next();
+                    final long seq = ring.next();
                     ring.publish(seq, batchBuffer[i]);
                     batchBuffer[i] = null;
                 }
             }
-        } catch (IOException ioe) {
+        } catch (final IOException ioe) {
             log.error("Ingress writer loop encountered an I/O error and will terminate. Partition data may be at risk.", ioe);
-        } catch (RuntimeException ex) {
+        } catch (final RuntimeException ex) {
             log.error("Ingress writer loop encountered an unexpected runtime error and will terminate.", ex);
             throw new RuntimeException("Ingress writer loop failed critically due to RuntimeException", ex);
         }
@@ -237,6 +238,7 @@ public final class Ingress {
 
     /**
      * Closes the underlying {@link LedgerOrchestrator}, which in turn closes its active segment.
+     *
      * @throws IOException if an I/O error occurs during closing the ledger orchestrator.
      */
     public void close() throws IOException {

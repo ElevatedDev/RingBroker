@@ -9,6 +9,8 @@ import java.lang.invoke.VarHandle;
  * Padded, CAS‑capable cursor to avoid false‑sharing between threads.
  */
 public final class Sequence {
+    private static final VarHandle VH;
+
     static {
         try {
             VH = MethodHandles.lookup().findVarHandle(Sequence.class, "value", long.class);
@@ -21,8 +23,6 @@ public final class Sequence {
     private long p1, p2, p3, p4, p5, p6, p7;
     @Getter
     private volatile long value;
-
-    private static final VarHandle VH;
     @SuppressWarnings("unused")
     private long p8, p9, p10, p11, p12, p13, p14;
 

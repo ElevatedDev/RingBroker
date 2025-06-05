@@ -7,7 +7,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.function.Supplier;
 
-/** Determines which persistence brokers form the replica set for a partition. */
+/**
+ * Determines which persistence brokers form the replica set for a partition.
+ */
 public final class ReplicaSetResolver {
     private final int replicationFactor;
     private final Supplier<Collection<Member>> members;

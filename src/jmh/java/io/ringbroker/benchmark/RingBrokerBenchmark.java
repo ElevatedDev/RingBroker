@@ -104,9 +104,10 @@ public class RingBrokerBenchmark {
                 1,
                 List::of);
 
-        final FlashReplicator replicator  = new FlashReplicator(
+        final FlashReplicator replicator = new FlashReplicator(
                 1,
-                Map.of());
+                Map.of(),
+                -1);
 
         ingress = ClusteredIngress.create(
                 registry,
@@ -171,7 +172,7 @@ public class RingBrokerBenchmark {
             for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
                 final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
 
-                ingress.publish(TOPIC, key, 0, payload);
+                ingress.publish(TOPIC, key, payload);
             }
         }
 

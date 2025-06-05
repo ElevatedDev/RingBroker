@@ -1,4 +1,4 @@
-package io.ringbroker.core.ring.memory;
+package io.ringbroker.core.ring;
 
 import io.ringbroker.core.barrier.Barrier;
 import io.ringbroker.core.sequence.Sequence;

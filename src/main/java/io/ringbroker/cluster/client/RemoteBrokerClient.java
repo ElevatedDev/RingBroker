@@ -2,12 +2,16 @@ package io.ringbroker.cluster.client;
 
 import io.ringbroker.api.BrokerApi;
 
+import java.util.concurrent.CompletableFuture;
+
 /**
  * Abstraction over the broker-to-broker transport.
  */
 public interface RemoteBrokerClient {
 
-    /** Legacy method — still used by classic single-owner forwarders. */
+    /**
+     * Legacy method — still used by classic single-owner forwarders.
+     */
     void sendMessage(String topic, byte[] key, byte[] payload);
 
     /**
@@ -17,7 +21,7 @@ public interface RemoteBrokerClient {
      */
     default void sendEnvelope(final BrokerApi.Envelope envelope) {
         if (envelope.hasPublish()) {
-            var m = envelope.getPublish();
+            final var m = envelope.getPublish();
             sendMessage(m.getTopic(),
                     m.getKey().isEmpty() ? null : m.getKey().toByteArray(),
                     m.getPayload().toByteArray());
@@ -25,4 +29,7 @@ public interface RemoteBrokerClient {
             throw new UnsupportedOperationException("Unsupported envelope type");
         }
     }
+
+
+    CompletableFuture<BrokerApi.ReplicationAck> sendEnvelopeWithAck(final BrokerApi.Envelope envelope);
 }

@@ -36,21 +36,28 @@ import static java.nio.file.StandardOpenOption.WRITE;
 public final class LedgerOrchestrator implements AutoCloseable {
 
     private final Path directory;
-    @Getter private final int segmentCapacity; // Renamed from segmentSize for clarity (size vs capacity)
-    @Getter private volatile long highWaterMark;
-
+    @Getter
+    private final int segmentCapacity; // Renamed from segmentSize for clarity (size vs capacity)
     private final ExecutorService segmentAllocatorService =
             Executors.newSingleThreadExecutor(
                     Thread.ofVirtual().name("segment-allocator").factory());
 
     private final AtomicReference<LedgerSegment> activeSegment = new AtomicReference<>();
+    @Getter
+    private volatile long highWaterMark;
     private Future<LedgerSegment> nextSegmentFuture;
+
+    private LedgerOrchestrator(final Path directory, final int segmentCapacity, final long initialHwm) {
+        this.directory = directory;
+        this.segmentCapacity = segmentCapacity;
+        this.highWaterMark = initialHwm;
+    }
 
     /**
      * Bootstraps a LedgerOrchestrator for the given directory.
      * This involves recovering any existing segments, opening them, and preparing for new appends.
      *
-     * @param directory The directory where ledger segments are stored.
+     * @param directory       The directory where ledger segments are stored.
      * @param segmentCapacity The capacity for each new ledger segment.
      * @return An initialized {@link LedgerOrchestrator} instance.
      * @throws IOException If an I/O error occurs during directory creation or segment recovery.
@@ -73,7 +80,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
         if (recoveredSegments.isEmpty()) {
             currentTailSegment = orchestrator.createNewSegment();
         } else {
-            LedgerSegment lastGoodSegment = recoveredSegments.getLast();
+            final LedgerSegment lastGoodSegment = recoveredSegments.getLast();
             // If the last segment is full, create a new one, otherwise use it.
             if (lastGoodSegment.isFull()) {
                 log.info("Last recovered segment {} is full. Creating a new active segment.", lastGoodSegment.getFile());
@@ -87,92 +94,6 @@ public final class LedgerOrchestrator implements AutoCloseable {
         orchestrator.activeSegment.set(currentTailSegment);
         orchestrator.preAllocateNextSegment(); // Start pre-allocating the next one
         return orchestrator;
-    }
-
-    private LedgerOrchestrator(final Path directory, final int segmentCapacity, final long initialHwm) {
-        this.directory = directory;
-        this.segmentCapacity = segmentCapacity;
-        this.highWaterMark = initialHwm;
-    }
-
-    /**
-     * Gets the currently active writable ledger segment.
-     * If the current active segment is full, it rolls over to the pre-allocated segment or creates a new one.
-     *
-     * @return The writable {@link LedgerSegment}.
-     * @throws IOException If an I/O error occurs while creating or opening a segment.
-     */
-    public LedgerSegment writable() throws IOException {
-        LedgerSegment current = activeSegment.get();
-        if (current == null || current.isFull()) {
-            log.info("Active segment {} is full or null. Rolling to next segment.", current != null ? current.getFile() : "N/A");
-            current = rollToNextSegment();
-            activeSegment.set(current);
-
-            if (current.getFirstOffset() > 0 && current.getLastOffset() == 0) {
-
-            }
-            // Schedule pre-allocation for the *next* next segment
-            preAllocateNextSegment();
-        }
-        return current;
-    }
-
-    private LedgerSegment rollToNextSegment() throws IOException {
-        LedgerSegment nextActiveSegment = null;
-        if (nextSegmentFuture != null && nextSegmentFuture.isDone()) {
-            try {
-                nextActiveSegment = nextSegmentFuture.get();
-                log.info("Rolled to pre-allocated segment: {}", nextActiveSegment.getFile());
-            } catch (final Exception e) {
-                log.warn("Pre-allocation of next segment failed. Creating a new one on demand.", e);
-            }
-        }
-
-        if (nextActiveSegment == null) {
-            LedgerSegment previousActive = activeSegment.get();
-            long baseOffsetForNewSegment = (previousActive != null) ? previousActive.getLastOffset() : this.highWaterMark;
-
-            nextActiveSegment = createNewSegment(baseOffsetForNewSegment);
-        }
-        return nextActiveSegment;
-    }
-
-    private void preAllocateNextSegment() {
-        if (nextSegmentFuture == null || nextSegmentFuture.isDone()){
-            LedgerSegment currentActive = activeSegment.get();
-            long baseOffset = (currentActive != null) ? currentActive.getLastOffset() : this.highWaterMark;
-            nextSegmentFuture = segmentAllocatorService.submit(() -> createNewSegment(baseOffset));
-            log.debug("Submitted pre-allocation task for next segment based on offset {}.", baseOffset);
-        }
-    }
-
-    private synchronized LedgerSegment createNewSegment() throws IOException {
-        return createNewSegment(this.highWaterMark);
-    }
-
-    private synchronized LedgerSegment createNewSegment(long previousSegmentLastOffset) throws IOException {
-        Path segmentPath;
-        String fileName;
-        // Ensure unique filenames, can be based on time and a random number or sequence.
-        // Using System.currentTimeMillis() and a random int.
-        do {
-            fileName = String.format("%d-%06d%s",
-                    System.currentTimeMillis(),
-                    ThreadLocalRandom.current().nextInt(1_000_000),
-                    LedgerConstant.SEGMENT_EXT);
-            segmentPath = directory.resolve(fileName);
-        } while (Files.exists(segmentPath));
-
-        log.info("Creating new ledger segment: {} with capacity {}", segmentPath, segmentCapacity);
-        LedgerSegment newSegment = LedgerSegment.create(segmentPath, segmentCapacity, false); // false for skipRecordCrc by default
-
-        // If the new segment logically follows a previous one, its firstOffset should be previousSegmentLastOffset + 1
-        // However, LedgerSegment.create initializes firstOffset to 0. This needs careful handling.
-        // For now, LedgerSegment manages its internal first/last offsets based on appends.
-        // The orchestrator's highWaterMark tracks the global sequence.
-
-        return newSegment;
     }
 
     private static LedgerSegment recoverAndOpenSegment(final Path segmentPath, final Path baseDir) {
@@ -191,7 +112,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
             } else {
                 log.error("Critical recovery failure for segment: {}. Segment might be unusable.", segmentPath);
                 // Optionally, move the corrupt segment to a 'corrupt' directory instead of deleting
-                Path corruptDir = baseDir.resolve("corrupt");
+                final Path corruptDir = baseDir.resolve("corrupt");
                 Files.createDirectories(corruptDir);
                 Files.move(segmentPath, corruptDir.resolve(segmentPath.getFileName()), StandardCopyOption.REPLACE_EXISTING);
                 return null; // Indicate failure
@@ -201,7 +122,10 @@ public final class LedgerOrchestrator implements AutoCloseable {
             return null; // Indicate failure
         } finally {
             if (tempRecoveryPath != null && Files.exists(tempRecoveryPath)) {
-                try { Files.delete(tempRecoveryPath); } catch (IOException ignored) {}
+                try {
+                    Files.delete(tempRecoveryPath);
+                } catch (final IOException ignored) {
+                }
             }
         }
     }
@@ -209,6 +133,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
     /**
      * Recovers a single segment file by reading records sequentially, validating CRCs,
      * and truncating the file at the first point of corruption.
+     *
      * @param segmentPath Path to the segment file to recover.
      * @return true if recovery process completed (even if truncation occurred), false on critical I/O error during recovery.
      */
@@ -223,7 +148,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
                 ch.force(true); // metaData=true to persist truncation
                 return true; // Considered "recovered" as an empty (invalid) segment
             }
-            ByteBuffer recordHeaderBuffer = ByteBuffer.allocate(Integer.BYTES * 2);
+            final ByteBuffer recordHeaderBuffer = ByteBuffer.allocate(Integer.BYTES * 2);
             ch.position(LedgerSegment.HEADER_SIZE);
 
             while (currentFilePosition < ch.size()) {
@@ -244,7 +169,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
                     return true;
                 }
 
-                ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLength);
+                final ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLength);
                 bytesRead = ch.read(payloadBuffer);
                 if (bytesRead < payloadLength) {
                     log.warn("Partial payload read for record at position {} in {}. Truncating.", currentFilePosition, segmentPath);
@@ -282,6 +207,86 @@ public final class LedgerOrchestrator implements AutoCloseable {
         ch.force(true); // metaData=true to persist truncation
     }
 
+    /**
+     * Gets the currently active writable ledger segment.
+     * If the current active segment is full, it rolls over to the pre-allocated segment or creates a new one.
+     *
+     * @return The writable {@link LedgerSegment}.
+     * @throws IOException If an I/O error occurs while creating or opening a segment.
+     */
+    public LedgerSegment writable() throws IOException {
+        LedgerSegment current = activeSegment.get();
+        if (current == null || current.isFull()) {
+            log.info("Active segment {} is full or null. Rolling to next segment.", current != null ? current.getFile() : "N/A");
+            current = rollToNextSegment();
+            activeSegment.set(current);
+
+            if (current.getFirstOffset() > 0 && current.getLastOffset() == 0) {
+
+            }
+            // Schedule pre-allocation for the *next* next segment
+            preAllocateNextSegment();
+        }
+        return current;
+    }
+
+    private LedgerSegment rollToNextSegment() throws IOException {
+        LedgerSegment nextActiveSegment = null;
+        if (nextSegmentFuture != null && nextSegmentFuture.isDone()) {
+            try {
+                nextActiveSegment = nextSegmentFuture.get();
+                log.info("Rolled to pre-allocated segment: {}", nextActiveSegment.getFile());
+            } catch (final Exception e) {
+                log.warn("Pre-allocation of next segment failed. Creating a new one on demand.", e);
+            }
+        }
+
+        if (nextActiveSegment == null) {
+            final LedgerSegment previousActive = activeSegment.get();
+            final long baseOffsetForNewSegment = (previousActive != null) ? previousActive.getLastOffset() : this.highWaterMark;
+
+            nextActiveSegment = createNewSegment(baseOffsetForNewSegment);
+        }
+        return nextActiveSegment;
+    }
+
+    private void preAllocateNextSegment() {
+        if (nextSegmentFuture == null || nextSegmentFuture.isDone()) {
+            final LedgerSegment currentActive = activeSegment.get();
+            final long baseOffset = (currentActive != null) ? currentActive.getLastOffset() : this.highWaterMark;
+            nextSegmentFuture = segmentAllocatorService.submit(() -> createNewSegment(baseOffset));
+            log.debug("Submitted pre-allocation task for next segment based on offset {}.", baseOffset);
+        }
+    }
+
+    private synchronized LedgerSegment createNewSegment() throws IOException {
+        return createNewSegment(this.highWaterMark);
+    }
+
+    private synchronized LedgerSegment createNewSegment(final long previousSegmentLastOffset) throws IOException {
+        Path segmentPath;
+        String fileName;
+        // Ensure unique filenames, can be based on time and a random number or sequence.
+        // Using System.currentTimeMillis() and a random int.
+        do {
+            fileName = String.format("%d-%06d%s",
+                    System.currentTimeMillis(),
+                    ThreadLocalRandom.current().nextInt(1_000_000),
+                    LedgerConstant.SEGMENT_EXT);
+            segmentPath = directory.resolve(fileName);
+        } while (Files.exists(segmentPath));
+
+        log.info("Creating new ledger segment: {} with capacity {}", segmentPath, segmentCapacity);
+        final LedgerSegment newSegment = LedgerSegment.create(segmentPath, segmentCapacity, false); // false for skipRecordCrc by default
+
+        // If the new segment logically follows a previous one, its firstOffset should be previousSegmentLastOffset + 1
+        // However, LedgerSegment.create initializes firstOffset to 0. This needs careful handling.
+        // For now, LedgerSegment manages its internal first/last offsets based on appends.
+        // The orchestrator's highWaterMark tracks the global sequence.
+
+        return newSegment;
+    }
+
     @Override
     public void close() {
         segmentAllocatorService.shutdownNow(); // Attempt to stop pre-allocation tasks
@@ -302,7 +307,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
         }
         if (nextSegmentFuture != null && nextSegmentFuture.isDone() && !nextSegmentFuture.isCancelled()) {
             try {
-                LedgerSegment futureSeg = nextSegmentFuture.get(); // Should not block if isDone
+                final LedgerSegment futureSeg = nextSegmentFuture.get(); // Should not block if isDone
                 if (futureSeg != null) {
                     futureSeg.close();
                     log.info("Closed pre-allocated segment: {}", futureSeg.getFile());
@@ -316,9 +321,10 @@ public final class LedgerOrchestrator implements AutoCloseable {
     /**
      * Updates the high-water mark. This should be called after records are successfully
      * written and confirmed (e.g., after a quorum of replicas acknowledge).
+     *
      * @param newHwm The new high-water mark.
      */
-    public void setHighWaterMark(long newHwm) {
+    public void setHighWaterMark(final long newHwm) {
         // Ensure HWM only moves forward
         if (newHwm > this.highWaterMark) {
             this.highWaterMark = newHwm;

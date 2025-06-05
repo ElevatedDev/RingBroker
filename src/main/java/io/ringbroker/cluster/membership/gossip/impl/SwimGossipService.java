@@ -9,12 +9,14 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.ringbroker.broker.role.BrokerRole;
-import io.ringbroker.cluster.membership.member.Member;
 import io.ringbroker.cluster.membership.gossip.type.GossipService;
+import io.ringbroker.cluster.membership.member.Member;
 import lombok.extern.slf4j.Slf4j;
 
 import java.net.InetSocketAddress;
-import java.util.*;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.*;
 
 /**
@@ -25,7 +27,9 @@ import java.util.concurrent.*;
 @Slf4j
 public final class SwimGossipService implements GossipService {
 
-    /** Immutable view keyed by brokerId. */
+    /**
+     * Immutable view keyed by brokerId.
+     */
     private final ConcurrentMap<Integer, Member> view = new ConcurrentHashMap<>();
 
     private final int selfId;
@@ -33,10 +37,9 @@ public final class SwimGossipService implements GossipService {
     private final EventLoopGroup group;
     private final InetSocketAddress bind;
     private final List<InetSocketAddress> seeds;
-
-    private volatile Channel channel;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r ->
             new Thread(r, "gossip-flusher"));
+    private volatile Channel channel;
 
     public SwimGossipService(final int selfId,
                              final BrokerRole role,
@@ -47,6 +50,15 @@ public final class SwimGossipService implements GossipService {
         this.bind = bind;
         this.seeds = seeds;
         this.group = new NioEventLoopGroup(1);
+    }
+
+    private static byte[] encode(final Member m) {
+        final ByteBuf b = Unpooled.buffer(4 + 1 + 8 + 1);
+        b.writeInt(m.brokerId());
+        b.writeByte(m.role().ordinal());
+        b.writeLong(System.currentTimeMillis());
+        b.writeByte(m.vnodes());
+        return ByteBufUtil.getBytes(b);
     }
 
     @Override
@@ -72,7 +84,7 @@ public final class SwimGossipService implements GossipService {
                     .bind(bind)
                     .sync()
                     .channel();
-        } catch (InterruptedException e) {
+        } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Cannot start gossip", e);
         }
@@ -86,7 +98,7 @@ public final class SwimGossipService implements GossipService {
 
     private void flush() {
         // Build one heartbeat buffer
-        ByteBuf payload = Unpooled.buffer(4 + 1 + 8 + 1);
+        final ByteBuf payload = Unpooled.buffer(4 + 1 + 8 + 1);
 
         payload.writeInt(selfId);                               // brokerId
         payload.writeByte(selfMember.role().ordinal());         // role
@@ -94,12 +106,12 @@ public final class SwimGossipService implements GossipService {
         payload.writeByte(selfMember.vnodes());                 // weight / vnodes
 
         // 1) seeds (static discovery)
-        for (InetSocketAddress seed : seeds) {
+        for (final InetSocketAddress seed : seeds) {
             channel.writeAndFlush(new DatagramPacket(payload.retainedDuplicate(), seed));
         }
 
         // 2) live peers discovered so far
-        for (Member m : view.values()) {
+        for (final Member m : view.values()) {
             if (m.brokerId() == selfId) continue;
 
             // skip myself
@@ -110,7 +122,6 @@ public final class SwimGossipService implements GossipService {
         payload.release();
     }
 
-
     private void decode(final DatagramPacket pkt) {
         final ByteBuf b = pkt.content();
         final int id = b.readInt();
@@ -120,15 +131,6 @@ public final class SwimGossipService implements GossipService {
         final Member m = new Member(id, role,
                 new InetSocketAddress(pkt.sender().getAddress(), bind.getPort()), ts, vnodes);
         view.merge(id, m, (old, neu) -> neu.timestampMillis() > old.timestampMillis() ? neu : old);
-    }
-
-    private static byte[] encode(final Member m) {
-        final ByteBuf b = Unpooled.buffer(4 + 1 + 8 + 1);
-        b.writeInt(m.brokerId());
-        b.writeByte(m.role().ordinal());
-        b.writeLong(System.currentTimeMillis());
-        b.writeByte(m.vnodes());
-        return ByteBufUtil.getBytes(b);
     }
 
     private void sweep() {

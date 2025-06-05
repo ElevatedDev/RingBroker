@@ -7,7 +7,7 @@ import io.ringbroker.core.sequence.Sequence;
  * Wait-strategy abstraction.
  */
 public sealed interface WaitStrategy
-        permits AdaptiveSpin, Blocking, BusySpin, SleepingWaitStrategy {
+        permits AdaptiveSpin, Blocking, BusySpin {
 
     /**
      * Wait until cursor.get() ≥ seq, then return the available cursor value.

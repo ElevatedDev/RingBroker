@@ -1,6 +1,6 @@
 package io.ringbroker.broker.delivery;
 
-import io.ringbroker.core.ring.memory.RingBuffer;
+import io.ringbroker.core.ring.RingBuffer;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 

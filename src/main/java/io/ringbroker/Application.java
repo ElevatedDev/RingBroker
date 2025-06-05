@@ -4,9 +4,9 @@ import com.google.protobuf.Descriptors.Descriptor;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
 import io.ringbroker.cluster.client.impl.NettyClusterClient;
+import io.ringbroker.cluster.membership.gossip.impl.SwimGossipService;
 import io.ringbroker.cluster.membership.replicator.FlashReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
-import io.ringbroker.cluster.membership.gossip.impl.SwimGossipService;
 import io.ringbroker.cluster.partitioner.Partitioner;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.config.impl.BrokerConfig;
@@ -98,20 +98,21 @@ public class Application {
         // Offset store
         final InMemoryOffsetStore store = new InMemoryOffsetStore();
 
-        var gossip = new SwimGossipService(
+        final var gossip = new SwimGossipService(
                 cfg.getNodeId(),
                 cfg.getBrokerRole(),
                 cfg.getBindAddress(),
                 cfg.getSeedAddresses());
         gossip.start();
 
-        ReplicaSetResolver resolver = new ReplicaSetResolver(
+        final ReplicaSetResolver resolver = new ReplicaSetResolver(
                 cfg.getReplicationFactor(),
                 () -> gossip.view().values());
 
-        FlashReplicator replicator = new FlashReplicator(
+        final FlashReplicator replicator = new FlashReplicator(
                 cfg.getAckQuorum(),
-                clusterNodes);
+                clusterNodes,
+                cfg.getReplicationTimeoutMillis());
 
         // Create the clustered ingress
         final ClusteredIngress ingress = ClusteredIngress.create(

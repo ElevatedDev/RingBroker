@@ -4,10 +4,14 @@ import io.ringbroker.broker.role.BrokerRole;
 import io.ringbroker.cluster.membership.member.Member;
 import lombok.experimental.UtilityClass;
 
-import java.util.*;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
 import java.util.stream.Collectors;
 
-/** Highest‑Random‑Weight hashing, stable under membership churn. */
+/**
+ * Highest‑Random‑Weight hashing, stable under membership churn.
+ */
 @UtilityClass
 public final class HashingProvider {
 
@@ -21,13 +25,15 @@ public final class HashingProvider {
         return h;
     }
 
-    /** Returns the brokerId with the highest weight for this key among INGESTION brokers. */
+    /**
+     * Returns the brokerId with the highest weight for this key among INGESTION brokers.
+     */
     public int primary(final int key, final Collection<Member> members) {
         long best = Long.MIN_VALUE;
         int bestId = -1;
-        for (Member m : members) {
+        for (final Member m : members) {
             if (m.role() != BrokerRole.INGESTION) continue;
-            long s = score(key, m.brokerId());
+            final long s = score(key, m.brokerId());
             if (s > best) {
                 best = s;
                 bestId = m.brokerId();
@@ -36,10 +42,12 @@ public final class HashingProvider {
         return bestId;
     }
 
-    /** Top‑N persistence replicas for the given key. */
+    /**
+     * Top‑N persistence replicas for the given key.
+     */
     public List<Integer> topN(final int key,
-                                     final int n,
-                                     final Collection<Member> members) {
+                              final int n,
+                              final Collection<Member> members) {
         return members.stream()
                 .filter(m -> m.role() == BrokerRole.PERSISTENCE)
                 .sorted(Comparator.comparingLong(m -> -score(key, m.brokerId())))
