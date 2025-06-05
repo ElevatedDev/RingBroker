@@ -1,4 +1,3 @@
-// ── src/main/java/io/ringbroker/cluster/client/impl/NettyClusterClient.java
 package io.ringbroker.cluster.client.impl;
 
 import io.netty.bootstrap.Bootstrap;
