@@ -230,7 +230,7 @@ public final class ClusteredIngress {
                     replicator.replicate(envelope, replicas);
                     log.debug("Node {}: Replication quorum achieved for partition {} (corrId={}).",
                             myNodeId, partitionId, correlationId);
-                } catch (Exception e) {
+                } catch (final Exception e) {
                     log.warn("Node {}: Async replication failed for partition {} (corrId={}): {}",
                             myNodeId, partitionId, correlationId, e.getMessage());
                 }
@@ -351,7 +351,7 @@ public final class ClusteredIngress {
             if (!VT_EXECUTOR.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
                 VT_EXECUTOR.shutdownNow();
             }
-        } catch (InterruptedException ie) {
+        } catch (final InterruptedException ie) {
             Thread.currentThread().interrupt();
             VT_EXECUTOR.shutdownNow();
         }
