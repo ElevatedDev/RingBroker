@@ -31,11 +31,11 @@ graph TD
     subgraph "Primary Node (Owner of Partition P)"
         P_Netty[Netty Transport]
         P_CI{ClusteredIngress}
-        P_Ingress[Ingress (Partition P)]
+        P_Ingress["Ingress (Partition P)"]
         P_Queue((SlotRing Queue))
-        P_Writer[Writer Loop VT]
-        P_Ledger[(Ledger - mmap)]
-        P_RingBuffer([RingBuffer - In-Memory])
+        P_Writer["Writer Loop VT"]
+        P_Ledger[("Ledger - mmap")]
+        P_RingBuffer(["RingBuffer - In-Memory"])
         P_Replicator{AdaptiveReplicator}
     end
 
@@ -43,7 +43,7 @@ graph TD
         R_Netty[Netty Transport]
         R_CI{ClusteredIngress}
         R_Ingress[Ingress]
-        R_Ledger[(Ledger - mmap)]
+        R_Ledger[("Ledger - mmap")]
     end
 
     Publisher -- "publish(msg)" --> P_Netty
