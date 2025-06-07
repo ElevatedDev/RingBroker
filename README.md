@@ -1,6 +1,8 @@
-# RingBroker 
+# RingBroker
 
-**RingBroker** is a high-performance, partitioned message broker combining an in-memory ring buffer with a persistent append-only log. It delivers exceptional throughput on commodity hardware, guarantees crash-safe durability, and supports seamless clustering—all with minimal operational overhead.
+**RingBroker** is a high-performance, partitioned message broker combining an in-memory ring buffer with a persistent
+append-only log. It delivers exceptional throughput on commodity hardware, guarantees crash-safe durability, and
+supports seamless clustering—all with minimal operational overhead.
 
 ---
 
@@ -13,7 +15,8 @@
   Outperforms Kafka on single-partition workloads. Even faster with clustered partitioning and segment compaction.
 
 - **RingBuffer Architecture**  
-  Based on a Disruptor-style design, RingBroker linearly scales with nodes and partitions—handling millions of messages per second.
+  Based on a Disruptor-style design, RingBroker linearly scales with nodes and partitions—handling millions of messages
+  per second.
 
 - **gRPC API**  
   Schema-aware admin via gRPC and Protobuf—language-agnostic and TLS-ready.
@@ -163,32 +166,33 @@ System.out.printf("Partitions: %d, Error: %s%n", desc.getPartitions(), desc.getE
 
 RingBroker uses **Netty-based custom transport** for all data-intensive operations like:
 
-- Publishing events  
-- Fetching messages  
-- Subscribing to message streams  
-- Committing and querying offsets  
+- Publishing events
+- Fetching messages
+- Subscribing to message streams
+- Committing and querying offsets
 
-➡️ **Refer to your Netty transport layer in** `io.ringbroker.transport.*` and `NettyServerRequestHandler` for full details.  
+➡️ **Refer to your Netty transport layer in** `io.ringbroker.transport.*` and `NettyServerRequestHandler` for full
+details.  
 This design isolates high-throughput message flows from low-volume admin logic.
 
 ---
 
 ## Configuration Reference
 
-| Property          | Type    | Description                              |
-|------------------|---------|------------------------------------------|
-| `grpcPort`       | int     | Port for gRPC admin interface            |
-| `clusterSize`    | int     | Total number of nodes in the cluster     |
-| `nodeId`         | int     | This node's ID (0-based)                 |
-| `totalPartitions`| int     | Number of partitions globally            |
-| `ringSize`       | int     | In-memory ring size (slots per partition)|
-| `segmentBytes`   | long    | Segment file size (bytes)                |
-| `ingressThreads` | int     | Thread count for ingress                 |
-| `batchSize`      | int     | Messages per batch flush                 |
-| `idempotentMode` | bool    | Enables deduplication                    |
-| `ledgerPath`     | string  | Path to log segment files                |
-| `topicsFile`     | string  | Path to static topics definition file    |
-| `clusterNodes`   | list    | YAML array of `{id,host,port}` configs   |
+| Property          | Type   | Description                               |
+|-------------------|--------|-------------------------------------------|
+| `grpcPort`        | int    | Port for gRPC admin interface             |
+| `clusterSize`     | int    | Total number of nodes in the cluster      |
+| `nodeId`          | int    | This node's ID (0-based)                  |
+| `totalPartitions` | int    | Number of partitions globally             |
+| `ringSize`        | int    | In-memory ring size (slots per partition) |
+| `segmentBytes`    | long   | Segment file size (bytes)                 |
+| `ingressThreads`  | int    | Thread count for ingress                  |
+| `batchSize`       | int    | Messages per batch flush                  |
+| `idempotentMode`  | bool   | Enables deduplication                     |
+| `ledgerPath`      | string | Path to log segment files                 |
+| `topicsFile`      | string | Path to static topics definition file     |
+| `clusterNodes`    | list   | YAML array of `{id,host,port}` configs    |
 
 ---
 
