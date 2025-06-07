@@ -3,7 +3,6 @@ package io.ringbroker.cluster.client.impl;
 import com.google.protobuf.ByteString;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
@@ -23,9 +22,9 @@ import java.util.concurrent.ConcurrentMap;
 
 /**
  * A Netty‐backed RemoteBrokerClient that:
- *  • sends Publish Envelopes to a remote Persistence node, and
- *  • waits (via CompletableFuture) for the corresponding ReplicationAck.
- *
+ * • sends Publish Envelopes to a remote Persistence node, and
+ * • waits (via CompletableFuture) for the corresponding ReplicationAck.
+ * <p>
  * The pipeline uses Protobuf varint32 framing to match the server side.
  */
 @Slf4j
@@ -35,7 +34,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
     /**
      * Tracks all in-flight replication requests:
-     *   correlationId → CompletableFuture<ReplicationAck>.
+     * correlationId → CompletableFuture<ReplicationAck>.
      * When an ack arrives, ClientReplicationHandler completes the future.
      */
     private final ConcurrentMap<Long, CompletableFuture<BrokerApi.ReplicationAck>> pendingAcks = new ConcurrentHashMap<>();

@@ -7,7 +7,7 @@ import io.ringbroker.core.sequence.Sequence;
  * Spins briefly, then blocks on the Barrier’s condition to reduce CPU burn.
  */
 public final class AdaptiveSpin implements WaitStrategy {
-    private static final int SPIN_LIMIT = 100;
+    private static final int SPIN_LIMIT = 1000;
 
     @Override
     public long await(final long seq, final Sequence cursor, final Barrier barrier)
