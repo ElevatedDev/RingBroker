@@ -1,7 +1,7 @@
 package io.ringbroker.core.ring;
 
-import io.ringbroker.core.sequence.Sequence;
 import io.ringbroker.core.barrier.Barrier;
+import io.ringbroker.core.sequence.Sequence;
 import io.ringbroker.core.wait.WaitStrategy;
 
 import java.lang.invoke.MethodHandles;
@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Multi‐producer, single‐consumer ring buffer.
  * <p>
  * Optimized for batch claims and batch publishes:
- * {@link #next(int)} + {@link #publishBatch(long,int,Object[])}.
+ * {@link #next(int)} + {@link #publishBatch(long, int, Object[])}.
  *
  * @param <E> the type of entry stored in the ring
  */
@@ -30,8 +30,8 @@ public final class RingBuffer<E> {
     private final Object[] entries;
     private final int mask;
     private final Sequence cursor = new Sequence(-1L);
-    private final Barrier  barrier;
-    private final PaddedSequence claim  = new PaddedSequence(-1L);
+    private final Barrier barrier;
+    private final PaddedSequence claim = new PaddedSequence(-1L);
 
     /**
      * @param size         power‐of‐two number of slots in the buffer
@@ -42,7 +42,7 @@ public final class RingBuffer<E> {
             throw new IllegalArgumentException("RingBuffer size must be a power of two.");
         }
         this.entries = new Object[size];
-        this.mask    = size - 1;
+        this.mask = size - 1;
         this.barrier = new Barrier(cursor, waitStrategy);
     }
 
@@ -77,7 +77,7 @@ public final class RingBuffer<E> {
      * @param entry the entry to publish
      */
     public void publish(final long seq, final E entry) {
-        final int idx = (int)(seq & mask);
+        final int idx = (int) (seq & mask);
         ARRAY_HANDLE.setRelease(entries, idx, entry);
 
         // wait our turn
@@ -101,11 +101,11 @@ public final class RingBuffer<E> {
     @SuppressWarnings("unchecked")
     public void publishBatch(final long endSeq, final int count, final E[] batch) {
         final Object[] localEntries = this.entries;
-        final int       m            = this.mask;
+        final int m = this.mask;
 
         long seq = endSeq - count + 1;
         for (int i = 0; i < count; i++, seq++) {
-            ARRAY_HANDLE.setRelease(localEntries, (int)(seq & m), batch[i]);
+            ARRAY_HANDLE.setRelease(localEntries, (int) (seq & m), batch[i]);
         }
 
         // only wait for the first slot in the batch
@@ -129,21 +129,22 @@ public final class RingBuffer<E> {
     @SuppressWarnings("unchecked")
     public E get(final long seq) throws InterruptedException {
         barrier.waitFor(seq);
-        return (E) ARRAY_HANDLE.getAcquire(entries, (int)(seq & mask));
+        return (E) ARRAY_HANDLE.getAcquire(entries, (int) (seq & mask));
     }
 
-    /** @return the highest published sequence */
+    /**
+     * @return the highest published sequence
+     */
     public long getCursor() {
         return cursor.getValue();
     }
 }
+
 final class PaddedSequence {
+    private final AtomicLong value;
     // 7 longs of pre‐padding
     @SuppressWarnings("unused")
     private long p1, p2, p3, p4, p5, p6, p7;
-
-    private final AtomicLong value;
-
     // 7 longs of post‐padding
     @SuppressWarnings("unused")
     private long p8, p9, p10, p11, p12, p13, p14;

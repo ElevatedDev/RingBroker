@@ -2,7 +2,6 @@ package io.ringbroker.cluster.membership.replicator;
 
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
-import io.ringbroker.cluster.client.impl.NettyClusterClient;
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Duration;
@@ -15,7 +14,7 @@ import java.util.concurrent.*;
 /**
  * Sends a pre-built BrokerApi.Envelope (of kind PUBLISH) to all replicas in parallel,
  * and waits until ackQuorum of them respond with Status.SUCCESS (i.e. durable fsync).
- *
+ * <p>
  * If fewer than ackQuorum succeed within timeoutMillis, a TimeoutException is thrown.
  */
 @Slf4j

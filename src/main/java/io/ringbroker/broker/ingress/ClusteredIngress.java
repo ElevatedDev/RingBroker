@@ -42,6 +42,11 @@ import java.util.function.BiConsumer;
 @RequiredArgsConstructor
 @Getter
 public final class ClusteredIngress {
+    /**
+     * A shared virtual-thread executor for asynchronous replication tasks.
+     */
+    private static final ExecutorService VT_EXECUTOR =
+            Executors.newVirtualThreadPerTaskExecutor();
     private final Partitioner partitioner;
     private final int totalPartitions;
     private final int myNodeId;
@@ -58,30 +63,24 @@ public final class ClusteredIngress {
     private final FlashReplicator replicator;
 
     /**
-     * A shared virtual-thread executor for asynchronous replication tasks.
-     */
-    private static final ExecutorService VT_EXECUTOR =
-            Executors.newVirtualThreadPerTaskExecutor();
-
-    /**
      * Creates and initializes a {@code ClusteredIngress} instance with the provided configuration.
      *
-     * @param registry         the topic registry for topic validation and schema lookup
-     * @param partitioner      the partitioner to map each message key to a partition
-     * @param totalPartitions  the total number of partitions in the cluster
-     * @param myNodeId         the ID of this node (0..clusterSize-1)
-     * @param clusterSize      the total number of nodes in the cluster
-     * @param clusterNodes     map from nodeId to RemoteBrokerClient for inter-node forwarding
-     * @param baseDataDir      the base directory for ledger segment storage per-partition
-     * @param ringSize         the size of each ring-buffer for in-memory delivery
-     * @param waitStrategy     the wait strategy for each ring-buffer
-     * @param segmentCapacity  the capacity of each ledger segment (bytes)
-     * @param batchSize        the maximum number of messages per batch for disk writes
-     * @param idempotentMode   if true, deduplicate by messageId before writing
-     * @param offsetStore      the OffsetStore to track committed offsets
-     * @param brokerRole       this node’s role (INGESTION or PERSISTENCE)
-     * @param replicaResolver  resolves which persistence replicas to send to per partition
-     * @param replicator       handles sending to replicas and awaiting quorum
+     * @param registry        the topic registry for topic validation and schema lookup
+     * @param partitioner     the partitioner to map each message key to a partition
+     * @param totalPartitions the total number of partitions in the cluster
+     * @param myNodeId        the ID of this node (0..clusterSize-1)
+     * @param clusterSize     the total number of nodes in the cluster
+     * @param clusterNodes    map from nodeId to RemoteBrokerClient for inter-node forwarding
+     * @param baseDataDir     the base directory for ledger segment storage per-partition
+     * @param ringSize        the size of each ring-buffer for in-memory delivery
+     * @param waitStrategy    the wait strategy for each ring-buffer
+     * @param segmentCapacity the capacity of each ledger segment (bytes)
+     * @param batchSize       the maximum number of messages per batch for disk writes
+     * @param idempotentMode  if true, deduplicate by messageId before writing
+     * @param offsetStore     the OffsetStore to track committed offsets
+     * @param brokerRole      this node’s role (INGESTION or PERSISTENCE)
+     * @param replicaResolver resolves which persistence replicas to send to per partition
+     * @param replicator      handles sending to replicas and awaiting quorum
      * @return a fully initialized {@code ClusteredIngress} instance
      * @throws IOException if any Ingress (per-partition) cannot be created
      */

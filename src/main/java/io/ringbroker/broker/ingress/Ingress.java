@@ -198,7 +198,7 @@ public final class Ingress {
     private void writerLoop() {
         try {
             while (!Thread.currentThread().isInterrupted()) {
-                byte[] first = queue.poll();
+                final byte[] first = queue.poll();
                 if (first == null) {
                     LockSupport.parkNanos(PARK_NANOS);
                     continue;
@@ -208,7 +208,7 @@ public final class Ingress {
                 batchBuffer[count++] = first;
 
                 while (count < batchSize) {
-                    byte[] next = queue.poll();
+                    final byte[] next = queue.poll();
                     if (next == null) break;
                     batchBuffer[count++] = next;
                 }
