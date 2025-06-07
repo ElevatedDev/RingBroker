@@ -3,7 +3,7 @@ package io.ringbroker.test;
 import com.google.protobuf.Timestamp;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.broker.role.BrokerRole;
-import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
@@ -117,7 +117,7 @@ class SanityCheckMain {
                 1,
                 List::of);
 
-        final FlashReplicator replicator = new FlashReplicator(
+        final AdaptiveReplicator replicator = new AdaptiveReplicator(
                 1,
                 Map.of(),
                 -1);

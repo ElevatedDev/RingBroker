@@ -15,6 +15,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.file.Path;
 import java.util.AbstractList;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
@@ -198,7 +199,6 @@ public final class Ingress {
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 final byte[] first = queue.poll();
-
                 if (first == null) {
                     LockSupport.parkNanos(PARK_NANOS);
                     continue;
@@ -214,19 +214,20 @@ public final class Ingress {
                 }
 
                 batchView.setSize(count);
-
                 final LedgerSegment segment = segments.writable();
+
                 if (forceDurableWrites) {
                     segment.appendBatchAndForce(batchView);
                 } else {
                     segment.appendBatch(batchView);
                 }
 
-                for (int i = 0; i < count; i++) {
-                    final long seq = ring.next();
-                    ring.publish(seq, batchBuffer[i]);
-                    batchBuffer[i] = null;
-                }
+                // micro-optimized batch publish in one go:
+                final long endSeq = ring.next(count);
+                ring.publishBatch(endSeq, count, batchBuffer);
+
+                // clear for GC
+                Arrays.fill(batchBuffer, 0, count, null);
             }
         } catch (final IOException ioe) {
             log.error("Ingress writer loop encountered an I/O error and will terminate. Partition data may be at risk.", ioe);
