@@ -1,45 +1,23 @@
+// ── src/main/java/io/ringbroker/config/impl/BrokerConfig.java
 package io.ringbroker.config.impl;
 
+import io.ringbroker.broker.role.BrokerRole;
 import lombok.Getter;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.List;
 import java.util.Map;
 
 /**
- * {@code BrokerConfig} holds the configuration settings for a broker node as read from a YAML file (typically {@code broker.yaml}).
- * <p>
- * This class provides access to various broker parameters such as network ports, partitioning, cluster size, file paths,
- * threading, batching, and operational modes. It also provides a static method to load configuration values from a YAML file
- * using SnakeYAML.
- * <p>
- * Example usage:
- * <pre>
- *   BrokerConfig config = BrokerConfig.load("/path/to/broker.yaml");
- *   int port = config.getGrpcPort();
- * </pre>
- *
- * <b>Configuration properties:</b>
- * <ul>
- *   <li>grpcPort: gRPC server port</li>
- *   <li>topicsFile: path to topics configuration file</li>
- *   <li>totalPartitions: number of partitions in the cluster</li>
- *   <li>nodeId: unique identifier for this broker node</li>
- *   <li>clusterSize: total number of broker nodes</li>
- *   <li>ledgerPath: path to the broker's ledger storage</li>
- *   <li>ringSize: size of the ring buffer</li>
- *   <li>segmentBytes: segment file size in bytes</li>
- *   <li>ingressThreads: number of threads for ingress (if present)</li>
- *   <li>batchSize: batch size for message processing</li>
- *   <li>idempotentMode: whether idempotent mode is enabled</li>
- * </ul>
+ * Immutable config holder loaded from broker.yaml
  */
 @Getter
 public final class BrokerConfig {
-
     private int grpcPort;
     private String topicsFile;
     private int totalPartitions;
@@ -48,40 +26,55 @@ public final class BrokerConfig {
     private String ledgerPath;
     private int ringSize;
     private int segmentBytes;
-    private int ingressThreads;
     private int batchSize;
+    private long replicationTimeoutMillis;
     private boolean idempotentMode;
 
-    /**
-     * Loads broker configuration from a YAML file at the specified path.
-     * <p>
-     * This method parses the YAML file using SnakeYAML and populates a new {@code BrokerConfig} instance
-     * with the configuration properties defined in the file. The expected properties include grpcPort,
-     * topicsFile, totalPartitions, nodeId, clusterSize, ledgerPath, ringSize, segmentBytes, batchSize,
-     * and idempotentMode.
-     *
-     * @param path the path to the YAML configuration file
-     * @return a populated {@code BrokerConfig} instance
-     * @throws IOException if the file cannot be read or parsed
-     * @throws ClassCastException if a property in the YAML file does not match the expected type
-     */
+    private BrokerRole brokerRole;
+    private List<InetSocketAddress> seedAddresses;
+    private int replicationFactor;
+    private int ackQuorum;
+    private InetSocketAddress bindAddress;
+
+    @SuppressWarnings("unchecked")
     public static BrokerConfig load(final String path) throws IOException {
         final Yaml yaml = new Yaml();
 
         try (final InputStream in = Files.newInputStream(Paths.get(path))) {
-            final Map<String, Object> map = yaml.load(in);
+            final Map<String, Object> m = yaml.load(in);
             final BrokerConfig cfg = new BrokerConfig();
 
-            cfg.grpcPort = (Integer) map.get("grpcPort");
-            cfg.topicsFile = (String) map.get("topicsFile");
-            cfg.totalPartitions = (Integer) map.get("totalPartitions");
-            cfg.nodeId = (Integer) map.get("nodeId");
-            cfg.clusterSize = (Integer) map.get("clusterSize");
-            cfg.ledgerPath = (String) map.get("ledgerPath");
-            cfg.ringSize = (Integer) map.get("ringSize");
-            cfg.segmentBytes = (Integer) map.get("segmentBytes");
-            cfg.batchSize = (Integer) map.get("batchSize");
-            cfg.idempotentMode = (Boolean) map.get("idempotentMode");
+            cfg.grpcPort = (Integer) m.get("grpcPort");
+            cfg.topicsFile = (String) m.get("topicsFile");
+            cfg.totalPartitions = (Integer) m.get("totalPartitions");
+            cfg.nodeId = (Integer) m.get("nodeId");
+            cfg.clusterSize = (Integer) m.get("clusterSize");
+            cfg.ledgerPath = (String) m.get("ledgerPath");
+            cfg.ringSize = (Integer) m.get("ringSize");
+            cfg.segmentBytes = (Integer) m.get("segmentBytes");
+            cfg.batchSize = (Integer) m.get("batchSize");
+            cfg.idempotentMode = (Boolean) m.get("idempotentMode");
+
+            cfg.brokerRole = BrokerRole.valueOf(
+                    ((String) m.getOrDefault("role", "INGESTION")).toUpperCase()
+            );
+
+            final Map<String, Object> bind = (Map<String, Object>) m.get("bind");
+            cfg.bindAddress = new InetSocketAddress(
+                    (String) bind.get("host"),
+                    (Integer) bind.get("port")
+            );
+
+            final List<Map<String, Object>> seeds = (List<Map<String, Object>>) m.get("seedNodes");
+            cfg.seedAddresses = seeds.stream()
+                    .map(s -> new InetSocketAddress(
+                            (String) s.get("host"),
+                            (Integer) s.get("port")))
+                    .toList();
+
+            cfg.replicationFactor = (Integer) m.getOrDefault("replicationFactor", 2);
+            cfg.ackQuorum = (Integer) m.getOrDefault("ackQuorum", 2);
+            cfg.replicationTimeoutMillis = ((Number) m.getOrDefault("replicationTimeoutMillis", 200)).longValue();
 
             return cfg;
         }

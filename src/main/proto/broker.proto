@@ -19,6 +19,8 @@ message Envelope {
     CommitAck        commitAck = 12;
     CommittedReply   committedReply = 13;
     MessageEvent     messageEvent = 14;
+
+    ReplicationAck   replication_ack = 15;
   }
 }
 
@@ -27,7 +29,9 @@ message Message {
   int32  retries = 2;
   bytes  payload = 3;
   bytes  key = 4;
+  int32  partition_id = 5;
 }
+
 message PublishReply {
   bool success = 1;
   string error = 2;
@@ -77,4 +81,19 @@ message BatchMessage {
 
 message FetchReply {
   repeated MessageEvent messages = 1;
+}
+
+message ReplicationAck {
+  enum Status {
+    SUCCESS = 0;
+    ERROR_PERSISTENCE_FAILED = 1;
+    ERROR_INVALID_REQUEST = 2;
+    ERROR_REPLICA_NOT_READY = 3;
+    ERROR_UNKNOWN = 4;
+  }
+
+  Status status = 1;
+  string error_message = 2;
+  int32 replica_node_id = 3;
+  int64 offset = 4;
 }

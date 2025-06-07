@@ -3,6 +3,9 @@ package io.ringbroker.benchmark;
 import com.google.protobuf.ByteString;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
+import io.ringbroker.broker.role.BrokerRole;
+import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.Blocking;
@@ -20,10 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -100,19 +100,32 @@ public class RingBrokerBenchmark {
             default -> throw new IllegalArgumentException("Unknown wait strategy: " + this.waitStrategy);
         };
 
+        final ReplicaSetResolver resolver = new ReplicaSetResolver(
+                1,
+                List::of);
+
+        final FlashReplicator replicator = new FlashReplicator(
+                1,
+                Map.of(),
+                -1);
+
         ingress = ClusteredIngress.create(
                 registry,
                 new RoundRobinPartitioner(),
                 TOTAL_PARTITIONS,
-                0, 1,
-                new HashMap<>(),
+                0,                     // myNodeId
+                1,                     // clusterSize (single PB)
+                new HashMap<>(),       // clusterNodes
                 DATA,
                 RING_SIZE,
                 waitStrategy,
                 SEG_BYTES,
                 BATCH_SIZE,
-                false,
-                offsetStore
+                false,                 // idempotentMode
+                offsetStore,
+                BrokerRole.INGESTION, // local durable path
+                resolver,
+                replicator
         );
 
         // Start TCP transport
@@ -159,7 +172,7 @@ public class RingBrokerBenchmark {
             for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
                 final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
 
-                ingress.publish(TOPIC, key, 0, payload);
+                ingress.publish(TOPIC, key, payload);
             }
         }
 

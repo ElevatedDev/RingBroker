@@ -3,9 +3,11 @@ package io.ringbroker.broker.ingress;
 import com.google.protobuf.DynamicMessage;
 import io.ringbroker.core.ring.RingBuffer;
 import io.ringbroker.ledger.orchestrator.LedgerOrchestrator;
+import io.ringbroker.ledger.segment.LedgerSegment;
 import io.ringbroker.registry.TopicRegistry;
 import lombok.Getter;
 import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.PostConstruct;
 import java.io.IOException;
@@ -44,6 +46,7 @@ import java.util.concurrent.locks.LockSupport;
  * </pre>
  */
 @Getter
+@Slf4j
 public final class Ingress {
 
     private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -65,18 +68,21 @@ public final class Ingress {
     private final SlotRing queue;
     private final byte[][] batchBuffer;
     private final ByteBatch batchView;
+    private final boolean forceDurableWrites;
 
     private Ingress(final TopicRegistry registry,
                     final RingBuffer<byte[]> ring,
                     final LedgerOrchestrator segments,
                     final ExecutorService pool,
-                    final int batchSize) {
+                    final int batchSize,
+                    final boolean forceDurableWrites) {
 
         this.registry = registry;
         this.ring = ring;
         this.segments = segments;
         this.pool = pool;
         this.batchSize = batchSize;
+        this.forceDurableWrites = forceDurableWrites;
 
         final int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
         this.queue = new SlotRing(capacity);
@@ -103,14 +109,16 @@ public final class Ingress {
                                  final RingBuffer<byte[]> ring,
                                  final Path dataDir,
                                  final long segmentSize,
-                                 final int batchSize) throws IOException {
+                                 final int batchSize,
+                                 final boolean durable) throws IOException {
 
+        final LedgerOrchestrator mgr =
+                LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
 
-        final LedgerOrchestrator mgr = LedgerOrchestrator.bootstrap(dataDir, (int) segmentSize);
-        final Ingress ingress = new Ingress(registry, ring, mgr, EXECUTOR, batchSize);
+        final Ingress ingress =
+                new Ingress(registry, ring, mgr, EXECUTOR, batchSize, durable);
 
         EXECUTOR.submit(ingress::writerLoop);
-
         return ingress;
     }
 
@@ -184,61 +192,59 @@ public final class Ingress {
 
     /**
      * Continuously drains the queue, batches messages, persists them to disk, and publishes to the ring buffer.
-     * <p>
-     * This method runs in a background thread, waiting for messages to arrive in the queue. It collects up to
-     * {@code batchSize} messages into a batch, appends the batch to the ledger for persistence, and then publishes
-     * each message to the downstream ring buffer for further processing. The method is designed to be lock-free
-     * and allocation-free for high-throughput scenarios.
+     * This method runs in a background thread. Persistence behavior (fsync) is controlled by {@code forceDurableWrites}.
      */
     private void writerLoop() {
         try {
             while (!Thread.currentThread().isInterrupted()) {
-
-                /* 1) wait for at least one element */
                 final byte[] first = queue.poll();
+
                 if (first == null) {
-                    // queue is empty – back off briefly to avoid endless CPU burn
-                    LockSupport.parkNanos(PARK_NANOS);   // ≈1 µs
+                    LockSupport.parkNanos(PARK_NANOS);
                     continue;
                 }
 
-                /* 2) drain up to batchSize elements in total */
                 int count = 0;
                 batchBuffer[count++] = first;
 
                 while (count < batchSize) {
                     final byte[] next = queue.poll();
-
                     if (next == null) break;
-
                     batchBuffer[count++] = next;
                 }
 
-                /* 3) expose array as List<byte[]> without copying */
                 batchView.setSize(count);
 
-                /* 4) disk append */
-                segments.writable().appendBatch(batchView);
+                final LedgerSegment segment = segments.writable();
+                if (forceDurableWrites) {
+                    segment.appendBatchAndForce(batchView);
+                } else {
+                    segment.appendBatch(batchView);
+                }
 
-                /* 5) publish to downstream ring */
                 for (int i = 0; i < count; i++) {
                     final long seq = ring.next();
                     ring.publish(seq, batchBuffer[i]);
-                    batchBuffer[i] = null; // reclaim slot for next batch
+                    batchBuffer[i] = null;
                 }
             }
-        } catch (final IOException exception) {
-            exception.printStackTrace();
+        } catch (final IOException ioe) {
+            log.error("Ingress writer loop encountered an I/O error and will terminate. Partition data may be at risk.", ioe);
+        } catch (final RuntimeException ex) {
+            log.error("Ingress writer loop encountered an unexpected runtime error and will terminate.", ex);
+            throw new RuntimeException("Ingress writer loop failed critically due to RuntimeException", ex);
         }
     }
 
     /**
-     * Closes the writable segment of the ledger orchestrator, releasing any resources held.
+     * Closes the underlying {@link LedgerOrchestrator}, which in turn closes its active segment.
      *
-     * @throws IOException if an I/O error occurs during closing
+     * @throws IOException if an I/O error occurs during closing the ledger orchestrator.
      */
     public void close() throws IOException {
-        this.segments.writable().close();
+        if (this.segments != null) {
+            this.segments.close();
+        }
     }
 
     /*
