@@ -58,12 +58,12 @@ Producers ──▶ ClusteredIngress ──▶ PartitionContext ──▶ RingBu
 **Test Machine:**  
 Intel i7 Ultra (1.40 GHz), 16 cores / 22 threads, SSD
 
-| Broker         | Producer Throughput | Consumer Throughput | Notes                                  |
-|----------------|---------------------|---------------------|----------------------------------------|
-| **RingBroker** | 6.11 M msg/s        | 3.21 M msg/s        | 16 partitions, batch 4096, single node |
-| Kafka          | ~1–3 M msg/s        | ~1–2 M msg/s        | Multinode tuning required              |
-| Redpanda       | ~2–3 M msg/s        | ~2–3 M msg/s        | C++, io_uring, good latency            |
-| NATS JetStream | ~160k msg/s         | ~160k msg/s         | Durable, Go-based, simpler semantics   |
+| Broker         | Producer Throughput | Consumer Throughput | Notes                                       |
+|----------------|---------------------|----------------------|---------------------------------------------|
+| **RingBroker** | 9.12 M msg/s        | 3.21 M msg/s         | 16 partitions, batch 4096, single node      |
+| Kafka          | ~1–3 M msg/s        | ~1–2 M msg/s         | Multinode tuning required                   |
+| Redpanda       | ~2–3 M msg/s        | ~2–3 M msg/s         | C++, io_uring, good latency                 |
+| NATS JetStream | ~160k msg/s         | ~160k msg/s          | Durable, Go-based, simpler semantics        |
 
 ---
 
