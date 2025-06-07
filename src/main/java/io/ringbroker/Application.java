@@ -5,7 +5,7 @@ import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
 import io.ringbroker.cluster.client.impl.NettyClusterClient;
 import io.ringbroker.cluster.membership.gossip.impl.SwimGossipService;
-import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.Partitioner;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
@@ -109,7 +109,7 @@ public class Application {
                 cfg.getReplicationFactor(),
                 () -> gossip.view().values());
 
-        final FlashReplicator replicator = new FlashReplicator(
+        final AdaptiveReplicator replicator = new AdaptiveReplicator(
                 cfg.getAckQuorum(),
                 clusterNodes,
                 cfg.getReplicationTimeoutMillis());

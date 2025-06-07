@@ -4,7 +4,7 @@ import com.google.protobuf.ByteString;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.broker.role.BrokerRole;
-import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
@@ -104,7 +104,7 @@ public class RingBrokerBenchmark {
                 1,
                 List::of);
 
-        final FlashReplicator replicator = new FlashReplicator(
+        final AdaptiveReplicator replicator = new AdaptiveReplicator(
                 1,
                 Map.of(),
                 -1);

@@ -5,7 +5,7 @@ import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.delivery.Delivery;
 import io.ringbroker.broker.role.BrokerRole;
 import io.ringbroker.cluster.client.RemoteBrokerClient;
-import io.ringbroker.cluster.membership.replicator.FlashReplicator;
+import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.partitioner.Partitioner;
 import io.ringbroker.core.ring.RingBuffer;
@@ -60,7 +60,7 @@ public final class ClusteredIngress {
     private final TopicRegistry registry;
     private final BrokerRole myRole;
     private final ReplicaSetResolver replicaResolver;
-    private final FlashReplicator replicator;
+    private final AdaptiveReplicator replicator;
 
     /**
      * Creates and initializes a {@code ClusteredIngress} instance with the provided configuration.
@@ -99,7 +99,7 @@ public final class ClusteredIngress {
                                           final OffsetStore offsetStore,
                                           final BrokerRole brokerRole,
                                           final ReplicaSetResolver replicaResolver,
-                                          final FlashReplicator replicator) throws IOException {
+                                          final AdaptiveReplicator replicator) throws IOException {
 
         final Map<Integer, Ingress> ingressMap = new HashMap<>();
         final Map<Integer, Delivery> deliveryMap = new HashMap<>();
