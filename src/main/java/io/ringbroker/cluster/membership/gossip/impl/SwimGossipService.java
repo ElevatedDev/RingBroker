@@ -39,6 +39,7 @@ public final class SwimGossipService implements GossipService {
     private final List<InetSocketAddress> seeds;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r ->
             new Thread(r, "gossip-flusher"));
+
     private volatile Channel channel;
 
     public SwimGossipService(final int selfId,

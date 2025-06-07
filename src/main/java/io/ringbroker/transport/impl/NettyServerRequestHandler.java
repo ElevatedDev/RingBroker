@@ -9,6 +9,8 @@ import io.ringbroker.offset.OffsetStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.concurrent.locks.LockSupport;
+
 /**
  * Handles incoming client requests from the Netty pipeline, dispatching them
  * to the appropriate {@link ClusteredIngress} or {@link OffsetStore} methods.
@@ -135,8 +137,15 @@ public class NettyServerRequestHandler
                     ingress.subscribeTopic(
                             s.getTopic(),
                             s.getGroup(),
-                            (seq, msg) -> { // BiConsumer callback for subscribed messages
+                            (seq, msg) -> {
+
                                 if (ctx.channel().isActive()) {
+
+                                    while (!ctx.channel().isWritable()) {
+                                        LockSupport.parkNanos(100_000);
+                                        if (!ctx.channel().isActive()) return;
+                                    }
+
                                     ctx.writeAndFlush( // Use writeAndFlush for streaming messages
                                             BrokerApi.Envelope.newBuilder()
                                                     // No correlationId for pushed MessageEvents is standard.
@@ -156,14 +165,11 @@ public class NettyServerRequestHandler
                                 }
                             }
                     );
-                    // No immediate reply for SUBSCRIBE is typical; success is implied by subsequent MessageEvents.
-                    // If an explicit "Subscribe OK" ack is needed, send it here.
                 }
 
                 default -> {
                     log.warn("Unhandled envelope kind: {} with correlationId: {}. This may indicate a client sending an unexpected message type or a new unhandled type.",
                             env.getKindCase(), corrId);
-                    // Optionally, send a generic error reply to the client.
                 }
             }
 

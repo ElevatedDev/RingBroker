@@ -64,7 +64,6 @@ public final class RingBuffer<E> {
         ARRAY_HANDLE.setRelease(entries, index, entry);
 
         // 2) spin only until the previous sequence has been published.
-        //    Once cursor.getValue() == (seq - 1), *we* know it's our turn.
         while (cursor.getValue() != seq - 1) {
             Thread.onSpinWait();
         }
@@ -95,6 +94,13 @@ public final class RingBuffer<E> {
      */
     public long getCursor() {
         return cursor.getValue();
+    }
+
+    /**
+     * @return the number of slots in the ring buffer.
+     */
+    public int capacity() {
+        return entries.length;
     }
 }
 
