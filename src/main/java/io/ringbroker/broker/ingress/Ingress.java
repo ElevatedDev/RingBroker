@@ -205,7 +205,6 @@ public final class Ingress {
                 }
 
                 int count = 0;
-                /* 8 bytes overhead per record (4 bytes length + 4 bytes CRC) */
                 int totalBytes = 0;
 
                 batchBuffer[count++] = first;
@@ -219,24 +218,16 @@ public final class Ingress {
                 }
 
                 batchView.setSize(count);
-
-                /*
-                 * CRITICAL FIX: Request a segment that definitely has space for this batch.
-                 * If the current segment is too full, the orchestrator will roll to a new one.
-                 */
                 final LedgerSegment segment = segments.writable(totalBytes);
 
                 if (forceDurableWrites) {
-                    segment.appendBatchAndForce(batchView);
+                    segment.appendBatchAndForce(batchView, totalBytes);
                 } else {
-                    segment.appendBatch(batchView);
+                    segment.appendBatch(batchView, totalBytes);
                 }
 
-                // micro-optimized batch publish in one go:
                 final long endSeq = ring.next(count);
                 ring.publishBatch(endSeq, count, batchBuffer);
-
-                // clear for GC
                 Arrays.fill(batchBuffer, 0, count, null);
             }
         } catch (final IOException ioe) {

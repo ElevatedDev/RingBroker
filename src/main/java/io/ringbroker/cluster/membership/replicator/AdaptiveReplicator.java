@@ -22,6 +22,7 @@ public final class AdaptiveReplicator {
      */
     private final ConcurrentMap<Integer, Double> ewmaNs = new ConcurrentHashMap<>();
     private final double alpha = 0.2;
+    private final double defaultNs;
 
     /**
      * Executor for background replication to “slow” replicas.
@@ -45,7 +46,8 @@ public final class AdaptiveReplicator {
         this.timeoutMillis = timeoutMillis;
 
         // initialize EWMA with a default (e.g. 1ms)
-        final double defaultNs = TimeUnit.MILLISECONDS.toNanos(1);
+        this.defaultNs = TimeUnit.MILLISECONDS.toNanos(1);
+
         for (final Integer id : clients.keySet()) {
             ewmaNs.put(id, defaultNs);
         }
@@ -70,7 +72,7 @@ public final class AdaptiveReplicator {
 
         // 1) Sort replicas by their EWMA latency (ascending)
         final List<Integer> sorted = new ArrayList<>(replicas);
-        sorted.sort(Comparator.comparingDouble(ewmaNs::get));
+        sorted.sort(Comparator.comparingDouble(id -> ewmaNs.getOrDefault(id, defaultNs)));
 
         // 2) Split into the “fast quorum” and the rest
         final List<Integer> fast = sorted.subList(0, Math.min(ackQuorum, sorted.size()));
@@ -110,11 +112,11 @@ public final class AdaptiveReplicator {
             try {
                 ack = fut.get(remainingMs, TimeUnit.MILLISECONDS);
             } catch (final ExecutionException ex) {
-                // IMPORTANT: Cancel the future to trigger map cleanup in NettyClusterClient
+                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
                 fut.cancel(true);
                 throw new RuntimeException("Fast replica " + nodeId + " failed", ex.getCause());
             } catch (final TimeoutException te) {
-                // IMPORTANT: Cancel the future to trigger map cleanup in NettyClusterClient
+                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
                 fut.cancel(true);
                 throw new TimeoutException("Fast replica " + nodeId +
                         " did not ack within " + timeoutMillis + "ms");
@@ -128,7 +130,7 @@ public final class AdaptiveReplicator {
             final long lat = System.nanoTime() - startNs.get(nodeId);
 
             ewmaNs.compute(nodeId, (id, prev) ->
-                    (1 - alpha) * prev + alpha * lat
+                    prev == null ? (double) lat : (1 - alpha) * prev + alpha * lat
             );
         }
 

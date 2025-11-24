@@ -291,10 +291,10 @@ public class RingBrokerBenchmark {
     }
 }
 
-    /**
-     * Subscribe benchmark - currently commented out in the TestMain
-     * but included here so it ain't missing.
-     */
+/**
+ * Subscribe benchmark - currently commented out in the TestMain
+ * but included here so it ain't missing.
+ */
 //    @Benchmark
 //    @BenchmarkMode(Mode.Throughput)
 //    @OutputTimeUnit(TimeUnit.SECONDS)

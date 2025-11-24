@@ -26,7 +26,7 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
-import java.util.zip.CRC32;
+import java.util.zip.CRC32C; // FIX: Use CRC32C
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -74,14 +74,23 @@ class SanityCheckMain {
                     break;
                 }
 
-                if (len <= 0) break;    // end-padding
+                /*
+                 * FIX: 0 length is now a valid EOF marker in production logic.
+                 * Stop parsing silently.
+                 */
+                if (len == 0) {
+                    break;
+                }
+
+                if (len < 0) break;    // corrupted/end
 
                 final int storedCrc = readIntLE(input);    // crc  (LE)
                 final byte[] buffer = input.readNBytes(len);
 
                 if (buffer.length < len) break;    // truncated (shouldn’t)
 
-                final CRC32 crc = new CRC32();
+                /* FIX: Use hardware-accelerated CRC32C to match LedgerSegment */
+                final CRC32C crc = new CRC32C();
                 crc.update(buffer, 0, len);
 
                 if ((int) crc.getValue() != storedCrc) {
@@ -165,7 +174,8 @@ class SanityCheckMain {
                     .setCreatedAt(Timestamp.getDefaultInstance())
                     .build();
 
-            ingress.publish(TOPIC, key, event.toByteArray());
+            /* We must wait for the future now that publish is async */
+            ingress.publish(TOPIC, key, event.toByteArray()).join();
         }
 
         assertTrue(latch.await(30, TimeUnit.SECONDS),

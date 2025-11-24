@@ -37,10 +37,10 @@ public final class LedgerOrchestrator implements AutoCloseable {
             Executors.newSingleThreadExecutor(Thread.ofVirtual().name("segment-allocator").factory());
 
     private final AtomicReference<LedgerSegment> activeSegment = new AtomicReference<>();
+    private final Lock segmentLock = new ReentrantLock();
     @Getter
     private volatile long highWaterMark;
     private Future<LedgerSegment> nextSegmentFuture;
-    private final Lock segmentLock = new ReentrantLock();
 
     private LedgerOrchestrator(final Path directory, final int segmentCapacity, final long initialHwm) {
         this.directory = directory;
@@ -96,7 +96,10 @@ public final class LedgerOrchestrator implements AutoCloseable {
             return null;
         } finally {
             if (tempRecoveryPath != null) {
-                try { Files.deleteIfExists(tempRecoveryPath); } catch (IOException ignored) {}
+                try {
+                    Files.deleteIfExists(tempRecoveryPath);
+                } catch (IOException ignored) {
+                }
             }
         }
     }
@@ -186,7 +189,8 @@ public final class LedgerOrchestrator implements AutoCloseable {
         if (nextSegmentFuture != null && nextSegmentFuture.isDone()) {
             try {
                 nextActiveSegment = nextSegmentFuture.get();
-            } catch (final Exception ignored) { }
+            } catch (final Exception ignored) {
+            }
         }
 
         if (nextActiveSegment == null) {
@@ -207,7 +211,11 @@ public final class LedgerOrchestrator implements AutoCloseable {
 
     private LedgerSegment createNewSegment() throws IOException {
         segmentLock.lock();
-        try { return createNewSegment(this.highWaterMark); } finally { segmentLock.unlock(); }
+        try {
+            return createNewSegment(this.highWaterMark);
+        } finally {
+            segmentLock.unlock();
+        }
     }
 
     private LedgerSegment createNewSegment(final long previousSegmentLastOffset) throws IOException {
@@ -231,13 +239,17 @@ public final class LedgerOrchestrator implements AutoCloseable {
     public void close() {
         segmentAllocatorService.shutdownNow();
         final LedgerSegment current = activeSegment.getAndSet(null);
-        if (current != null) try { current.close(); } catch (Exception ignored) {}
+        if (current != null) try {
+            current.close();
+        } catch (Exception ignored) {
+        }
 
         if (nextSegmentFuture != null && nextSegmentFuture.isDone() && !nextSegmentFuture.isCancelled()) {
             try {
                 final LedgerSegment f = nextSegmentFuture.get();
                 if (f != null) f.close();
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
     }
 

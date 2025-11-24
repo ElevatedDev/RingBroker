@@ -14,7 +14,6 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
-import java.util.zip.CRC32;
 import java.util.zip.CRC32C;
 
 @Slf4j
@@ -30,13 +29,13 @@ public final class LedgerSegment implements AutoCloseable {
     private static final int MIN_RECORD_SIZE = MIN_RECORD_OVERHEAD + 1;
 
     private static final Unsafe UNSAFE = initUnsafe();
-    private static final long FIRST_OFF_OFFSET_IN_OBJECT;
-    private static final long LAST_OFF_OFFSET_IN_OBJECT;
+    private static final long FIRST_OFF_OFFSET;
+    private static final long LAST_OFF_OFFSET;
 
     static {
         try {
-            FIRST_OFF_OFFSET_IN_OBJECT = UNSAFE.objectFieldOffset(LedgerSegment.class.getDeclaredField("firstOffset"));
-            LAST_OFF_OFFSET_IN_OBJECT = UNSAFE.objectFieldOffset(LedgerSegment.class.getDeclaredField("lastOffset"));
+            FIRST_OFF_OFFSET = UNSAFE.objectFieldOffset(LedgerSegment.class.getDeclaredField("firstOffset"));
+            LAST_OFF_OFFSET = UNSAFE.objectFieldOffset(LedgerSegment.class.getDeclaredField("lastOffset"));
         } catch (final NoSuchFieldException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -47,7 +46,8 @@ public final class LedgerSegment implements AutoCloseable {
     private final MappedByteBuffer buf;
     private final boolean skipRecordCrc;
 
-    private final CRC32 recordCrc = new CRC32();
+    // Reusing CRC32C instance is fine as LedgerSegment is single-threaded writer
+    private final CRC32C recordCrc = new CRC32C();
     private final CRC32C headerCrc = new CRC32C();
     private final ByteBuffer headerScratch = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
 
@@ -60,6 +60,8 @@ public final class LedgerSegment implements AutoCloseable {
         this.buf = buf;
         this.skipRecordCrc = skipRecordCrc;
         readAndVerifyHeader();
+        // Only scan if we didn't just create it (optimization can be added to pass 'isNew' flag,
+        // but checking 0 at pos HEADER_SIZE is fast enough)
         this.buf.position(scanToEndOfWrittenData());
     }
 
@@ -75,11 +77,13 @@ public final class LedgerSegment implements AutoCloseable {
 
     public static LedgerSegment create(final Path file, final int capacity, final boolean skipRecordCrc) throws IOException {
         if (capacity < HEADER_SIZE + MIN_RECORD_SIZE) throw new IllegalArgumentException("Capacity too small");
+
         try (final FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             ch.truncate(capacity);
             final MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, 0, capacity);
             map.order(ByteOrder.LITTLE_ENDIAN);
 
+            // Write header
             map.putInt(MAGIC_POS, LedgerConstant.MAGIC);
             map.putShort(VERSION_POS, LedgerConstant.VERSION);
             map.putInt(CRC_POS, 0);
@@ -87,8 +91,13 @@ public final class LedgerSegment implements AutoCloseable {
             map.putLong(LAST_OFFSET_POS, 0L);
 
             writeHeaderCrcStatic(map, 0L, 0L);
-            map.load(); // Pre-touch
-            map.force();
+
+            /*
+             * REVERTED: map.load() and map.force().
+             * These caused massive latency spikes during segment rollover.
+             * We rely on OS lazy paging and async flush for throughput.
+             */
+
             map.position(HEADER_SIZE);
 
             return new LedgerSegment(file, capacity, map, skipRecordCrc);
@@ -101,7 +110,7 @@ public final class LedgerSegment implements AutoCloseable {
             if (size < HEADER_SIZE) throw new IOException("Segment too small");
             final MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, 0, size);
             map.order(ByteOrder.LITTLE_ENDIAN);
-            map.load();
+            // map.load() removed here too to speed up recovery startup
             return new LedgerSegment(file, (int) size, map, skipRecordCrc);
         }
     }
@@ -138,8 +147,7 @@ public final class LedgerSegment implements AutoCloseable {
         final int maxPos = capacity - MIN_RECORD_OVERHEAD - 1;
         while (pos <= maxPos) {
             final int len = buf.getInt(pos);
-            // FIX: 0 is a valid EOF marker.
-            if (len == 0) break;
+            if (len == 0) break; // Valid EOF
             if (len < 0) {
                 log.warn("Corrupt negative length {} at {} in {}", len, pos, file);
                 break;
@@ -154,57 +162,60 @@ public final class LedgerSegment implements AutoCloseable {
     }
 
     public boolean hasSpaceFor(int payloadBytes) {
-        // Overhead = Length(4) + CRC(4) = 8 bytes
-        return (capacity - buf.position()) >= (payloadBytes + 8);
+        return (capacity - buf.position()) >= (payloadBytes + MIN_RECORD_OVERHEAD); // overhead check fixed
     }
 
     public MappedByteBuffer getBuf() { return buf; }
 
-    public long[] appendBatch(final List<byte[]> msgs) throws IOException {
+    public long[] appendBatch(final List<byte[]> msgs, final int totalBytes) throws IOException {
         if (msgs.isEmpty()) return new long[0];
 
-        // Pre-flight check: do we have space?
-        int totalPayload = 0;
-        for (byte[] m : msgs) totalPayload += (MIN_RECORD_OVERHEAD + m.length);
-
-        if (buf.position() + totalPayload > capacity) {
+        // Double check capacity (cheap int comparison)
+        if (buf.position() + totalBytes > capacity) {
             throw new IOException("Segment full for batch: " + file);
         }
 
-        final long[] outs = new long[msgs.size()];
+        final int count = msgs.size();
+        final long[] outs = new long[count];
+
         long curr = (firstOffset == 0 && lastOffset == 0) ? 0L : lastOffset;
         boolean firstSet = firstOffset != 0L;
         final boolean doCrc = !skipRecordCrc;
 
-        for (int i = 0; i < msgs.size(); i++) {
+        for (int i = 0; i < count; i++) {
             final byte[] d = msgs.get(i);
-            buf.putInt(d.length);
+            final int len = d.length;
+
+            buf.putInt(len);
+
             if (doCrc) {
                 recordCrc.reset();
-                recordCrc.update(d, 0, d.length);
+                recordCrc.update(d, 0, len);
                 buf.putInt((int) recordCrc.getValue());
             } else {
                 buf.putInt(0);
             }
+
             buf.put(d);
 
             curr++;
             outs[i] = curr;
+
             if (!firstSet) {
-                UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET_IN_OBJECT, curr);
+                UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET, curr);
                 firstOffset = curr;
                 firstSet = true;
             }
         }
 
-        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET_IN_OBJECT, curr);
+        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET, curr);
         lastOffset = curr;
         updateHeaderOnDisk();
         return outs;
     }
 
-    public long[] appendBatchAndForce(final List<byte[]> msgs) throws IOException {
-        final long[] offs = appendBatch(msgs);
+    public long[] appendBatchAndForce(final List<byte[]> msgs, final int totalBytes) throws IOException {
+        final long[] offs = appendBatch(msgs, totalBytes);
         if (!msgs.isEmpty()) buf.force();
         return offs;
     }
@@ -234,5 +245,16 @@ public final class LedgerSegment implements AutoCloseable {
             try { buf.force(); } catch (Exception ignored) {}
             try { UNSAFE.invokeCleaner(buf); } catch (Exception ignored) {}
         }
+    }
+
+    @Override
+    public String toString() {
+        return "LedgerSegment{" +
+                "file=" + file +
+                ", capacity=" + capacity +
+                ", firstOffset=" + firstOffset +
+                ", lastOffset=" + lastOffset +
+                ", position=" + (buf != null ? buf.position() : "N/A") +
+                '}';
     }
 }

@@ -27,8 +27,12 @@ import java.util.function.BiConsumer;
 @Getter
 public final class ClusteredIngress {
 
-    private static final ExecutorService REPLICATION_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
-    private static final CompletableFuture<Void> COMPLETED_FUTURE = CompletableFuture.completedFuture(null);
+    // Shared completed future to avoid allocations when nothing async is pending.
+    private static final CompletableFuture<Void> COMPLETED_FUTURE =
+            CompletableFuture.completedFuture(null);
+
+    // Instance-level executor so one instance's shutdown doesn't kill others.
+    private final ExecutorService replicationExecutor;
 
     private final Partitioner partitioner;
     private final int totalPartitions;
@@ -37,7 +41,7 @@ public final class ClusteredIngress {
     private final Map<Integer, Ingress> ingressMap;
     private final Map<Integer, RemoteBrokerClient> clusterNodes;
     private final boolean idempotentMode;
-    private final Map<Integer, Set<String>> seenMessageIds;
+    private final Map<Integer, Set<Long>> seenMessageIds; // Long IDs, not String
     private final Map<Integer, Delivery> deliveryMap;
     private final OffsetStore offsetStore;
     private final TopicRegistry registry;
@@ -45,7 +49,7 @@ public final class ClusteredIngress {
     private final ReplicaSetResolver replicaResolver;
     private final AdaptiveReplicator replicator;
 
-    /* Factory method omitted for brevity, assume standard create() as before */
+    /* Factory method */
     public static ClusteredIngress create(final TopicRegistry registry,
                                           final Partitioner partitioner,
                                           final int totalPartitions,
@@ -65,7 +69,7 @@ public final class ClusteredIngress {
 
         final Map<Integer, Ingress> ingressMap = new HashMap<>();
         final Map<Integer, Delivery> deliveryMap = new HashMap<>();
-        final Map<Integer, Set<String>> seenMessageIds = idempotentMode
+        final Map<Integer, Set<Long>> seenMessageIds = idempotentMode
                 ? new HashMap<>()
                 : Collections.emptyMap();
 
@@ -79,18 +83,37 @@ public final class ClusteredIngress {
                         registry, ring, partDir, segmentCapacity, batchSize, forceDurable
                 );
                 ingressMap.put(pid, ingress);
+
                 final Delivery delivery = new Delivery(ring);
                 deliveryMap.put(pid, delivery);
+
                 if (idempotentMode) {
+                    // Concurrent set for dedupe IDs
                     seenMessageIds.put(pid, ConcurrentHashMap.newKeySet());
                 }
             }
         }
 
+        // Instance-specific virtual-thread executor for replication tasks.
+        final ExecutorService replicationExecutor =
+                Executors.newVirtualThreadPerTaskExecutor();
+
         return new ClusteredIngress(
-                partitioner, totalPartitions, myNodeId, clusterSize, ingressMap,
-                clusterNodes, idempotentMode, seenMessageIds, deliveryMap,
-                offsetStore, registry, brokerRole, replicaResolver, replicator
+                replicationExecutor,
+                partitioner,
+                totalPartitions,
+                myNodeId,
+                clusterSize,
+                ingressMap,
+                clusterNodes,
+                idempotentMode,
+                seenMessageIds,
+                deliveryMap,
+                offsetStore,
+                registry,
+                brokerRole,
+                replicaResolver,
+                replicator
         );
     }
 
@@ -110,8 +133,14 @@ public final class ClusteredIngress {
                                            final byte[] payload) {
 
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
-        final int ownerNode = Math.floorMod(partitionId, clusterSize);
 
+        // Inline floorMod for a tiny bit less overhead
+        int ownerNode = partitionId % clusterSize;
+        if (ownerNode < 0) {
+            ownerNode += clusterSize;
+        }
+
+        // Single-node fast path: no envelope, no replication, just local publish.
         if (clusterSize == 1 && myRole == BrokerRole.INGESTION) {
             try {
                 handleLocalPublish(partitionId, topic, retries, payload, key);
@@ -121,18 +150,7 @@ public final class ClusteredIngress {
             }
         }
 
-        final BrokerApi.Message.Builder msgBuilder = BrokerApi.Message.newBuilder()
-                .setTopic(topic)
-                .setRetries(retries)
-                .setKey(key == null ? ByteString.EMPTY : ByteString.copyFrom(key))
-                .setPayload(ByteString.copyFrom(payload))
-                .setPartitionId(partitionId);
-
-        final BrokerApi.Envelope envelope = BrokerApi.Envelope.newBuilder()
-                .setCorrelationId(correlationId)
-                .setPublish(msgBuilder.build())
-                .build();
-
+        // Owner is this node.
         if (ownerNode == myNodeId) {
             try {
                 handleLocalPublish(partitionId, topic, retries, payload, key);
@@ -140,15 +158,30 @@ public final class ClusteredIngress {
                 return CompletableFuture.failedFuture(e);
             }
 
-            final List<Integer> replicas = replicaResolver.replicas(partitionId);
-            replicas.removeIf(id -> id == myNodeId);
+            // Determine replicas. Avoid mutating a possibly unmodifiable list.
+            final List<Integer> resolved = replicaResolver.replicas(partitionId);
+            if (resolved.isEmpty()) {
+                return COMPLETED_FUTURE;
+            }
+
+            final List<Integer> replicas = new ArrayList<>(resolved.size());
+            for (int nodeId : resolved) {
+                if (nodeId != myNodeId) {
+                    replicas.add(nodeId);
+                }
+            }
 
             if (replicas.isEmpty()) {
                 return COMPLETED_FUTURE;
             }
 
+            // Only now build the protobuf envelope, since we actually need it.
+            final BrokerApi.Envelope envelope = buildEnvelope(
+                    correlationId, topic, key, payload, partitionId, retries
+            );
+
             final CompletableFuture<Void> future = new CompletableFuture<>();
-            REPLICATION_EXECUTOR.submit(() -> {
+            replicationExecutor.submit(() -> {
                 try {
                     replicator.replicate(envelope, replicas);
                     future.complete(null);
@@ -159,11 +192,19 @@ public final class ClusteredIngress {
             return future;
         }
 
+        // Owner is a remote node: we need an envelope.
         final RemoteBrokerClient ownerClient = clusterNodes.get(ownerNode);
         if (ownerClient == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("No client for owner node " + ownerNode));
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("No client for owner node " + ownerNode)
+            );
         }
 
+        final BrokerApi.Envelope envelope = buildEnvelope(
+                correlationId, topic, key, payload, partitionId, retries
+        );
+
+        // Here sendEnvelopeWithAck returns a ReplicationAck (semantic unchanged)
         return ownerClient.sendEnvelopeWithAck(envelope).thenApply(ack -> {
             if (ack.getStatus() != BrokerApi.ReplicationAck.Status.SUCCESS) {
                 throw new RuntimeException("Forwarding failed: " + ack.getStatus());
@@ -172,44 +213,90 @@ public final class ClusteredIngress {
         });
     }
 
+    private static BrokerApi.Envelope buildEnvelope(final long correlationId,
+                                                    final String topic,
+                                                    final byte[] key,
+                                                    final byte[] payload,
+                                                    final int partitionId,
+                                                    final int retries) {
+
+        final BrokerApi.Message.Builder msgBuilder = BrokerApi.Message.newBuilder()
+                .setTopic(topic)
+                .setRetries(retries)
+                .setKey(key == null ? ByteString.EMPTY : ByteString.copyFrom(key))
+                .setPayload(ByteString.copyFrom(payload))
+                .setPartitionId(partitionId);
+
+        return BrokerApi.Envelope.newBuilder()
+                .setCorrelationId(correlationId)
+                .setPublish(msgBuilder.build())
+                .build();
+    }
+
     public void handleLocalPublish(final int partitionId,
                                    final String topic,
                                    final int retries,
                                    final byte[] payload,
                                    final byte[] key) {
         if (idempotentMode) {
-            final Set<String> seen = Objects.requireNonNull(
-                    seenMessageIds.get(partitionId), "Seen set missing for partition " + partitionId);
-            final String msgId = computeMessageId(partitionId, key, payload);
-            if (!seen.add(msgId)) return;
+            final Set<Long> seen = seenMessageIds.get(partitionId);
+            if (seen == null) {
+                throw new IllegalStateException("Seen set missing for partition " + partitionId);
+            }
+            final long msgId = computeMessageId(partitionId, key, payload);
+            if (!seen.add(msgId)) {
+                // Duplicate detected, drop.
+                return;
+            }
         }
 
         final Ingress ingress = ingressMap.get(partitionId);
-        if (ingress == null) throw new IllegalStateException("No Ingress for partition " + partitionId);
+        if (ingress == null) {
+            throw new IllegalStateException("No Ingress for partition " + partitionId);
+        }
         ingress.publish(topic, retries, payload);
     }
 
     public void subscribeTopic(final String topic, final String group, final BiConsumer<Long, byte[]> handler) {
-        if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
+        if (!registry.contains(topic)) {
+            throw new IllegalArgumentException("Unknown topic: " + topic);
+        }
 
         for (final Map.Entry<Integer, Delivery> entry : deliveryMap.entrySet()) {
             final int partitionId = entry.getKey();
             final long committed = Math.max(0L, offsetStore.fetch(topic, group, partitionId));
+
             entry.getValue().subscribe(committed, (sequence, message) -> {
                 handler.accept(sequence, message);
+                // Per-message commit; with optimized OffsetStore this is still fine.
                 offsetStore.commit(topic, group, partitionId, sequence);
             });
         }
     }
 
     public void shutdown() throws IOException {
-        for (final Ingress ingress : ingressMap.values()) ingress.close();
-        REPLICATION_EXECUTOR.shutdown();
+        for (final Ingress ingress : ingressMap.values()) {
+            ingress.close();
+        }
+        replicationExecutor.shutdown();
+        try {
+            if (!replicationExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                log.warn("Replication executor did not terminate within 30s");
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
-    private String computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
+    /**
+     * Cheap-ish idempotent key: based on partition + hash(key) + hash(payload).
+     * Still O(|key| + |payload|) to compute, but we avoid String allocation.
+     */
+    private long computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
         final int keyHash = (key != null ? Arrays.hashCode(key) : 0);
         final int payloadHash = Arrays.hashCode(payload);
-        return partitionId + "-" + keyHash + "-" + payloadHash;
+        // Mix into a single 64-bit value.
+        final int combined = 31 * keyHash + payloadHash;
+        return (((long) partitionId) << 32) ^ (combined & 0xFFFF_FFFFL);
     }
 }
