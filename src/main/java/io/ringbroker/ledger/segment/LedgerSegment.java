@@ -17,6 +17,13 @@ import java.util.List;
 import java.util.zip.CRC32C;
 
 @Slf4j
+
+/**
+ * An append-only, memory-mapped segment file optimized for single-threaded writers.
+ * Each segment contains a header followed by records: [length (int), crc32 (int), payload (byte[])].
+ * Header is [magic, version, crc32c, firstOffset, lastOffset].
+ * Uses Unsafe for ordered writes and in-place header updates.
+ */
 public final class LedgerSegment implements AutoCloseable {
     private static final int MAGIC_POS = 0;
     private static final int VERSION_POS = MAGIC_POS + Integer.BYTES;

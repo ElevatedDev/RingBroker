@@ -118,36 +118,61 @@ public final class LedgerOrchestrator implements AutoCloseable {
             final ByteBuffer recordHeaderBuffer = ByteBuffer.allocate(Integer.BYTES * 2);
             ch.position(LedgerSegment.HEADER_SIZE);
 
+            // Reuse CRC instance to reduce allocation churn during recovery
+            final java.util.zip.CRC32C crcValidator = new java.util.zip.CRC32C();
+
             while (currentFilePosition < ch.size()) {
                 recordHeaderBuffer.clear();
                 int bytesRead = ch.read(recordHeaderBuffer);
 
-                /* FIX: If we read 0 bytes (or partial), checks are needed.
-                   But EOF on 0 bytes read is valid. */
+                // 1. Check for EOF (Clean stop)
                 if (bytesRead == -1 || bytesRead == 0) break;
 
+                // 2. Check for partial header (Corruption)
                 if (bytesRead < recordHeaderBuffer.capacity()) {
+                    log.warn("Partial record header at pos {}. Truncating.", currentFilePosition);
                     truncateChannel(ch, currentFilePosition);
                     return true;
                 }
+
                 recordHeaderBuffer.flip();
                 final int payloadLength = recordHeaderBuffer.getInt();
                 final int storedCrc = recordHeaderBuffer.getInt();
 
-                /* FIX: 0 means EOF */
+                // 3. Check for Valid EOF Marker (0-filled space)
                 if (payloadLength == 0) break;
 
+                // 4. Sanity Check Length
                 if (payloadLength < 0 || payloadLength > (ch.size() - currentFilePosition - Integer.BYTES * 2)) {
+                    log.warn("Invalid payload length {} at {}. Truncating.", payloadLength, currentFilePosition);
                     truncateChannel(ch, currentFilePosition);
                     return true;
                 }
 
                 final ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLength);
                 bytesRead = ch.read(payloadBuffer);
+
+                // 5. Check for Torn Payload
                 if (bytesRead < payloadLength) {
+                    log.warn("Torn record payload at {}. Truncating.", currentFilePosition);
                     truncateChannel(ch, currentFilePosition);
                     return true;
                 }
+
+                payloadBuffer.flip();
+                crcValidator.reset();
+
+                // CRC32C works with direct ByteBuffers or arrays.
+                // Since we allocated on heap, .array() is safe.
+                crcValidator.update(payloadBuffer.array(), 0, payloadLength);
+
+                if ((int) crcValidator.getValue() != storedCrc && storedCrc != 0) {
+                    log.warn("CRC32C Mismatch at {}. Stored: {}, Calc: {}. Truncating.",
+                            currentFilePosition, storedCrc, (int) crcValidator.getValue());
+                    truncateChannel(ch, currentFilePosition);
+                    return true;
+                }
+
                 currentFilePosition += (Integer.BYTES * 2 + payloadLength);
             }
             return true;

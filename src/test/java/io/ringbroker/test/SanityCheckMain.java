@@ -74,10 +74,6 @@ class SanityCheckMain {
                     break;
                 }
 
-                /*
-                 * FIX: 0 length is now a valid EOF marker in production logic.
-                 * Stop parsing silently.
-                 */
                 if (len == 0) {
                     break;
                 }
@@ -89,7 +85,6 @@ class SanityCheckMain {
 
                 if (buffer.length < len) break;    // truncated (shouldn’t)
 
-                /* FIX: Use hardware-accelerated CRC32C to match LedgerSegment */
                 final CRC32C crc = new CRC32C();
                 crc.update(buffer, 0, len);
 
