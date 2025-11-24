@@ -46,6 +46,7 @@ public class RingBrokerBenchmark {
     private static final String TOPIC = "orders/created";
 
     private static final Path DATA = Paths.get("data-jmh");
+    private static final Path OFFSETS = DATA.resolve("offsets"); // Dedicated offsets dir
 
     private static final String SUB_GROUP = "sub-benchmark";
     private static final String FETCH_GROUP = "fetch-benchmark";
@@ -62,6 +63,7 @@ public class RingBrokerBenchmark {
     private NettyTransport tcpTransport;
     private RawTcpClient client;
     private byte[] payload;
+    private InMemoryOffsetStore offsetStore; // Use field to close cleanly
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
@@ -79,13 +81,15 @@ public class RingBrokerBenchmark {
         }
 
         Files.createDirectories(DATA);
+        Files.createDirectories(OFFSETS);
 
-        // Build registry, offset store, ingress
+        // Build registry
         final TopicRegistry registry = new TopicRegistry.Builder()
                 .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
                 .build();
 
-        final InMemoryOffsetStore offsetStore = new InMemoryOffsetStore();
+        // FIX: Instantiate Durable Offset Store
+        offsetStore = new InMemoryOffsetStore(OFFSETS);
 
         // Create directory for each partition
         for (int p = 0; p < TOTAL_PARTITIONS; p++) {
@@ -96,18 +100,11 @@ public class RingBrokerBenchmark {
             case "adaptive-spin" -> new AdaptiveSpin();
             case "blocking" -> new Blocking();
             case "busy-spin" -> new BusySpin();
-
             default -> throw new IllegalArgumentException("Unknown wait strategy: " + this.waitStrategy);
         };
 
-        final ReplicaSetResolver resolver = new ReplicaSetResolver(
-                1,
-                List::of);
-
-        final AdaptiveReplicator replicator = new AdaptiveReplicator(
-                1,
-                Map.of(),
-                -1);
+        final ReplicaSetResolver resolver = new ReplicaSetResolver(1, List::of);
+        final AdaptiveReplicator replicator = new AdaptiveReplicator(1, Map.of(), -1);
 
         ingress = ClusteredIngress.create(
                 registry,
@@ -144,7 +141,7 @@ public class RingBrokerBenchmark {
     }
 
     @TearDown(Level.Trial)
-    public void tearDown() {
+    public void tearDown() throws Exception {
         if (client != null) {
             client.close();
         }
@@ -153,12 +150,16 @@ public class RingBrokerBenchmark {
             tcpTransport.stop();
         }
 
+        // FIX: Close offset store to stop flusher thread
+        if (offsetStore != null) {
+            offsetStore.close();
+        }
+
         log.info("=== Benchmark complete ===");
     }
 
-    /**
-     * Benchmark for direct ingress publish
-     */
+    // [Benchmarks: directIngressPublish, tcpBatchPublish, tcpFetch remain unchanged]
+
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
@@ -179,9 +180,6 @@ public class RingBrokerBenchmark {
         blackhole.consume(written);
     }
 
-    /**
-     * Benchmark for TCP batch publish
-     */
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
@@ -219,11 +217,6 @@ public class RingBrokerBenchmark {
         blackhole.consume(written);
     }
 
-    /**
-     * Benchmark for fetch operations
-     * This is a combined benchmark that first commits offsets to zero,
-     * then fetches messages and commits offsets
-     */
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
@@ -296,6 +289,7 @@ public class RingBrokerBenchmark {
 
         blackhole.consume(totalFetched);
     }
+}
 
     /**
      * Subscribe benchmark - currently commented out in the TestMain
@@ -328,4 +322,4 @@ public class RingBrokerBenchmark {
 //
 //        blackhole.consume(received.get());
 //    }
-}
+//}

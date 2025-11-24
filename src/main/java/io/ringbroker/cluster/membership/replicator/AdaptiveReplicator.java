@@ -18,13 +18,13 @@ public final class AdaptiveReplicator {
     private final long timeoutMillis;
 
     /**
-     * EWMA of each replica’s latency in nanoseconds
+     * EWMA of each replica’s latency in nanoseconds.
      */
     private final ConcurrentMap<Integer, Double> ewmaNs = new ConcurrentHashMap<>();
     private final double alpha = 0.2;
 
     /**
-     * Executor for background replication to “slow” replicas
+     * Executor for background replication to “slow” replicas.
      */
     private final ScheduledExecutorService pool = Executors.newScheduledThreadPool(
             1, r -> {
@@ -110,11 +110,16 @@ public final class AdaptiveReplicator {
             try {
                 ack = fut.get(remainingMs, TimeUnit.MILLISECONDS);
             } catch (final ExecutionException ex) {
+                // IMPORTANT: Cancel the future to trigger map cleanup in NettyClusterClient
+                fut.cancel(true);
                 throw new RuntimeException("Fast replica " + nodeId + " failed", ex.getCause());
             } catch (final TimeoutException te) {
+                // IMPORTANT: Cancel the future to trigger map cleanup in NettyClusterClient
+                fut.cancel(true);
                 throw new TimeoutException("Fast replica " + nodeId +
                         " did not ack within " + timeoutMillis + "ms");
             }
+
             if (ack.getStatus() != BrokerApi.ReplicationAck.Status.SUCCESS) {
                 throw new RuntimeException("Fast replica " + nodeId +
                         " returned non-SUCCESS: " + ack.getStatus());
@@ -134,10 +139,10 @@ public final class AdaptiveReplicator {
 
             pool.submit(() -> {
                 try {
+                    // We join() here because we are in a background thread anyway
                     final BrokerApi.ReplicationAck ack = client.sendEnvelopeWithAck(frame).join();
                     if (ack.getStatus() == BrokerApi.ReplicationAck.Status.SUCCESS) {
-                        // warm up their EWMA too
-                        // note: we can’t measure latency here easily, so just nudge it downward
+                        // warm up their EWMA too, nudge downward
                         ewmaNs.computeIfPresent(nodeId, (id, prev) -> prev * 0.9);
                     }
                 } catch (final Throwable t) {

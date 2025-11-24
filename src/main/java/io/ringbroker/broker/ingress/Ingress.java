@@ -205,16 +205,26 @@ public final class Ingress {
                 }
 
                 int count = 0;
+                /* 8 bytes overhead per record (4 bytes length + 4 bytes CRC) */
+                int totalBytes = 0;
+
                 batchBuffer[count++] = first;
+                totalBytes += (8 + first.length);
 
                 while (count < batchSize) {
                     final byte[] next = queue.poll();
                     if (next == null) break;
                     batchBuffer[count++] = next;
+                    totalBytes += (8 + next.length);
                 }
 
                 batchView.setSize(count);
-                final LedgerSegment segment = segments.writable();
+
+                /*
+                 * CRITICAL FIX: Request a segment that definitely has space for this batch.
+                 * If the current segment is too full, the orchestrator will roll to a new one.
+                 */
+                final LedgerSegment segment = segments.writable(totalBytes);
 
                 if (forceDurableWrites) {
                     segment.appendBatchAndForce(batchView);

@@ -30,6 +30,11 @@ public class NettyTransport {
     public void start() throws InterruptedException {
         final IoHandlerFactory factory = NioIoHandler.newFactory();
 
+        /*
+         * Netty Threading Model:
+         * 1 Boss thread for accepting connections.
+         * 0 (Default) Worker threads for IO processing (defaults to NettyRuntime.availableProcessors() * 2).
+         */
         bossGroup = new MultiThreadIoEventLoopGroup(1, factory);
         workerGroup = new MultiThreadIoEventLoopGroup(0, factory);
 
@@ -40,23 +45,35 @@ public class NettyTransport {
                     @Override
                     protected void initChannel(final SocketChannel ch) {
                         final ChannelPipeline p = ch.pipeline();
+
+                        /*
+                         * Consolidate flushes to reduce syscalls under heavy load.
+                         * 256 pending writes or explicit flush triggers actual write.
+                         */
                         p.addLast(new FlushConsolidationHandler(256, true));
-                        // inbound: split the byte stream into frames
+
+                        /* Protocol Buffers Framing (Varint32 Length Prefix) */
                         p.addLast(new ProtobufVarint32FrameDecoder());
-                        // inbound: parse each frame as an Envelope
                         p.addLast(new ProtobufDecoder(BrokerApi.Envelope.getDefaultInstance()));
-                        // outbound: prefix each Envelope with its varint length
                         p.addLast(new ProtobufVarint32LengthFieldPrepender());
-                        // outbound: serialize Envelopes to bytes
                         p.addLast(new ProtobufEncoder());
-                        // your business logic
+
+                        /* Business Logic Handler */
                         p.addLast(new NettyServerRequestHandler(ingress, offsetStore));
                     }
                 })
+
+                /*
+                 * TCP Tuning:
+                 * TCP_NODELAY: Disable Nagle's algorithm. Essential for low-latency messaging.
+                 * SO_KEEPALIVE: Detect dead peers at TCP level.
+                 */
+                .childOption(ChannelOption.TCP_NODELAY, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, true);
 
         final ChannelFuture f = b.bind(port).sync();
-        log.info("RawTcpTransport listening on {}", port);
+        log.info("Netty Transport started on port {}", port);
+
         f.channel().closeFuture().addListener(cf -> stop());
     }
 

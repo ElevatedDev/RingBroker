@@ -35,7 +35,9 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     /**
      * Tracks all in-flight replication requests:
      * correlationId → CompletableFuture<ReplicationAck>.
-     * When an ack arrives, ClientReplicationHandler completes the future.
+     * <p>
+     * Futures are self-cleaning: they remove themselves from this map
+     * upon completion, cancellation, or exception.
      */
     private final ConcurrentMap<Long, CompletableFuture<BrokerApi.ReplicationAck>> pendingAcks = new ConcurrentHashMap<>();
 
@@ -118,12 +120,16 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     public CompletableFuture<BrokerApi.ReplicationAck> sendEnvelopeWithAck(final BrokerApi.Envelope envelope) {
         final long corrId = envelope.getCorrelationId();
         final CompletableFuture<BrokerApi.ReplicationAck> future = new CompletableFuture<>();
+
         pendingAcks.put(corrId, future);
+
+        // LEAK FIX: Ensure removal from map on ANY completion (Success, Failure, or Cancellation)
+        future.whenComplete((res, ex) -> pendingAcks.remove(corrId));
 
         // Write-and-flush the Envelope. On write failure, complete the future exceptionally:
         channel.writeAndFlush(envelope).addListener(f -> {
             if (!f.isSuccess()) {
-                pendingAcks.remove(corrId);
+                // This triggers the whenComplete hook above, ensuring cleanup
                 future.completeExceptionally(f.cause());
                 log.error("Failed to send Envelope for correlationId {}: {}", corrId, f.cause().getMessage());
             }

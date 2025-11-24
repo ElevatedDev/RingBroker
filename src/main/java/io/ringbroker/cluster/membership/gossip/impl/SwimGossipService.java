@@ -27,6 +27,10 @@ import java.util.concurrent.*;
 @Slf4j
 public final class SwimGossipService implements GossipService {
 
+    // Cache values to avoid array clone overhead in hot loop
+    private static final BrokerRole[] ROLES = BrokerRole.values();
+    private static final long MEMBER_TIMEOUT_MS = 3_000;
+
     /**
      * Immutable view keyed by brokerId.
      */
@@ -68,7 +72,6 @@ public final class SwimGossipService implements GossipService {
 
     @Override
     public void start() {
-        // bootstrap UDP channel
         try {
             channel = new Bootstrap()
                     .group(group)
@@ -89,7 +92,6 @@ public final class SwimGossipService implements GossipService {
             throw new IllegalStateException("Cannot start gossip", e);
         }
 
-        // local member is always alive
         view.put(selfId, selfMember);
 
         scheduler.scheduleAtFixedRate(this::flush, 0, 1, TimeUnit.SECONDS);
@@ -97,7 +99,6 @@ public final class SwimGossipService implements GossipService {
     }
 
     private void flush() {
-        // Build one heartbeat buffer
         final ByteBuf payload = Unpooled.buffer(4 + 1 + 8 + 1);
 
         payload.writeInt(selfId);                               // brokerId
@@ -113,8 +114,6 @@ public final class SwimGossipService implements GossipService {
         // 2) live peers discovered so far
         for (final Member m : view.values()) {
             if (m.brokerId() == selfId) continue;
-
-            // skip myself
             channel.writeAndFlush(
                     new DatagramPacket(payload.retainedDuplicate(), m.address()));
         }
@@ -124,18 +123,29 @@ public final class SwimGossipService implements GossipService {
 
     private void decode(final DatagramPacket pkt) {
         final ByteBuf b = pkt.content();
+        if (b.readableBytes() < 14) return; // Basic length guard
+
         final int id = b.readInt();
-        final BrokerRole role = BrokerRole.values()[b.readByte()];
+        final int roleOrd = b.readByte();
         final long ts = b.readLong();
         final int vnodes = b.readByte();
+
+        // This prevents a delayed packet from re-adding a node we just swept.
+        if (System.currentTimeMillis() - ts > MEMBER_TIMEOUT_MS) {
+            return;
+        }
+
+        final BrokerRole role = (roleOrd >= 0 && roleOrd < ROLES.length) ? ROLES[roleOrd] : BrokerRole.INGESTION;
+
         final Member m = new Member(id, role,
                 new InetSocketAddress(pkt.sender().getAddress(), bind.getPort()), ts, vnodes);
+
         view.merge(id, m, (old, neu) -> neu.timestampMillis() > old.timestampMillis() ? neu : old);
     }
 
     private void sweep() {
         final long now = System.currentTimeMillis();
-        view.values().removeIf(mem -> (now - mem.timestampMillis()) > 3_000);
+        view.values().removeIf(mem -> (now - mem.timestampMillis()) > MEMBER_TIMEOUT_MS);
     }
 
     @Override
