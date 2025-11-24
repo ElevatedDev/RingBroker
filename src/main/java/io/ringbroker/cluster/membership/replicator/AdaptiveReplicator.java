@@ -18,13 +18,14 @@ public final class AdaptiveReplicator {
     private final long timeoutMillis;
 
     /**
-     * EWMA of each replica’s latency in nanoseconds
+     * EWMA of each replica’s latency in nanoseconds.
      */
     private final ConcurrentMap<Integer, Double> ewmaNs = new ConcurrentHashMap<>();
     private final double alpha = 0.2;
+    private final double defaultNs;
 
     /**
-     * Executor for background replication to “slow” replicas
+     * Executor for background replication to “slow” replicas.
      */
     private final ScheduledExecutorService pool = Executors.newScheduledThreadPool(
             1, r -> {
@@ -45,7 +46,8 @@ public final class AdaptiveReplicator {
         this.timeoutMillis = timeoutMillis;
 
         // initialize EWMA with a default (e.g. 1ms)
-        final double defaultNs = TimeUnit.MILLISECONDS.toNanos(1);
+        this.defaultNs = TimeUnit.MILLISECONDS.toNanos(1);
+
         for (final Integer id : clients.keySet()) {
             ewmaNs.put(id, defaultNs);
         }
@@ -70,7 +72,7 @@ public final class AdaptiveReplicator {
 
         // 1) Sort replicas by their EWMA latency (ascending)
         final List<Integer> sorted = new ArrayList<>(replicas);
-        sorted.sort(Comparator.comparingDouble(ewmaNs::get));
+        sorted.sort(Comparator.comparingDouble(id -> ewmaNs.getOrDefault(id, defaultNs)));
 
         // 2) Split into the “fast quorum” and the rest
         final List<Integer> fast = sorted.subList(0, Math.min(ackQuorum, sorted.size()));
@@ -110,11 +112,16 @@ public final class AdaptiveReplicator {
             try {
                 ack = fut.get(remainingMs, TimeUnit.MILLISECONDS);
             } catch (final ExecutionException ex) {
+                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
+                fut.cancel(true);
                 throw new RuntimeException("Fast replica " + nodeId + " failed", ex.getCause());
             } catch (final TimeoutException te) {
+                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
+                fut.cancel(true);
                 throw new TimeoutException("Fast replica " + nodeId +
                         " did not ack within " + timeoutMillis + "ms");
             }
+
             if (ack.getStatus() != BrokerApi.ReplicationAck.Status.SUCCESS) {
                 throw new RuntimeException("Fast replica " + nodeId +
                         " returned non-SUCCESS: " + ack.getStatus());
@@ -123,7 +130,7 @@ public final class AdaptiveReplicator {
             final long lat = System.nanoTime() - startNs.get(nodeId);
 
             ewmaNs.compute(nodeId, (id, prev) ->
-                    (1 - alpha) * prev + alpha * lat
+                    prev == null ? (double) lat : (1 - alpha) * prev + alpha * lat
             );
         }
 
@@ -134,10 +141,10 @@ public final class AdaptiveReplicator {
 
             pool.submit(() -> {
                 try {
+                    // We join() here because we are in a background thread anyway
                     final BrokerApi.ReplicationAck ack = client.sendEnvelopeWithAck(frame).join();
                     if (ack.getStatus() == BrokerApi.ReplicationAck.Status.SUCCESS) {
-                        // warm up their EWMA too
-                        // note: we can’t measure latency here easily, so just nudge it downward
+                        // warm up their EWMA too, nudge downward
                         ewmaNs.computeIfPresent(nodeId, (id, prev) -> prev * 0.9);
                     }
                 } catch (final Throwable t) {

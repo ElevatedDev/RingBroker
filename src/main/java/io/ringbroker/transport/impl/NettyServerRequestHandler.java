@@ -9,14 +9,13 @@ import io.ringbroker.offset.OffsetStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
-/**
- * Handles incoming client requests from the Netty pipeline, dispatching them
- * to the appropriate {@link ClusteredIngress} or {@link OffsetStore} methods.
- */
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
 @Slf4j
 @RequiredArgsConstructor
-public class NettyServerRequestHandler
-        extends SimpleChannelInboundHandler<BrokerApi.Envelope> {
+public class NettyServerRequestHandler extends SimpleChannelInboundHandler<BrokerApi.Envelope> {
 
     private final ClusteredIngress ingress;
     private final OffsetStore offsetStore;
@@ -29,58 +28,48 @@ public class NettyServerRequestHandler
             switch (env.getKindCase()) {
                 case PUBLISH -> {
                     final var m = env.getPublish();
-                    /** Pass correlationId to ClusteredIngress.publish */
-                    ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray());
-
-                    ctx.write(
-                            BrokerApi.Envelope.newBuilder()
-                                    .setCorrelationId(corrId)
-                                    .setPublishReply(
-                                            BrokerApi.PublishReply.newBuilder().setSuccess(true)
-                                    )
-                                    .build()
-                    );
+                    /* Wait for Quorum (Local + Replicas) before replying */
+                    ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
+                            .whenComplete((v, ex) -> {
+                                if (ex != null) {
+                                    log.error("Publish failed (corrId: {}): {}", corrId, ex.getMessage());
+                                    ctx.close(); // Or send error reply
+                                } else {
+                                    writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
+                                }
+                            });
                 }
 
                 case BATCH -> {
-                    for (final var m : env.getBatch().getMessagesList()) {
-                        /** Pass correlationId for each message in the batch. */
-                        ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray());
+                    final var list = env.getBatch().getMessagesList();
+                    final List<CompletableFuture<Void>> futures = new ArrayList<>(list.size());
+
+                    for (final var m : list) {
+                        futures.add(ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray()));
                     }
-                    ctx.write(
-                            BrokerApi.Envelope.newBuilder()
-                                    .setCorrelationId(corrId)
-                                    .setPublishReply( // Single reply for the batch operation
-                                            BrokerApi.PublishReply.newBuilder().setSuccess(true)
-                                    )
-                                    .build()
-                    );
+
+                    /* Wait for ALL messages in batch to be safe */
+                    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                            .whenComplete((v, ex) -> {
+                                if (ex != null) {
+                                    log.error("Batch publish failed (corrId: {}): {}", corrId, ex.getMessage());
+                                    ctx.close();
+                                } else {
+                                    writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
+                                }
+                            });
                 }
 
                 case COMMIT -> {
                     final var req = env.getCommit();
                     offsetStore.commit(req.getTopic(), req.getGroup(), req.getPartition(), req.getOffset());
-                    ctx.write(
-                            BrokerApi.Envelope.newBuilder()
-                                    .setCorrelationId(corrId)
-                                    .setCommitAck(
-                                            BrokerApi.CommitAck.newBuilder().setSuccess(true)
-                                    )
-                                    .build()
-                    );
+                    writeReply(ctx, corrId, BrokerApi.CommitAck.newBuilder().setSuccess(true).build());
                 }
 
                 case COMMITTED -> {
                     final var r = env.getCommitted();
                     final long off = offsetStore.fetch(r.getTopic(), r.getGroup(), r.getPartition());
-                    ctx.write(
-                            BrokerApi.Envelope.newBuilder()
-                                    .setCorrelationId(corrId)
-                                    .setCommittedReply(
-                                            BrokerApi.CommittedReply.newBuilder().setOffset(off)
-                                    )
-                                    .build()
-                    );
+                    writeReply(ctx, corrId, BrokerApi.CommittedReply.newBuilder().setOffset(off).build());
                 }
 
                 case FETCH -> {
@@ -88,102 +77,78 @@ public class NettyServerRequestHandler
                     final var delivery = ingress.getDeliveryMap().get(f.getPartition());
 
                     if (delivery == null || delivery.getRing() == null) {
-                        log.warn("Fetch request for partition {} (corrId: {}) failed: No delivery or ring buffer found.",
-                                f.getPartition(), corrId);
-                        final BrokerApi.FetchReply.Builder errorReply = BrokerApi.FetchReply.newBuilder(); // Empty
-                        // TODO: Consider adding an error field to FetchReply in proto for richer error reporting.
-                        ctx.write(
-                                BrokerApi.Envelope.newBuilder()
-                                        .setCorrelationId(corrId)
-                                        .setFetchReply(errorReply)
-                                        .build()
-                        );
+                        writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
                         break;
                     }
 
                     final var ring = delivery.getRing();
                     final BrokerApi.FetchReply.Builder fr = BrokerApi.FetchReply.newBuilder();
                     long offset = f.getOffset();
-                    final long maxAvailableOffset = ring.getCursor(); // Highest available sequence in the ring
+                    final long maxAvailable = ring.getCursor();
 
-                    for (int i = 0; i < f.getMaxMessages() && offset <= maxAvailableOffset; i++, offset++) {
+                    for (int i = 0; i < f.getMaxMessages(); i++) {
+                        if (offset > maxAvailable) break;
                         final byte[] payload = ring.get(offset);
-                        if (payload == null) { // Defensive check
-                            log.warn("Payload at offset {} for partition {} (corrId: {}) was null. Skipping fetch for this offset.",
-                                    offset, f.getPartition(), corrId);
-                            continue;
+                        if (payload != null) {
+                            fr.addMessages(BrokerApi.MessageEvent.newBuilder()
+                                    .setTopic(f.getTopic())
+                                    .setOffset(offset)
+                                    .setKey(ByteString.EMPTY)
+                                    .setPayload(ByteString.copyFrom(payload)));
                         }
-                        fr.addMessages(
-                                BrokerApi.MessageEvent.newBuilder()
-                                        .setTopic(f.getTopic())
-                                        .setOffset(offset)
-                                        // Key is not currently stored in RingBuffer<byte[]>; if needed, RingBuffer structure must change.
-                                        .setKey(ByteString.EMPTY)
-                                        .setPayload(ByteString.copyFrom(payload))
-                        );
+                        offset++;
                     }
-                    ctx.write(
-                            BrokerApi.Envelope.newBuilder()
-                                    .setCorrelationId(corrId)
-                                    .setFetchReply(fr)
-                                    .build()
-                    );
+                    writeReply(ctx, corrId, fr.build());
                 }
 
                 case SUBSCRIBE -> {
                     final var s = env.getSubscribe();
-                    ingress.subscribeTopic(
-                            s.getTopic(),
-                            s.getGroup(),
-                            (seq, msg) -> { // BiConsumer callback for subscribed messages
-                                if (ctx.channel().isActive()) {
-                                    ctx.writeAndFlush( // Use writeAndFlush for streaming messages
-                                            BrokerApi.Envelope.newBuilder()
-                                                    // No correlationId for pushed MessageEvents is standard.
-                                                    .setMessageEvent(
-                                                            BrokerApi.MessageEvent.newBuilder()
-                                                                    .setTopic(s.getTopic())
-                                                                    .setOffset(seq)
-                                                                    .setKey(ByteString.EMPTY) // Key not available from RingBuffer<byte[]>
-                                                                    .setPayload(ByteString.copyFrom(msg))
-                                                    )
-                                                    .build()
-                                    );
-                                } else {
-                                    log.warn("Subscription channel for topic '{}' group '{}' became inactive. Cannot push message event for offset {}.",
-                                            s.getTopic(), s.getGroup(), seq);
-                                    // TODO: Implement unsubscription logic if channel dies.
-                                }
-                            }
-                    );
-                    // No immediate reply for SUBSCRIBE is typical; success is implied by subsequent MessageEvents.
-                    // If an explicit "Subscribe OK" ack is needed, send it here.
+                    ingress.subscribeTopic(s.getTopic(), s.getGroup(), (seq, msg) -> {
+                        if (ctx.channel().isActive()) {
+                            ctx.writeAndFlush(
+                                    BrokerApi.Envelope.newBuilder()
+                                            .setMessageEvent(BrokerApi.MessageEvent.newBuilder()
+                                                    .setTopic(s.getTopic())
+                                                    .setOffset(seq)
+                                                    .setKey(ByteString.EMPTY)
+                                                    .setPayload(ByteString.copyFrom(msg)))
+                                            .build()
+                            );
+                        }
+                    });
                 }
 
-                default -> {
-                    log.warn("Unhandled envelope kind: {} with correlationId: {}. This may indicate a client sending an unexpected message type or a new unhandled type.",
-                            env.getKindCase(), corrId);
-                    // Optionally, send a generic error reply to the client.
-                }
-            }
-
-            /** Flush any buffered writes (e.g., for non-streaming replies) */
-            if (env.getKindCase() != BrokerApi.Envelope.KindCase.SUBSCRIBE) {
-                ctx.flush();
+                default -> log.warn("Unknown envelope kind: {}", env.getKindCase());
             }
 
         } catch (final Exception ex) {
-            log.error("Error handling envelope kind {} (corrId: {}): {}", env.getKindCase(), corrId, ex.getMessage(), ex);
+            log.error("Handler error", ex);
             ctx.close();
+        }
+    }
+
+    private void writeReply(ChannelHandlerContext ctx, long corrId, com.google.protobuf.GeneratedMessageV3 reply) {
+        final BrokerApi.Envelope.Builder b = BrokerApi.Envelope.newBuilder().setCorrelationId(corrId);
+
+        if (reply instanceof BrokerApi.PublishReply r) {
+            b.setPublishReply(r);
+        } else if (reply instanceof BrokerApi.CommitAck r) {
+            b.setCommitAck(r);
+        } else if (reply instanceof BrokerApi.CommittedReply r) {
+            b.setCommittedReply(r);
+        } else if (reply instanceof BrokerApi.FetchReply r) {
+            b.setFetchReply(r);
+        }
+
+        /* Using writeAndFlush inside async callbacks ensures data goes out immediately */
+        if (ctx.channel().isActive()) {
+            ctx.writeAndFlush(b.build());
         }
     }
 
     @Override
     public void exceptionCaught(final ChannelHandlerContext ctx, final Throwable cause) {
-        final String remoteAddress = ctx.channel().remoteAddress() != null ? ctx.channel().remoteAddress().toString() : "unknown remote";
-        log.error("NettyServerRequestHandler connection error for remote address {}: {}",
-                remoteAddress,
-                cause.getMessage(), cause);
+        log.error("Transport error: {}", cause.getMessage());
         ctx.close();
     }
 }

@@ -19,14 +19,8 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * A Netty‐backed RemoteBrokerClient that:
- * • sends Publish Envelopes to a remote Persistence node, and
- * • waits (via CompletableFuture) for the corresponding ReplicationAck.
- * <p>
- * The pipeline uses Protobuf varint32 framing to match the server side.
- */
 @Slf4j
 public final class NettyClusterClient implements RemoteBrokerClient {
     private final Channel channel;
@@ -35,9 +29,16 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     /**
      * Tracks all in-flight replication requests:
      * correlationId → CompletableFuture<ReplicationAck>.
-     * When an ack arrives, ClientReplicationHandler completes the future.
      */
-    private final ConcurrentMap<Long, CompletableFuture<BrokerApi.ReplicationAck>> pendingAcks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<BrokerApi.ReplicationAck>> pendingAcks =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Local sequence generator for correlationIds on this connection only.
+     * Ensures each sendEnvelopeWithAck gets a unique corrId, even if the
+     * original envelope had a reused client corrId (e.g. batch).
+     */
+    private final AtomicLong corrSeq = new AtomicLong(1L);
 
     public NettyClusterClient(final String host, final int port) throws InterruptedException {
         final IoHandlerFactory factory = NioIoHandler.newFactory();
@@ -108,22 +109,35 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     }
 
     /**
-     * Zero‐copy path for replication **with** ack: write the given Envelope,
-     * register a CompletableFuture under its correlationId, and return that future.
-     * The future completes when a matching ReplicationAck arrives (or exceptionally on error).
+     * Path for replication **with** ack: write the given Envelope,
+     * assign a unique connection-local correlationId, register a CompletableFuture
+     * under that corrId, and return that future. The future completes when a
+     * matching ReplicationAck arrives (or exceptionally on error).
      *
-     * @param envelope must include a valid correlationId and Publish message.
+     * @param envelope must include a Publish message; its original correlationId
+     *                 is ignored for transport matching to avoid collisions.
      * @return CompletableFuture that completes with the ReplicationAck from the server.
      */
+    @Override
     public CompletableFuture<BrokerApi.ReplicationAck> sendEnvelopeWithAck(final BrokerApi.Envelope envelope) {
-        final long corrId = envelope.getCorrelationId();
+        // Generate a fresh, connection-local correlation id
+        final long corrId = corrSeq.getAndIncrement();
+
+        // Build a new envelope with our internal corrId, preserving everything else
+        final BrokerApi.Envelope toSend = BrokerApi.Envelope.newBuilder(envelope)
+                .setCorrelationId(corrId)
+                .build();
+
         final CompletableFuture<BrokerApi.ReplicationAck> future = new CompletableFuture<>();
+
         pendingAcks.put(corrId, future);
 
+        // Ensure removal from map on ANY completion (Success, Failure, or Cancellation)
+        future.whenComplete((res, ex) -> pendingAcks.remove(corrId));
+
         // Write-and-flush the Envelope. On write failure, complete the future exceptionally:
-        channel.writeAndFlush(envelope).addListener(f -> {
+        channel.writeAndFlush(toSend).addListener(f -> {
             if (!f.isSuccess()) {
-                pendingAcks.remove(corrId);
                 future.completeExceptionally(f.cause());
                 log.error("Failed to send Envelope for correlationId {}: {}", corrId, f.cause().getMessage());
             }

@@ -5,6 +5,7 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.ringbroker.api.BrokerApi;
 import lombok.extern.slf4j.Slf4j;
 
+import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentMap;
 
@@ -40,15 +41,24 @@ public final class ClientReplicationHandler extends SimpleChannelInboundHandler<
                 log.warn("Received ReplicationAck for unknown correlationId {}. Ignoring.", corrId);
             }
         } else {
-            // If other messages (unlikely) appear here, pass them along or ignore.
             ctx.fireChannelRead(envelope);
         }
     }
 
     @Override
+    public void channelInactive(final ChannelHandlerContext ctx) throws Exception {
+        if (!pendingAcks.isEmpty()) {
+            log.warn("Channel inactive. Failing {} pending replication futures.", pendingAcks.size());
+            final ClosedChannelException ex = new ClosedChannelException();
+            pendingAcks.forEach((corrId, future) -> future.completeExceptionally(ex));
+            pendingAcks.clear();
+        }
+        super.channelInactive(ctx);
+    }
+
+    @Override
     public void exceptionCaught(final ChannelHandlerContext ctx, final Throwable cause) throws Exception {
         log.error("ClientReplicationHandler encountered exception. Completing all pending futures exceptionally.", cause);
-        // Fail all pending futures so they don't hang.
         pendingAcks.forEach((corrId, future) -> future.completeExceptionally(cause));
         pendingAcks.clear();
         ctx.close();
