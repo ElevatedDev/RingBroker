@@ -1,165 +1,256 @@
-# RingBroker: A High-Performance Distributed Messaging System
+# RingBroker — High-Performance Distributed Messaging on Java 21
 
-![Java](https://img.shields.io/badge/Java-21+-blue.svg)
-![Maven](https://img.shields.io/badge/build-maven-red.svg)
+![Java](https://img.shields.io/badge/Java-21%2B-blue.svg)
+![Build](https://img.shields.io/badge/build-Gradle-02303A.svg)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://opensource.org/licenses/GPL-3.0)
 
-RingBroker is a message broker engineered from the ground up for extreme throughput and low latency. It leverages modern Java features (including Virtual Threads), lock-free data structures, and a partitioned, replicated architecture to deliver uncompromising performance.
+RingBroker is a high-throughput, low-latency distributed messaging system built for mechanical sympathy: lock-free hot paths, batch-oriented I/O, memory-mapped persistence, and modern Java concurrency (Virtual Threads).
 
-The system is designed to achieve throughputs of **10 million messages per second on commodity hardware** and over **20 million messages per second on cloud infrastructure (c6a.4xlarge)** on a single node, making it suitable for the most demanding data ingestion and streaming workloads.
-
-## Core Architectural Principles
-
-*   **Mechanical Sympathy:** The design minimizes kernel calls, context switches, cache misses, and garbage collection pressure by using virtual threads, memory-mapped files, `VarHandle`/`Unsafe` memory semantics, and object/buffer reuse.
-*   **Partitioning for Scale:** Topics are split into partitions, which are distributed across the cluster, allowing for horizontal scaling of storage and throughput.
-*   **Separation of Concerns:** Nodes can be configured with distinct roles—`INGESTION` for handling client traffic and `PERSISTENCE` for durable storage—allowing for specialized hardware and independent scaling of network/CPU vs disk I/O.
-*   **Lock-Free & Allocation-Free Hot Paths:** The core message ingestion path aims to avoid blocking locks and heap allocations by using a custom MPMC queue (`SlotRing`) and pre-allocated, reusable batch buffers (`ByteBatch`).
-*   **Replication for Durability:** Data is replicated across a configurable number of `PERSISTENCE` nodes to ensure fault tolerance. RingBroker uses a novel **Adaptive Replicator** to achieve quorum acknowledgements from the fastest replicas first, ensuring low tail latency without sacrificing durability guarantees.
+It is designed as a **partitioned, replicated log** with a fast in-memory delivery path backed by a durable append-only ledger.
 
 ---
 
-## Architectural Overview
+## Highlights
 
-RingBroker's architecture is a sophisticated interplay of components designed for performance and resilience.
+- **Extreme throughput** on commodity hardware  
+  Benchmarks observed locally (Dell Precision 3590):  
+  - **Ingestion path:** ~**15M msg/s** (JMH)  
+  - **Persistence path:** ~**6M msg/s** (JMH)
+
+- **Role separation**  
+  Nodes can run as:
+  - `INGESTION`: front-door; partition routing + quorum replication orchestration
+  - `PERSISTENCE`: durable storage; owns ledger segments for assigned partitions
+
+- **Lock-free, allocation-avoiding hot path**
+  - Custom bounded MPMC queue (`Ingress.SlotRing`)
+  - Reused batch buffers (`ByteBatch`)
+  - `VarHandle` + `Unsafe` ordering semantics, padding to reduce false sharing
+
+- **Durable, recoverable storage**
+  - Append-only **memory-mapped segments** (`LedgerSegment`)
+  - CRC validation, crash-safe recovery scans
+  - Background segment pre-allocation and dense index building
+
+- **Adaptive replication**
+  - Latency-aware quorum: waits on the fastest replicas first (EWMA-based)
+  - Slow replicas are updated asynchronously for eventual durability
+
+- **High-performance networking**
+  - Netty transport for client and inter-broker communication
+  - Protobuf framing and encoding, low overhead request handling
+
+---
+
+## Architecture Overview
+
+RingBroker’s write path is **batch → append → publish**:
+
+1. **Partitioning** chooses the owner for a message (`Partitioner`).
+2. The owner performs **local publish** into partition-specific `Ingress` (or forwards to the owner if remote).
+3. `Ingress` batches payloads from a lock-free queue and appends to the **ledger** (mmap).
+4. The same batch is published into an in-memory **RingBuffer** for low-latency delivery.
+5. The owner triggers **replication** to persistence replicas using adaptive quorum acknowledgements.
+
+### Flow Chart (Mermaid)
+
+> Note: Some renderers require Mermaid diagrams to be in a fenced code block with language `mermaid`.
+> If your renderer supports that, change the fence below to: ```mermaid
 
 ```mermaid
-graph TD
-    subgraph Client
-        Publisher
-    end
+flowchart TD
+     subgraph CLIENT[Client]
+    P[Producer]
+    S[Subscriber]
+  end
 
-    subgraph "Primary Node (Owner of Partition P)"
-        P_Netty[Netty Transport]
-        P_CI{ClusteredIngress}
-        P_Ingress["Ingress (Partition P)"]
-        P_Queue((SlotRing Queue))
-        P_Writer["Writer Loop VT"]
-        P_Ledger[("Ledger - mmap")]
-        P_RingBuffer(["RingBuffer - In-Memory"])
-        P_Replicator{AdaptiveReplicator}
-    end
+  subgraph EDGE[Node role INGESTION]
+    NTY_IN[Netty transport]
+    SRV_IN[Server handler]
+    CIN[ClusteredIngress]
+    PART[Partitioner]
+  end
 
-    subgraph "Replica Node (Persistence)"
-        R_Netty[Netty Transport]
-        R_CI{ClusteredIngress}
-        R_Ingress[Ingress]
-        R_Ledger[("Ledger - mmap")]
-    end
+  subgraph OWNER[Owner node for partition p]
+    LWRITE[Local publish]
+    INGRESS[Ingress per partition]
+    Q((SlotRing queue))
+    WL[Writer loop VT]
+    LEDGER[(Ledger mmap segments)]
+    RING[(RingBuffer memory)]
+    DELIV[Delivery VT per sub]
+    OFFS[OffsetStore]
+  end
 
-    Publisher -- "publish(msg)" --> P_Netty
-    P_Netty --> P_CI
-    
-    P_CI -- "1. Local Write" --> P_Ingress
-    P_Ingress --> P_Queue
-    P_Queue --> P_Writer
-    P_Writer -- persists --> P_Ledger
-    P_Writer -- publishes --> P_RingBuffer
-    
-    P_CI -- "2. Replicate Async" --> P_Replicator
-    P_Replicator -- "sendEnvelopeWithAck()" --> R_Netty
-    R_Netty --> R_CI
-    R_CI --> R_Ingress
-    R_Ingress --> R_Ledger
-    R_Netty -- "Ack" --> P_Replicator
+  subgraph REPL[Persist nodes]
+    RNET[Netty transport]
+    RSRV[Server handler]
+    RCIN[ClusteredIngress]
+    RINGRESS[Ingress per partition]
+    RLEDGER[(Ledger mmap segments)]
+  end
+
+  %% Publish
+  P -->|Publish| NTY_IN --> SRV_IN --> CIN --> PART
+  PART -->|Owner local| LWRITE
+  PART -->|Owner remote| FWD[Forward to owner]
+
+  %% Remote owner (also used by replication sends)
+  FWD -->|sendEnvelopeWithAck| RNET --> RSRV --> RCIN --> RINGRESS --> RLEDGER
+  RSRV -->|Ack| FWD
+
+  %% Local owner write pipeline
+  LWRITE --> INGRESS --> Q --> WL
+  WL -->|append batch| LEDGER
+  WL -->|publish batch| RING
+
+  %% Replication from owner
+  CIN -->|replicas| RES[Replica resolver]
+  RES --> AR[Adaptive replicator]
+  AR -->|quorum acks| RNET
+  AR -->|async to slow| RNET
+
+  %% Subscribe
+  S -->|Subscribe| NTY_IN --> SRV_IN --> CIN
+  CIN -->|from committed| DELIV
+  RING -->|stream| DELIV
+  DELIV -->|MessageEvent| NTY_IN --> S
+  DELIV -->|commit| OFFS
+
+  %% Fetch
+  S -->|Fetch| NTY_IN --> SRV_IN
+  SRV_IN -->|read from ledger| LEDGER
+  LEDGER -->|FetchReply| NTY_IN --> S
 ```
+---
 
-## Key Features
+## Core Concepts
 
--   **High-Throughput Ingestion:** Lock-free, batch-oriented pipeline from network to disk (`Ingress`, `SlotRing`, `ByteBatch`).
--   **Low-Latency Delivery:** In-memory `RingBuffer` with `WaitStrategy` for push-based pub/sub delivery, bypassing disk reads for active consumers.
--   **Partitioned & Replicated:** Horizontally scalable and fault-tolerant by design.
--   **Distinct Broker Roles:** Optimize `INGESTION` nodes for CPU and network, and `PERSISTENCE` nodes for I/O and storage.
--   **Adaptive Quorum:** `AdaptiveReplicator` achieves low-latency acknowledgements by prioritizing fast replicas using latency EWMA and `CompletableFuture`.
--   **Durable & Recoverable Ledger:** Memory-mapped, append-only logs (`LedgerSegment`) with CRC validation, background pre-allocation and startup recovery (`LedgerOrchestrator`).
--   **Idempotent Publishing:** Optional deduplication of messages based on key/payload hash (`ClusteredIngress.computeMessageId`) to prevent processing duplicates.
--  **Virtual Threads:** Extensive use of `Executors.newVirtualThreadPerTaskExecutor()` for `Delivery` subscribers, `Ingress` writer loops, asynchronous replication calls, and `LedgerOrchestrator` pre-allocation, enabling massive scalability for I/O-bound tasks.
--   **Dead-Letter Queue (DLQ):** Automatic routing of unprocessable (schema validation failure) or repeatedly failing messages.
--   **Dynamic Schema Validation:** Integrates with Google Protobuf `DynamicMessage` and `Descriptor` for per-topic message schema validation (`TopicRegistry`, `Ingress`).
--   **Modern Concurrency Primitives**: Use of `VarHandle` and `sun.misc.Unsafe` for low-level memory access, padding (`PaddedAtomicLong`, `PaddedSequence`) to prevent false sharing.
-- **Netty Transport**: Non-blocking I/O for client (`NettyClusterClient`) and server (`NettyTransport`) communication with Protobuf encoding/decoding.
+### Partitions
+Topics are split into partitions. Each partition is owned by a node (owner selection is currently `partitionId % clusterSize` in `ClusteredIngress`, with support for custom `Partitioner`).
 
-## Components Deep Dive
+Each owned partition maintains:
+- `Ingress` (durable write pipeline)
+- `RingBuffer<byte[]>` (hot in-memory stream)
+- `Delivery` (subscription streaming from ring)
 
--   `io.ringbroker.broker.ingress.ClusteredIngress`: The main entry point. Orchestrates partitioning, forwarding, local writes, and replication based on node role.
--    `io.ringbroker.broker.ingress.Ingress`: Manages the single-partition ingestion pipeline: validation, DLQ, queuing (`SlotRing`), batching (`ByteBatch`), and writing to the `LedgerOrchestrator` and `RingBuffer`. Includes the `writerLoop`.
--   `io.ringbroker.broker.delivery.Delivery`: Manages subscriber threads (virtual), consuming from a `RingBuffer` and pushing to consumers.
--   `io.ringbroker.core.ring.RingBuffer`: A multi-producer, single-consumer ring buffer with batch claim/publish for high-speed, in-memory message exchange. Uses `Sequence`, `Barrier`, `WaitStrategy`.
--   `io.ringbroker.ledger.orchestrator.LedgerOrchestrator`: Manages the lifecycle of on-disk log segments: creation, rollover, background pre-allocation, crash recovery (`bootstrap`, `recoverSegmentFile`).
-- `io.ringbroker.ledger.segment.LedgerSegment`: Represents a single, append-only, memory-mapped file with header, CRC, and offset metadata. Uses `Unsafe`.
--   `io.ringbroker.cluster.membership.replicator.AdaptiveReplicator`: Implements the smart, latency-aware (EWMA) replication strategy using `CompletableFuture`.
--   `io.ringbroker.cluster.membership.resolver.ReplicaSetResolver`: Uses `HashingProvider` (HRW hash) to determine the set of persistence nodes for a given partition ID.
-- `io.ringbroker.cluster.client.impl.NettyClusterClient`: Client for broker-to-broker communication, handles sending `Envelope` and managing `CompletableFuture` for `ReplicationAck`.
--  `io.ringbroker.transport.type.NettyTransport` & `NettyServerRequestHandler`: The high-performance, non-blocking network server for client communication, decoding `BrokerApi.Envelope` and dispatching to `ClusteredIngress`.
--   `io.ringbroker.config.impl.BrokerConfig`: Loads the broker's configuration from a `broker.yaml` file.
--   `io.ringbroker.registry.TopicRegistry` / `grpc.services.*`: Manages topic schemas and provides a gRPC admin interface.
+### Node Roles
 
-## Performance Benchmarks
+#### `INGESTION`
+- Handles inbound PUBLISH/BATCH requests
+- Computes partition ownership
+- Writes locally if owner, otherwise forwards to owner
+- Coordinates replication (quorum) when owner
 
-RingBroker is engineered for extreme, low-latency throughput by leveraging a lock-free internal architecture, memory-mapped I/O, and modern Java concurrency. The following benchmarks demonstrate its performance on a single node compared to other well-known messaging systems under a high-throughput workload.
-
-### Test Environment
-
-| Component             | Commodity Hardware                             | Cloud Hardware (High Performance)             |
-| --------------------- | ---------------------------------------------- | --------------------------------------------- |
-| **CPU**               | AMD Ryzen 9 5900X (12 Cores, 24 Threads)       | AWS EC2 `c6a.4xlarge` (16 vCPU, 32 GiB RAM)    |
-| **Memory**            | 64 GB DDR4 @ 3600MHz                           | 32 GiB                                        |
-| **Disk**              | 2TB Samsung 980 Pro NVMe SSD                   | 1TB gp3 EBS Volume (16,000 IOPS, 1000 MB/s)    |
-| **Network**           | 10 GbE                                         | Up to 12.5 Gbps                               |
-| **Operating System**  | Ubuntu 22.04.1 LTS (Kernel 5.15)               | Amazon Linux 2 (Kernel 5.10)                  |
-| **Java Version**      | OpenJDK 21                                     | OpenJDK 21                                    |
-
-### Methodology
-
-*   **Workload:** 16 concurrent producers sending messages continuously.
-*   **Message Size:** 256 bytes.
-*   **Test Client:** A separate, dedicated machine of the same class to ensure the client was not a bottleneck.
-*   **Scenarios:**
-    1.  **In-Memory (Max Throughput):** Producers publish messages and consumers read from the in-memory `RingBuffer` without waiting for disk `fsync`. This measures the raw speed of the ingress and delivery path.
-    2.  **Durable (Replicated Write):** Producers publish messages with a confirmation that the data is durably persisted to the node's disk (`fsync` enabled). This is the most common real-world scenario. For Kafka, this corresponds to `acks=1`.
-
-### Results (Single Node)
-
-| Broker                             | Scenario      | Hardware  | Throughput (msg/s) | p99 Latency (μs) |
-| ---------------------------------- |---------------| --------- |--------------------| ------------------ |
-| **RingBroker**                     | **In-Memory** | **Cloud**   | **~21,500,000**    | **~150 μs**        |
-| **RingBroker**                     | **Durable**   | **Cloud**   | **~12,100,000**    | **~350 μs**        |
-| **RingBroker**                     | **In Memory** | **Commodity** | **~10,300,000**    | **~420 μs**        |
-| **RingBroker**                     | **Durable**   | **Commodity** | **~5,300,000**     | **~420 μs**        |
-| *Apache Kafka (v3.3, Reference)*   | Durable       | Cloud     | ~3,500,000         | ~2,000 μs          |
-| *RabbitMQ (v3.11, Reference)*      | Durable       | Cloud     | ~450,000           | ~4,500 μs          |
+#### `PERSISTENCE`
+- Owns partitions and the ledger data
+- Performs durable append
+- Serves fetch/replay and stream delivery
 
 ---
 
-### Analysis
+## Data Model & Wire Protocol
 
-*   **Peak Throughput:** RingBroker's in-memory performance of over **20M msg/s** highlights the efficiency of its lock-free `SlotRing` queue and `RingBuffer`. By keeping the hot path free of locks and heap allocations, it operates near the limits of the network and CPU.
+RingBroker uses Protobuf (`BrokerApi.Envelope`) as the wire format. Primary envelope kinds include:
 
-*   **Durable Performance:** Even when forcing writes to disk, RingBroker sustains over **10M msg/s**. This is a direct result of batching writes and using memory-mapped files (`mmap`), which minimizes system call overhead and allows the OS to efficiently schedule I/O.
+- `PUBLISH` / `BATCH` — publish messages (optionally with retries)
+- `FETCH` — read from durable ledger by (partition, offset, maxMessages)
+- `SUBSCRIBE` — stream message events (in-memory delivery from ring)
+- `COMMIT` / `COMMITTED` — consumer offset management
 
-*   **Latency Advantage:** The sub-millisecond p99 latency is a key differentiator. The combination of virtual threads for client handling and a streamlined internal pipeline ensures that messages are processed and acknowledged with minimal delay.
+On the server, `NettyServerRequestHandler` dispatches each request to the corresponding broker component (`ClusteredIngress`, `OffsetStore`, etc.).
 
-*   **Comparison:**
-    *   **vs. Kafka:** While Kafka is highly optimized, RingBroker's design avoids some of the overhead associated with the JVM page cache and its more complex log management, leading to significantly higher single-node throughput and lower tail latency.
-    *   **vs. RabbitMQ:** RabbitMQ is an excellent general-purpose broker with powerful routing features (AMQP), but it is not architected for the extreme throughput scenarios that RingBroker targets, which is reflected in the results.
+---
 
-> **Disclaimer:** These benchmarks are provided for illustrative purposes. Performance in a production environment will vary based on workload patterns, message sizes, network conditions, hardware, and system tuning.
+## Write Path (Durable Ingest)
+
+### Ingress: lock-free batch ingest
+`Ingress.publish(...)` performs topic validation and DLQ routing, then enqueues the payload into a bounded MPMC ring (`SlotRing`) without allocating per-batch objects.
+
+The background `writerLoop()`:
+- drains the queue
+- forms a batch in a reusable buffer (`byte[][]`)
+- appends the batch to the ledger (optionally forced flush for durability)
+- publishes batch entries into the `RingBuffer`
+
+### Ledger: append-only mmap segments
+`LedgerOrchestrator` manages segment lifecycle:
+- recovery on startup (scan + CRC checks + truncation on corruption)
+- rollover and background pre-allocation
+- optional dense per-segment offset index (`.idx`) for O(1) position lookups
+
+---
+
+## Replication
+
+Replication is coordinated by `AdaptiveReplicator`:
+- maintains EWMA latency per replica
+- selects the fastest `ackQuorum` replicas for the critical path
+- waits for success acknowledgements within a timeout
+- updates EWMA on each completed ack
+- pushes to slower replicas asynchronously after quorum is reached
+
+**Transport note:** inter-broker send-with-ack uses a **connection-local correlationId** to prevent correlation collisions.
+
+---
+
+## Read Path
+
+### Streaming (low-latency)
+`Delivery` streams from the in-memory `RingBuffer`:
+- each subscriber runs on its own **virtual thread**
+- `ring.get(sequence)` blocks using `WaitStrategy` + `Barrier`
+- delivered as `(sequence, payload)` to the handler
+
+### Fetch (durable replay)
+For replay or cold consumers, `FETCH` reads from the durable ledger:
+- traverses segment(s) and returns up to `maxMessages`
+- uses `MappedByteBuffer.duplicate()` for isolated zero-copy-ish views
+
+---
+
+## Consumer Offsets
+
+`OffsetStore` tracks committed offsets per (topic, group, partition).  
+The included `InMemoryOffsetStore` provides:
+- a fast in-memory map/array layout for hot reads/writes
+- async WAL persistence via a background virtual thread (batch flushed to a ledger)
+
+In `subscribeTopic(...)`, offsets are fetched at subscription start and committed per message.
+
+---
+
+## Key Modules
+
+- `io.ringbroker.broker.ingress.ClusteredIngress` — routing, forwarding, local writes, replication orchestration
+- `io.ringbroker.broker.ingress.Ingress` — queue → batch → ledger append → ring publish
+- `io.ringbroker.broker.delivery.Delivery` — per-subscriber VT streaming from ring
+- `io.ringbroker.core.ring.RingBuffer` — batch claim/publish + wait strategies
+- `io.ringbroker.ledger.orchestrator.LedgerOrchestrator` — segment lifecycle + recovery + indexing
+- `io.ringbroker.ledger.segment.LedgerSegment` — mmap segment with CRC + dense index support
+- `io.ringbroker.cluster.membership.replicator.AdaptiveReplicator` — EWMA-based fast quorum + async slow replication
+- `io.ringbroker.cluster.client.impl.NettyClusterClient` — envelope send + correlationId/future ack mapping
+- `io.ringbroker.transport.type.NettyTransport` / `NettyServerRequestHandler` — Netty server pipeline and dispatch
+- `io.ringbroker.cluster.membership.gossip.impl.SwimGossipService` — SWIM-style UDP membership view
+
+---
+
+## Semantics (Current)
+
+- **Ordering:** ordered by partition; offsets/sequence increase monotonically.
+- **Durability:** append-only ledger provides durable storage; durability strength depends on forced flush configuration + replication.
+- **Replication:** quorum-based acknowledgement on fast replicas; background propagation to slower replicas.
+- **Idempotence (optional):** per-partition dedupe set using `(partition, hash(key), hash(payload))`.
+- **Delivery:** optimized in-memory stream for hot consumers; durable replay via fetch.
+
+---
+
+## Build & Benchmark
 
 ### Prerequisites
+- Java 21+
+- Gradle (wrapper recommended)
 
--   Java 21+ (required for Virtual Threads)
--   Apache Maven
-
-### Building
-
-To build the project and its dependencies, run the following command from the root directory:
-
+### Build
 ```bash
-gradle generateProto
-gradle build
-```
-
-For a quick test, you can run:
-
-```bash 
-gradle jmh
-```
+./gradlew clean build
