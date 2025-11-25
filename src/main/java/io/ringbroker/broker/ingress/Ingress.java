@@ -13,16 +13,18 @@ import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.MappedByteBuffer;
 import java.nio.file.Path;
 import java.util.AbstractList;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Allocation‑free, lock‑free ingress for high-throughput data ingestion.
+ * Allocation-free, lock-free ingress for high-throughput data ingestion.
  * <p>
  * This class manages the ingestion of data into a ring buffer, batching incoming messages
  * and coordinating with a ledger orchestrator for persistence. It is designed to minimize
@@ -70,6 +72,9 @@ public final class Ingress {
     private final byte[][] batchBuffer;
     private final ByteBatch batchView;
     private final boolean forceDurableWrites;
+
+    // Keep a handle so we can stop writer deterministically on close.
+    private volatile Future<?> writerTask;
 
     private Ingress(final TopicRegistry registry,
                     final RingBuffer<byte[]> ring,
@@ -119,7 +124,7 @@ public final class Ingress {
         final Ingress ingress =
                 new Ingress(registry, ring, mgr, EXECUTOR, batchSize, durable);
 
-        EXECUTOR.submit(ingress::writerLoop);
+        ingress.writerTask = EXECUTOR.submit(ingress::writerLoop);
         return ingress;
     }
 
@@ -192,6 +197,22 @@ public final class Ingress {
     private void init() { /* DI hook – no-op */ }
 
     /**
+     * Zero-copy fetch visitor for ledger-backed reads.
+     */
+    @FunctionalInterface
+    public interface FetchVisitor {
+        void accept(long offset, MappedByteBuffer segmentBuffer, int payloadPos, int payloadLen);
+    }
+
+    /**
+     * Fetches up to maxMessages starting at offset (inclusive), reading from the durable ledger.
+     * Returns number of messages visited.
+     */
+    public int fetch(final long offset, final int maxMessages, final FetchVisitor visitor) {
+        return segments.fetch(offset, maxMessages, visitor::accept);
+    }
+
+    /**
      * Continuously drains the queue, batches messages, persists them to disk, and publishes to the ring buffer.
      * This method runs in a background thread. Persistence behavior (fsync) is controlled by {@code forceDurableWrites}.
      */
@@ -221,13 +242,15 @@ public final class Ingress {
                 final LedgerSegment segment = segments.writable(totalBytes);
 
                 if (forceDurableWrites) {
-                    segment.appendBatchAndForce(batchView, totalBytes);
+                    segment.appendBatchAndForceNoOffsets(batchView, totalBytes);
                 } else {
-                    segment.appendBatch(batchView, totalBytes);
+                    segment.appendBatchNoOffsets(batchView, totalBytes);
                 }
 
+                // Publish to ring as before.
                 final long endSeq = ring.next(count);
                 ring.publishBatch(endSeq, count, batchBuffer);
+
                 Arrays.fill(batchBuffer, 0, count, null);
             }
         } catch (final IOException ioe) {
@@ -244,13 +267,17 @@ public final class Ingress {
      * @throws IOException if an I/O error occurs during closing the ledger orchestrator.
      */
     public void close() throws IOException {
+        final Future<?> t = writerTask;
+        if (t != null) {
+            t.cancel(true);
+        }
         if (this.segments != null) {
             this.segments.close();
         }
     }
 
     /*
-     * Allocation‑free bounded lock‑free multi‑producer / multi‑consumer queue
+     * Allocation-free bounded lock-free multi-producer / multi-consumer queue
      * (heavily simplified Vyukov algorithm).
      * Only *one* array of references is allocated once in the constructor.
      */
@@ -291,7 +318,7 @@ public final class Ingress {
                 if (difference == 0) {
                     if (tail.compareAndSet(tailSnapshot, tailSnapshot + 1)) break;
                 } else if (difference < 0) {
-                    return false;              // queue full
+                    return false; // queue full
                 } else {
                     Thread.onSpinWait();
                 }
@@ -335,7 +362,7 @@ public final class Ingress {
     }
 
     /*
-     * Cache‑line‑padded AtomicLong to stop false sharing between head & tail.
+     * Cache-line-padded AtomicLong to stop false sharing between head & tail.
      */
     @SuppressWarnings("unused")
     private static final class PaddedAtomicLong extends AtomicLong {
