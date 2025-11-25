@@ -180,42 +180,42 @@ public class RingBrokerBenchmark {
         blackhole.consume(written);
     }
 
-    @Benchmark
-    @BenchmarkMode(Mode.Throughput)
-    @OutputTimeUnit(TimeUnit.SECONDS)
-    @Fork(value = 1)
-    @Warmup(iterations = 1, time = 5)
-    @Measurement(iterations = 3, time = 10)
-    public void tcpBatchPublish(final Blackhole blackhole) throws Exception {
-        long written = 0;
-
-        final List<CompletableFuture<Void>> publishFutures = new ArrayList<>();
-
-        while (written < totalMessages) {
-            final List<BrokerApi.Message> batch = new ArrayList<>(BATCH_SIZE);
-
-            for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
-                final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
-
-                final BrokerApi.Message m = BrokerApi.Message.newBuilder()
-                        .setTopic(TOPIC)
-                        .setRetries(0)
-                        .setKey(ByteString.copyFrom(key))
-                        .setPayload(ByteString.copyFrom(payload))
-                        .build();
-
-                batch.add(m);
-            }
-
-            publishFutures.add(client.publishBatchAsync(batch));
-        }
-
-        client.finishAndFlush();
-
-        CompletableFuture.allOf(publishFutures.toArray(new CompletableFuture[0])).join();
-
-        blackhole.consume(written);
-    }
+//    @Benchmark
+//    @BenchmarkMode(Mode.Throughput)
+//    @OutputTimeUnit(TimeUnit.SECONDS)
+//    @Fork(value = 1)
+//    @Warmup(iterations = 1, time = 5)
+//    @Measurement(iterations = 3, time = 10)
+//    public void tcpBatchPublish(final Blackhole blackhole) throws Exception {
+//        long written = 0;
+//
+//        final List<CompletableFuture<Void>> publishFutures = new ArrayList<>();
+//
+//        while (written < totalMessages) {
+//            final List<BrokerApi.Message> batch = new ArrayList<>(BATCH_SIZE);
+//
+//            for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
+//                final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
+//
+//                final BrokerApi.Message m = BrokerApi.Message.newBuilder()
+//                        .setTopic(TOPIC)
+//                        .setRetries(0)
+//                        .setKey(ByteString.copyFrom(key))
+//                        .setPayload(ByteString.copyFrom(payload))
+//                        .build();
+//
+//                batch.add(m);
+//            }
+//
+//            publishFutures.add(client.publishBatchAsync(batch));
+//        }
+//
+//        client.finishAndFlush();
+//
+//        CompletableFuture.allOf(publishFutures.toArray(new CompletableFuture[0])).join();
+//
+//        blackhole.consume(written);
+//    }
 
     @Benchmark
     @BenchmarkMode(Mode.Throughput)

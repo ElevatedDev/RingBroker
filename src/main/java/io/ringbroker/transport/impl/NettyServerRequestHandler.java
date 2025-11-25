@@ -1,14 +1,17 @@
 package io.ringbroker.transport.impl;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
+import io.ringbroker.broker.ingress.Ingress;
 import io.ringbroker.offset.OffsetStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -74,30 +77,31 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                 case FETCH -> {
                     final var f = env.getFetch();
-                    final var delivery = ingress.getDeliveryMap().get(f.getPartition());
 
-                    if (delivery == null || delivery.getRing() == null) {
+                    final Ingress part = ingress.getIngressMap().get(f.getPartition());
+                    if (part == null) {
                         writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
                         break;
                     }
 
-                    final var ring = delivery.getRing();
                     final BrokerApi.FetchReply.Builder fr = BrokerApi.FetchReply.newBuilder();
-                    long offset = f.getOffset();
-                    final long maxAvailable = ring.getCursor();
+                    final String topic = f.getTopic();
+                    final int max = f.getMaxMessages();
+                    final long startOffset = f.getOffset();
 
-                    for (int i = 0; i < f.getMaxMessages(); i++) {
-                        if (offset > maxAvailable) break;
-                        final byte[] payload = ring.get(offset);
-                        if (payload != null) {
-                            fr.addMessages(BrokerApi.MessageEvent.newBuilder()
-                                    .setTopic(f.getTopic())
-                                    .setOffset(offset)
-                                    .setKey(ByteString.EMPTY)
-                                    .setPayload(ByteString.copyFrom(payload)));
-                        }
-                        offset++;
-                    }
+                    part.fetch(startOffset, max, (off, segBuf, payloadPos, payloadLen) -> {
+                        // Create an isolated ByteBuffer view over the mmap region (zero-copy).
+                        final ByteBuffer bb = segBuf.duplicate();
+                        bb.position(payloadPos);
+                        bb.limit(payloadPos + payloadLen);
+
+                        fr.addMessages(BrokerApi.MessageEvent.newBuilder()
+                                .setTopic(topic)
+                                .setOffset(off)
+                                .setKey(ByteString.EMPTY)
+                                .setPayload(UnsafeByteOperations.unsafeWrap(bb)));
+                    });
+
                     writeReply(ctx, corrId, fr.build());
                 }
 
