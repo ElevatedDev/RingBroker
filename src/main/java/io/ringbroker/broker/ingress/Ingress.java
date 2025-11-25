@@ -174,14 +174,6 @@ public final class Ingress {
         String outTopic = retries > MAX_RETRIES ? topic + ".DLQ" : topic;
         if (!registry.contains(outTopic)) throw new IllegalArgumentException("topic not registered: " + outTopic);
 
-        // 3) schema-validate
-        try {
-            DynamicMessage.parseFrom(registry.descriptor(outTopic), rawPayload);
-        } catch (final Exception ex) {
-            outTopic = topic + ".DLQ";
-            if (!registry.contains(outTopic)) throw new IllegalArgumentException("DLQ not registered: " + outTopic);
-        }
-
         // 4) enqueue without allocation; spin if queue is momentarily full
         while (!queue.offer(rawPayload)) {
             Thread.onSpinWait();
