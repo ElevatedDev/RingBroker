@@ -52,10 +52,7 @@ RingBroker’s write path is **batch → append → publish**:
 4. The same batch is published into an in-memory **RingBuffer** for low-latency delivery.
 5. The owner triggers **replication** to persistence replicas using adaptive quorum acknowledgements.
 
-### Flow Chart (Mermaid)
-
-> Note: Some renderers require Mermaid diagrams to be in a fenced code block with language `mermaid`.
-> If your renderer supports that, change the fence below to: ```mermaid
+### Flow Chart 
 
 ```mermaid
 flowchart TD
@@ -254,3 +251,4 @@ In `subscribeTopic(...)`, offsets are fetched at subscription start and committe
 ### Build
 ```bash
 ./gradlew clean build
+
