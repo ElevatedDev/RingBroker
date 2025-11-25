@@ -205,28 +205,29 @@ public final class Ingress {
                 }
 
                 int count = 0;
+                int totalBytes = 0;
+
                 batchBuffer[count++] = first;
+                totalBytes += (8 + first.length);
 
                 while (count < batchSize) {
                     final byte[] next = queue.poll();
                     if (next == null) break;
                     batchBuffer[count++] = next;
+                    totalBytes += (8 + next.length);
                 }
 
                 batchView.setSize(count);
-                final LedgerSegment segment = segments.writable();
+                final LedgerSegment segment = segments.writable(totalBytes);
 
                 if (forceDurableWrites) {
-                    segment.appendBatchAndForce(batchView);
+                    segment.appendBatchAndForce(batchView, totalBytes);
                 } else {
-                    segment.appendBatch(batchView);
+                    segment.appendBatch(batchView, totalBytes);
                 }
 
-                // micro-optimized batch publish in one go:
                 final long endSeq = ring.next(count);
                 ring.publishBatch(endSeq, count, batchBuffer);
-
-                // clear for GC
                 Arrays.fill(batchBuffer, 0, count, null);
             }
         } catch (final IOException ioe) {

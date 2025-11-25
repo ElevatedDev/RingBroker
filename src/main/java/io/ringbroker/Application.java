@@ -41,13 +41,19 @@ public class Application {
             System.exit(1);
         }
 
-        // Load broker settings and topic definitions
+        /* Load broker settings and topic definitions */
         final BrokerConfig cfg = ConfigLoader.load(args[0]);
         final List<TopicConfig> topics = ConfigLoader.loadTopics(cfg.getTopicsFile());
 
-        // Prepare ledger directory
+        /* Prepare ledger directory */
         final Path dataDir = Paths.get(cfg.getLedgerPath());
+        final Path offsetsDir = dataDir.resolve("offsets");
 
+        /*
+         * WARNING: This block wipes data on every startup.
+         * For a production durable broker, you typically want to comment this out
+         * so data persists across restarts. Keeping it as-is for dev/testing per your setup.
+         */
         if (Files.exists(dataDir)) {
             try (final Stream<Path> stream = Files.walk(dataDir)) {
                 stream
@@ -62,8 +68,9 @@ public class Application {
         }
 
         Files.createDirectories(dataDir);
+        Files.createDirectories(offsetsDir);
 
-        // Build topic registry via reflection
+        /* Build topic registry via reflection */
         final TopicRegistry.Builder registryBuilder = new TopicRegistry.Builder();
         for (final TopicConfig t : topics) {
             final Class<?> protoClass = Class.forName(t.getProtoClass());
@@ -73,11 +80,11 @@ public class Application {
         }
         final TopicRegistry registry = registryBuilder.build();
 
-        // Partitioner and cluster node map
+        /* Partitioner and cluster node map */
         final Partitioner partitioner = new RoundRobinPartitioner();
         final Map<Integer, RemoteBrokerClient> clusterNodes = new HashMap<>();
 
-        // Load cluster node addresses from broker.yaml under "clusterNodes"
+        /* Load cluster node addresses from broker.yaml under "clusterNodes" */
         final Yaml yaml = new Yaml();
 
         try (final InputStream in = Files.newInputStream(Paths.get(args[0]))) {
@@ -95,8 +102,11 @@ public class Application {
             }
         }
 
-        // Offset store
-        final InMemoryOffsetStore store = new InMemoryOffsetStore();
+        /*
+         * FIX: Offset store is now durable and requires a storage path.
+         * We use a dedicated sub-directory to separate it from partition segments.
+         */
+        final InMemoryOffsetStore store = new InMemoryOffsetStore(offsetsDir);
 
         final var gossip = new SwimGossipService(
                 cfg.getNodeId(),
@@ -114,7 +124,7 @@ public class Application {
                 clusterNodes,
                 cfg.getReplicationTimeoutMillis());
 
-        // Create the clustered ingress
+        /* Create the clustered ingress */
         final ClusteredIngress ingress = ClusteredIngress.create(
                 registry,
                 partitioner,
@@ -134,13 +144,27 @@ public class Application {
                 replicator
         );
 
-        // Start gRPC transport
+        /* Start gRPC transport */
         final NettyTransport transport = new NettyTransport(
                 cfg.getGrpcPort(),
                 ingress,
                 store
         );
         transport.start();
+
+        /* Ensure graceful shutdown to flush mmap logs */
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                log.info("Shutting down RingBroker...");
+                transport.stop();
+                ingress.shutdown();
+                store.close();
+                gossip.close();
+                log.info("Shutdown complete.");
+            } catch (Exception e) {
+                log.error("Error during shutdown", e);
+            }
+        }));
 
         log.info("RingBroker started on gRPC port {}", cfg.getGrpcPort());
     }

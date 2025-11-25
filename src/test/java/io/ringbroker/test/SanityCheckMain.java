@@ -26,7 +26,7 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
-import java.util.zip.CRC32;
+import java.util.zip.CRC32C; // FIX: Use CRC32C
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -39,7 +39,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class SanityCheckMain {
 
     private static final int PARTITIONS = 16;
-    private static final int WRITER_THREADS = 1;
     private static final int BATCH_SIZE = 100;
     private static final int TOTAL_MSGS = 1_000;
     private static final long SEGMENT_BYTES = 128L << 20;   // 128 MiB
@@ -75,14 +74,18 @@ class SanityCheckMain {
                     break;
                 }
 
-                if (len <= 0) break;    // end-padding
+                if (len == 0) {
+                    break;
+                }
+
+                if (len < 0) break;    // corrupted/end
 
                 final int storedCrc = readIntLE(input);    // crc  (LE)
                 final byte[] buffer = input.readNBytes(len);
 
                 if (buffer.length < len) break;    // truncated (shouldn’t)
 
-                final CRC32 crc = new CRC32();
+                final CRC32C crc = new CRC32C();
                 crc.update(buffer, 0, len);
 
                 if ((int) crc.getValue() != storedCrc) {
@@ -106,8 +109,10 @@ class SanityCheckMain {
     @Test
     void endToEndSanityTest(@TempDir final Path tempDir) throws Exception {
         final Path dataDir = tempDir.resolve("data");
+        final Path offsetsDir = tempDir.resolve("offsets");
 
         Files.createDirectories(dataDir);
+        Files.createDirectories(offsetsDir);
 
         final TopicRegistry registry = new TopicRegistry.Builder()
                 .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
@@ -122,6 +127,9 @@ class SanityCheckMain {
                 Map.of(),
                 -1);
 
+        /* durable impl now requires storage path */
+        final InMemoryOffsetStore offsetStore = new InMemoryOffsetStore(offsetsDir);
+
         final ClusteredIngress ingress = ClusteredIngress.create(
                 registry,
                 new RoundRobinPartitioner(),
@@ -135,7 +143,7 @@ class SanityCheckMain {
                 SEGMENT_BYTES,
                 BATCH_SIZE,
                 /* flushOnWrite */ false,
-                new InMemoryOffsetStore(),
+                offsetStore,
                 BrokerRole.PERSISTENCE,
                 resolver,
                 replicator
@@ -161,13 +169,15 @@ class SanityCheckMain {
                     .setCreatedAt(Timestamp.getDefaultInstance())
                     .build();
 
-            ingress.publish(TOPIC, key, event.toByteArray());
+            /* We must wait for the future now that publish is async */
+            ingress.publish(TOPIC, key, event.toByteArray()).join();
         }
 
         assertTrue(latch.await(30, TimeUnit.SECONDS),
                 () -> String.format("saw only %d/%d messages", TOTAL_MSGS - latch.getCount(), TOTAL_MSGS));
 
         ingress.shutdown();
+        offsetStore.close();
 
         final Map<Integer, Set<String>> seen = new HashMap<>();
 
@@ -193,5 +203,23 @@ class SanityCheckMain {
                     "Missing: " + diff(exp, got) + "\nExtra: " + diff(got, exp));
         }
 
+    }
+
+    @Test
+    void testOffsetDurability(@TempDir final Path tempDir) throws Exception {
+        final Path offsetsDir = tempDir.resolve("offsets_durability");
+
+        /* 1. write offsets and close to flush */
+        final InMemoryOffsetStore storeWrite = new InMemoryOffsetStore(offsetsDir);
+        storeWrite.commit("topic-1", "g1", 0, 100L);
+        storeWrite.commit("topic-1", "g1", 0, 200L); // overwrite check
+        storeWrite.commit("topic-2", "g1", 1, 500L);
+        storeWrite.close();
+
+        /* 2. recover and verify */
+        final InMemoryOffsetStore storeRead = new InMemoryOffsetStore(offsetsDir);
+        assertEquals(200L, storeRead.fetch("topic-1", "g1", 0));
+        assertEquals(500L, storeRead.fetch("topic-2", "g1", 1));
+        storeRead.close();
     }
 }
