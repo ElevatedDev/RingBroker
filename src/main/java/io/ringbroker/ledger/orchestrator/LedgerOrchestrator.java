@@ -30,6 +30,9 @@ import static java.nio.file.StandardOpenOption.WRITE;
 @Slf4j
 public final class LedgerOrchestrator implements AutoCloseable {
 
+    private static final ExecutorService INDEX_BUILDER =
+            Executors.newSingleThreadExecutor(Thread.ofPlatform().name("ledger-idx-builder").factory());
+
     private final Path directory;
     @Getter
     private final int segmentCapacity;
@@ -41,6 +44,9 @@ public final class LedgerOrchestrator implements AutoCloseable {
     @Getter
     private volatile long highWaterMark;
     private Future<LedgerSegment> nextSegmentFuture;
+
+    // Immutable snapshot for fast binary-search selection in fetch.
+    private volatile LedgerSegment[] segmentSnapshot = new LedgerSegment[0];
 
     private LedgerOrchestrator(final Path directory, final int segmentCapacity, final long initialHwm) {
         this.directory = directory;
@@ -59,12 +65,13 @@ public final class LedgerOrchestrator implements AutoCloseable {
                 .sorted(Comparator.comparingLong(LedgerSegment::getFirstOffset).thenComparingLong(LedgerSegment::getLastOffset))
                 .toList();
 
-        final long currentHwm = recoveredSegments.isEmpty() ? 0L : recoveredSegments.getLast().getLastOffset();
+        // Offsets start at 0; if there are no segments yet, HWM is -1.
+        final long currentHwm = recoveredSegments.isEmpty() ? -1L : recoveredSegments.getLast().getLastOffset();
         final LedgerOrchestrator orchestrator = new LedgerOrchestrator(directory, segmentCapacity, currentHwm);
 
         final LedgerSegment currentTailSegment;
         if (recoveredSegments.isEmpty()) {
-            currentTailSegment = orchestrator.createNewSegment();
+            currentTailSegment = orchestrator.createNewSegment(-1L);
         } else {
             final LedgerSegment lastGoodSegment = recoveredSegments.getLast();
             if (lastGoodSegment.isFull()) {
@@ -75,6 +82,21 @@ public final class LedgerOrchestrator implements AutoCloseable {
         }
 
         orchestrator.activeSegment.set(currentTailSegment);
+
+        // Build snapshot: recovered segments + potentially a new tail segment.
+        if (recoveredSegments.isEmpty()) {
+            orchestrator.segmentSnapshot = new LedgerSegment[]{ currentTailSegment };
+        } else {
+            if (recoveredSegments.getLast() == currentTailSegment) {
+                orchestrator.segmentSnapshot = recoveredSegments.toArray(new LedgerSegment[0]);
+            } else {
+                final LedgerSegment[] arr = new LedgerSegment[recoveredSegments.size() + 1];
+                for (int i = 0; i < recoveredSegments.size(); i++) arr[i] = recoveredSegments.get(i);
+                arr[arr.length - 1] = currentTailSegment;
+                orchestrator.segmentSnapshot = arr;
+            }
+        }
+
         orchestrator.preAllocateNextSegment();
         return orchestrator;
     }
@@ -87,7 +109,18 @@ public final class LedgerOrchestrator implements AutoCloseable {
 
             if (recoverSegmentFile(tempRecoveryPath)) {
                 Files.move(tempRecoveryPath, segmentPath, StandardCopyOption.REPLACE_EXISTING);
-                return LedgerSegment.openExisting(segmentPath, false);
+
+                final LedgerSegment seg = LedgerSegment.openExisting(segmentPath, false);
+
+                // Drop garbage empty segments (typically preallocated but unused).
+                if (seg.isLogicallyEmpty()) {
+                    try { seg.close(); } catch (Exception ignored) {}
+                    try { Files.deleteIfExists(segmentPath); } catch (Exception ignored) {}
+                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(segmentPath)); } catch (Exception ignored) {}
+                    return null;
+                }
+
+                return seg;
             } else {
                 return null;
             }
@@ -120,6 +153,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
 
             // Reuse CRC instance to reduce allocation churn during recovery
             final java.util.zip.CRC32C crcValidator = new java.util.zip.CRC32C();
+            final ByteBuffer payloadChunk = ByteBuffer.allocateDirect(64 * 1024);
 
             while (currentFilePosition < ch.size()) {
                 recordHeaderBuffer.clear();
@@ -149,22 +183,33 @@ public final class LedgerOrchestrator implements AutoCloseable {
                     return true;
                 }
 
-                final ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLength);
-                bytesRead = ch.read(payloadBuffer);
+                crcValidator.reset();
+                long remaining = payloadLength;
+                boolean torn = false;
+
+                while (remaining > 0) {
+                    payloadChunk.clear();
+                    if (remaining < payloadChunk.capacity()) {
+                        payloadChunk.limit((int) remaining);
+                    }
+
+                    int chunkRead = ch.read(payloadChunk);
+                    if (chunkRead < 0) {
+                        torn = true;
+                        break;
+                    }
+
+                    payloadChunk.flip();
+                    crcValidator.update(payloadChunk);
+                    remaining -= chunkRead;
+                }
 
                 // 5. Check for Torn Payload
-                if (bytesRead < payloadLength) {
+                if (torn || remaining > 0) {
                     log.warn("Torn record payload at {}. Truncating.", currentFilePosition);
                     truncateChannel(ch, currentFilePosition);
                     return true;
                 }
-
-                payloadBuffer.flip();
-                crcValidator.reset();
-
-                // CRC32C works with direct ByteBuffers or arrays.
-                // Since we allocated on heap, .array() is safe.
-                crcValidator.update(payloadBuffer.array(), 0, payloadLength);
 
                 if ((int) crcValidator.getValue() != storedCrc && storedCrc != 0) {
                     log.warn("CRC32C Mismatch at {}. Stored: {}, Calc: {}. Truncating.",
@@ -198,15 +243,35 @@ public final class LedgerOrchestrator implements AutoCloseable {
             if (current != null) {
                 log.debug("Rolling segment (capacity full for batch of {} bytes)", requiredBytes);
             }
+
+            final LedgerSegment sealed = current;
+
             current = rollToNextSegment();
             activeSegment.set(current);
+            addToSnapshotIfMissing(current);
             preAllocateNextSegment();
+
+            // Build .idx off the hot path for sealed segments.
+            if (sealed != null && !sealed.isLogicallyEmpty()) {
+                INDEX_BUILDER.execute(sealed::buildDenseIndexIfMissingOrStale);
+            }
         }
         return current;
     }
 
     public LedgerSegment writable() throws IOException {
         return writable(1024); // Default safety margin
+    }
+
+    private void addToSnapshotIfMissing(final LedgerSegment seg) {
+        final LedgerSegment[] snap = segmentSnapshot;
+        if (snap.length > 0 && snap[snap.length - 1] == seg) return;
+
+        // Append; segments are monotonically increasing by offset.
+        final LedgerSegment[] next = new LedgerSegment[snap.length + 1];
+        System.arraycopy(snap, 0, next, 0, snap.length);
+        next[next.length - 1] = seg;
+        segmentSnapshot = next;
     }
 
     private LedgerSegment rollToNextSegment() throws IOException {
@@ -223,6 +288,9 @@ public final class LedgerOrchestrator implements AutoCloseable {
             final long baseOffset = (previousActive != null) ? previousActive.getLastOffset() : this.highWaterMark;
             nextActiveSegment = createNewSegment(baseOffset);
         }
+
+        // Once used (or ignored), clear the future reference.
+        nextSegmentFuture = null;
         return nextActiveSegment;
     }
 
@@ -234,48 +302,137 @@ public final class LedgerOrchestrator implements AutoCloseable {
         }
     }
 
-    private LedgerSegment createNewSegment() throws IOException {
-        segmentLock.lock();
-        try {
-            return createNewSegment(this.highWaterMark);
-        } finally {
-            segmentLock.unlock();
-        }
-    }
-
     private LedgerSegment createNewSegment(final long previousSegmentLastOffset) throws IOException {
         segmentLock.lock();
         try {
             Path segmentPath;
             String fileName;
             do {
-                fileName = String.format("%d-%06d%s", System.currentTimeMillis(), ThreadLocalRandom.current().nextInt(1_000_000), LedgerConstant.SEGMENT_EXT);
+                fileName = String.format("%d-%06d%s", System.currentTimeMillis(),
+                        ThreadLocalRandom.current().nextInt(1_000_000), LedgerConstant.SEGMENT_EXT);
                 segmentPath = directory.resolve(fileName);
             } while (Files.exists(segmentPath));
 
             log.info("Creating segment: {}", segmentPath);
-            return LedgerSegment.create(segmentPath, segmentCapacity, false);
+            return LedgerSegment.create(segmentPath, segmentCapacity, false, previousSegmentLastOffset);
         } finally {
             segmentLock.unlock();
         }
     }
 
+    /**
+     * Fetch visitor signature for zero-copy payload access from mmap.
+     */
+    @FunctionalInterface
+    public interface PayloadVisitor {
+        void accept(long offset, java.nio.MappedByteBuffer segmentBuffer, int payloadPos, int payloadLen);
+    }
+
+    /**
+     * Visits up to maxMessages starting at offset (inclusive), across segment boundaries if needed.
+     * Returns number of messages visited.
+     */
+    public int fetch(final long offset, final int maxMessages, final PayloadVisitor visitor) {
+        if (maxMessages <= 0) return 0;
+
+        long start = offset;
+        if (start < 0) start = 0;
+
+        int remaining = maxMessages;
+        int visited = 0;
+
+        while (remaining > 0) {
+            final LedgerSegment seg = segmentForOffset(start);
+            if (seg == null) break;
+
+            final int n = seg.visitFromOffset(start, remaining, (off, buf, pos, len) ->
+                    visitor.accept(off, buf, pos, len)
+            );
+
+            if (n <= 0) break;
+
+            visited += n;
+            remaining -= n;
+            start += n;
+        }
+
+        return visited;
+    }
+
+    private LedgerSegment segmentForOffset(final long offset) {
+        final LedgerSegment[] snap = segmentSnapshot;
+        int lo = 0, hi = snap.length - 1;
+
+        while (lo <= hi) {
+            final int mid = (lo + hi) >>> 1;
+            final LedgerSegment s = snap[mid];
+
+            final long fo = s.getFirstOffset();
+            final long loff = s.getLastOffset();
+
+            // Empty segments: firstOffset might be unset; treat as "no coverage".
+            if (fo == Long.MIN_VALUE) {
+                hi = mid - 1;
+                continue;
+            }
+
+            if (offset < fo) {
+                hi = mid - 1;
+            } else if (offset > loff) {
+                lo = mid + 1;
+            } else {
+                return s;
+            }
+        }
+        return null;
+    }
+
     @Override
     public void close() {
+        // Stop allocator first to prevent creating new unused segments during close.
         segmentAllocatorService.shutdownNow();
+
+        // If a preallocated segment exists but was never activated, close+delete it so tests don’t see it.
+        if (nextSegmentFuture != null && nextSegmentFuture.isDone() && !nextSegmentFuture.isCancelled()) {
+            try {
+                final LedgerSegment pre = nextSegmentFuture.get();
+                if (pre != null && !isInSnapshot(pre)) {
+                    try { pre.close(); } catch (Exception ignored) {}
+                    try { Files.deleteIfExists(pre.getFile()); } catch (Exception ignored) {}
+                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(pre.getFile())); } catch (Exception ignored) {}
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        // Deterministic: ensure every remaining .seg in snapshot has a .idx before returning.
+        final LedgerSegment[] snap = segmentSnapshot;
+        for (final LedgerSegment s : snap) {
+            if (s != null) {
+                try { s.buildDenseIndexIfMissingOrStale(); } catch (Exception ignored) {}
+            }
+        }
+
+        // Close all segments (avoid mmap leaks).
+        for (final LedgerSegment s : snap) {
+            if (s != null) {
+                try { s.close(); } catch (Exception ignored) {}
+            }
+        }
+
         final LedgerSegment current = activeSegment.getAndSet(null);
         if (current != null) try {
             current.close();
         } catch (Exception ignored) {
         }
+    }
 
-        if (nextSegmentFuture != null && nextSegmentFuture.isDone() && !nextSegmentFuture.isCancelled()) {
-            try {
-                final LedgerSegment f = nextSegmentFuture.get();
-                if (f != null) f.close();
-            } catch (Exception ignored) {
-            }
+    private boolean isInSnapshot(final LedgerSegment seg) {
+        final LedgerSegment[] snap = segmentSnapshot;
+        for (final LedgerSegment s : snap) {
+            if (s == seg) return true;
         }
+        return false;
     }
 
     public void setHighWaterMark(final long newHwm) {
