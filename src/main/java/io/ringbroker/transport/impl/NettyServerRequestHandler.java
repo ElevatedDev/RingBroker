@@ -1,3 +1,4 @@
+// src/main/java/io/ringbroker/transport/impl/NettyServerRequestHandler.java
 package io.ringbroker.transport.impl;
 
 import com.google.protobuf.ByteString;
@@ -7,6 +8,7 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.broker.ingress.Ingress;
+import io.ringbroker.core.lsn.Lsn;
 import io.ringbroker.offset.OffsetStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,12 +33,14 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
             switch (env.getKindCase()) {
                 case PUBLISH -> {
                     final var m = env.getPublish();
-                    /* Wait for Quorum (Local + Replicas) before replying */
                     ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
                                     log.error("Publish failed (corrId: {}): {}", corrId, ex.getMessage());
-                                    ctx.close(); // Or send error reply
+                                    writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder()
+                                            .setSuccess(false)
+                                            .setError(String.valueOf(ex.getMessage()))
+                                            .build());
                                 } else {
                                     writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
                                 }
@@ -51,12 +55,14 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                         futures.add(ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray()));
                     }
 
-                    /* Wait for ALL messages in batch to be safe */
                     CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
                                     log.error("Batch publish failed (corrId: {}): {}", corrId, ex.getMessage());
-                                    ctx.close();
+                                    writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder()
+                                            .setSuccess(false)
+                                            .setError(String.valueOf(ex.getMessage()))
+                                            .build());
                                 } else {
                                     writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
                                 }
@@ -78,6 +84,15 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                 case FETCH -> {
                     final var f = env.getFetch();
 
+                    final long startLsn = f.getOffset();
+                    final long epoch = Lsn.epoch(startLsn);
+                    final long startSeq = Lsn.seq(startLsn);
+
+                    if (epoch != 0) {
+                        writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
+                        break;
+                    }
+
                     final Ingress part = ingress.getIngressMap().get(f.getPartition());
                     if (part == null) {
                         writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
@@ -87,17 +102,15 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                     final BrokerApi.FetchReply.Builder fr = BrokerApi.FetchReply.newBuilder();
                     final String topic = f.getTopic();
                     final int max = f.getMaxMessages();
-                    final long startOffset = f.getOffset();
 
-                    part.fetch(startOffset, max, (off, segBuf, payloadPos, payloadLen) -> {
-                        // Create an isolated ByteBuffer view over the mmap region (zero-copy).
+                    part.fetch(startSeq, max, (off, segBuf, payloadPos, payloadLen) -> {
                         final ByteBuffer bb = segBuf.duplicate();
                         bb.position(payloadPos);
                         bb.limit(payloadPos + payloadLen);
 
                         fr.addMessages(BrokerApi.MessageEvent.newBuilder()
                                 .setTopic(topic)
-                                .setOffset(off)
+                                .setOffset(Lsn.encode(epoch, off))
                                 .setKey(ByteString.EMPTY)
                                 .setPayload(UnsafeByteOperations.unsafeWrap(bb)));
                     });
@@ -122,6 +135,62 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                     });
                 }
 
+                case APPEND -> {
+                    ingress.handleAppendAsync(env.getAppend())
+                            .whenComplete((ack, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
+                                            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_UNKNOWN)
+                                            .setErrorMessage(String.valueOf(ex.getMessage()))
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, ack);
+                                }
+                            });
+                }
+
+                case APPEND_BATCH -> {
+                    ingress.handleAppendBatchAsync(env.getAppendBatch())
+                            .whenComplete((ack, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
+                                            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_UNKNOWN)
+                                            .setErrorMessage(String.valueOf(ex.getMessage()))
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, ack);
+                                }
+                            });
+                }
+
+                case EPOCH_STATUS -> {
+                    ingress.handleEpochStatusAsync(env.getEpochStatus())
+                            .whenComplete((ack, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
+                                            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_UNKNOWN)
+                                            .setErrorMessage(String.valueOf(ex.getMessage()))
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, ack);
+                                }
+                            });
+                }
+
+                case SEAL -> {
+                    ingress.handleSealAsync(env.getSeal())
+                            .whenComplete((ack, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
+                                            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_UNKNOWN)
+                                            .setErrorMessage(String.valueOf(ex.getMessage()))
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, ack);
+                                }
+                            });
+                }
+
                 default -> log.warn("Unknown envelope kind: {}", env.getKindCase());
             }
 
@@ -142,9 +211,10 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
             b.setCommittedReply(r);
         } else if (reply instanceof BrokerApi.FetchReply r) {
             b.setFetchReply(r);
+        } else if (reply instanceof BrokerApi.ReplicationAck r) {
+            b.setReplicationAck(r);
         }
 
-        /* Using writeAndFlush inside async callbacks ensures data goes out immediately */
         if (ctx.channel().isActive()) {
             ctx.writeAndFlush(b.build());
         }
