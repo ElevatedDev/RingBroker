@@ -16,6 +16,7 @@ import java.lang.invoke.VarHandle;
 import java.nio.MappedByteBuffer;
 import java.util.AbstractList;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -29,6 +30,8 @@ public final class Ingress {
 
     private static final int MAX_RETRIES = 5;
     private static final int QUEUE_CAPACITY_FACTOR = 4;
+
+    // Writer idle park, and producer backoff park (kept tiny)
     private static final long PARK_NANOS = 1_000;
 
     @Getter private final TopicRegistry registry;
@@ -36,7 +39,6 @@ public final class Ingress {
     @Getter private final VirtualLog virtualLog;
 
     private final AtomicLong activeEpoch = new AtomicLong();
-    private final ExecutorService pool;
 
     private final int batchSize;
     private final SlotRing queue;
@@ -50,15 +52,16 @@ public final class Ingress {
                     final RingBuffer<byte[]> ring,
                     final VirtualLog virtualLog,
                     final long epoch,
-                    final ExecutorService pool,
                     final int batchSize,
                     final boolean forceDurableWrites) {
 
-        this.registry = registry;
-        this.ring = ring;
-        this.virtualLog = virtualLog;
+        this.registry = Objects.requireNonNull(registry, "registry");
+        this.ring = Objects.requireNonNull(ring, "ring");
+        this.virtualLog = Objects.requireNonNull(virtualLog, "virtualLog");
+
+        if (batchSize <= 0) throw new IllegalArgumentException("batchSize must be > 0");
+
         this.activeEpoch.set(epoch);
-        this.pool = pool;
         this.batchSize = batchSize;
         this.forceDurableWrites = forceDurableWrites;
 
@@ -75,14 +78,15 @@ public final class Ingress {
                                  final int batchSize,
                                  final boolean durable) throws IOException {
 
-        final Ingress ingress = new Ingress(registry, ring, log, epoch, EXECUTOR, batchSize, durable);
+        final Ingress ingress = new Ingress(registry, ring, log, epoch, batchSize, durable);
         ingress.writerTask = EXECUTOR.submit(ingress::writerLoop);
         return ingress;
     }
 
     private static int nextPowerOfTwo(final int x) {
-        final int highest = Integer.highestOneBit(x);
-        return (x == highest) ? x : highest << 1;
+        final int v = Math.max(2, x);
+        final int highest = Integer.highestOneBit(v);
+        return (v == highest) ? v : highest << 1;
     }
 
     public void publish(final String topic, final byte[] payload) {
@@ -90,20 +94,37 @@ public final class Ingress {
     }
 
     public void publish(final String topic, final int retries, final byte[] rawPayload) {
+        Objects.requireNonNull(topic, "topic");
+        Objects.requireNonNull(rawPayload, "rawPayload");
+
         if (!registry.contains(topic)) throw new IllegalArgumentException("topic not registered: " + topic);
 
+        // Keep original behavior (DLQ routing decision); note: payload does not embed topic.
         final String outTopic = retries > MAX_RETRIES ? topic + ".DLQ" : topic;
         if (!registry.contains(outTopic)) throw new IllegalArgumentException("topic not registered: " + outTopic);
 
         final long epoch = activeEpoch.get();
-        while (!queue.offer(rawPayload, epoch)) {
-            Thread.onSpinWait();
-        }
+        offerWithBackoff(rawPayload, epoch);
     }
 
     public void publishForEpoch(final long epoch, final byte[] rawPayload) {
-        while (!queue.offer(rawPayload, epoch)) {
-            Thread.onSpinWait();
+        Objects.requireNonNull(rawPayload, "rawPayload");
+        offerWithBackoff(rawPayload, epoch);
+    }
+
+    private void offerWithBackoff(final byte[] payload, final long epoch) {
+        int spins = 0;
+        while (!queue.offer(payload, epoch)) {
+            if (Thread.currentThread().isInterrupted()) {
+                // Make shutdown responsive.
+                throw new RuntimeException("Interrupted while publishing");
+            }
+            // Gentle backoff under contention/full queue.
+            if ((++spins & 1023) == 0) {
+                LockSupport.parkNanos(PARK_NANOS);
+            } else {
+                Thread.onSpinWait();
+            }
         }
     }
 
@@ -112,10 +133,18 @@ public final class Ingress {
      */
     public void appendBackfillBatch(final long epoch, final byte[][] payloads, final int count) throws IOException {
         if (count == 0) return;
+        for (int i = 0; i < count; i++) {
+            if (payloads[i] == null) {
+                throw new IllegalArgumentException("Backfill payload[" + i + "] is null");
+            }
+        }
+
         final int totalBytes = computeTotalBytes(payloads, count);
         final LedgerSegment segment = virtualLog.forEpoch(epoch).writable(totalBytes);
+
         final ByteBatch view = new ByteBatch(payloads);
         view.setSize(count);
+
         segment.appendBatchNoOffsets(view, totalBytes);
         virtualLog.forEpoch(epoch).setHighWaterMark(segment.getLastOffset());
     }
@@ -123,7 +152,9 @@ public final class Ingress {
     private int computeTotalBytes(final byte[][] payloads, final int count) {
         int total = 0;
         for (int i = 0; i < count; i++) {
-            total += (Integer.BYTES + Integer.BYTES + payloads[i].length); // len + crc + payload
+            // LedgerSegment stores: [len:int][crc:int][payload:bytes]
+            final int len = payloads[i].length;
+            total = Math.addExact(total, Integer.BYTES + Integer.BYTES + len);
         }
         return total;
     }
@@ -153,11 +184,11 @@ public final class Ingress {
      * - publishes to ring
      */
     private void writerLoop() {
-        try {
-            final SlotRing.Entry entry = new SlotRing.Entry();
-            final SlotRing.Entry carry = new SlotRing.Entry();
-            boolean hasCarry = false;
+        final SlotRing.Entry entry = new SlotRing.Entry();
+        final SlotRing.Entry carry = new SlotRing.Entry();
+        boolean hasCarry = false;
 
+        try {
             while (!Thread.currentThread().isInterrupted()) {
 
                 // First element comes either from carry (epoch boundary) or queue.
@@ -172,16 +203,25 @@ public final class Ingress {
                     }
                 }
 
+                if (entry.payload == null) {
+                    // This should never happen after SlotRing fix; fail fast with context.
+                    throw new IllegalStateException("SlotRing returned null payload (epoch=" + entry.epoch + ")");
+                }
+
                 int count = 0;
                 int totalBytes = 0;
                 final long batchEpoch = entry.epoch;
 
                 batchBuffer[count++] = entry.payload;
-                totalBytes += (8 + entry.payload.length);
+                totalBytes = Math.addExact(totalBytes, Integer.BYTES + Integer.BYTES + entry.payload.length);
 
                 // Drain as much as possible, but stop when epoch changes.
                 while (count < batchSize) {
                     if (!queue.pollInto(entry)) break;
+
+                    if (entry.payload == null) {
+                        throw new IllegalStateException("SlotRing returned null payload (epoch=" + entry.epoch + ")");
+                    }
 
                     if (entry.epoch != batchEpoch) {
                         carry.payload = entry.payload;
@@ -191,7 +231,7 @@ public final class Ingress {
                     }
 
                     batchBuffer[count++] = entry.payload;
-                    totalBytes += (8 + entry.payload.length);
+                    totalBytes = Math.addExact(totalBytes, Integer.BYTES + Integer.BYTES + entry.payload.length);
                 }
 
                 batchView.setSize(count);
@@ -215,9 +255,9 @@ public final class Ingress {
             }
         } catch (final IOException ioe) {
             log.error("Ingress writer loop encountered an I/O error and will terminate. Partition data may be at risk.", ioe);
-        } catch (final RuntimeException ex) {
-            log.error("Ingress writer loop encountered an unexpected runtime error and will terminate.", ex);
-            throw new RuntimeException("Ingress writer loop failed critically due to RuntimeException", ex);
+        } catch (final Throwable t) {
+            log.error("Ingress writer loop encountered a fatal error and will terminate.", t);
+            throw (t instanceof RuntimeException) ? (RuntimeException) t : new RuntimeException(t);
         }
     }
 
@@ -249,6 +289,14 @@ public final class Ingress {
 
     // -------------------- SlotRing --------------------
 
+    /**
+     * MPSC-ish bounded ring (multi-producer, single-consumer).
+     *
+     * IMPORTANT FIX:
+     * The consumer MUST clear the slot BEFORE publishing it as available to producers
+     * (i.e., before updating the sequence to "free"). Otherwise, a producer may reuse
+     * the slot and then the consumer clears it to null, corrupting the queue.
+     */
     static final class SlotRing {
         private static final VarHandle SEQUENCE_HANDLE, BUFFER_HANDLE, EPOCH_HANDLE;
 
@@ -259,7 +307,8 @@ public final class Ingress {
         }
 
         private final long[] epochs;
-        private final int mask;
+        private final int mask;     // capacity - 1
+        private final int capacity; // mask + 1
         private final long[] sequence;
         private final byte[][] buffer;
 
@@ -267,28 +316,35 @@ public final class Ingress {
         private final PaddedAtomicLong head = new PaddedAtomicLong(0);
 
         SlotRing(final int capacityPow2) {
-            mask = capacityPow2 - 1;
+            if (Integer.bitCount(capacityPow2) != 1) {
+                throw new IllegalArgumentException("capacity must be power of two");
+            }
+            this.capacity = capacityPow2;
+            this.mask = capacityPow2 - 1;
 
-            sequence = new long[capacityPow2];
-            buffer = new byte[capacityPow2][];
-            epochs = new long[capacityPow2];
+            this.sequence = new long[capacityPow2];
+            this.buffer = new byte[capacityPow2][];
+            this.epochs = new long[capacityPow2];
 
             for (int i = 0; i < capacityPow2; i++) sequence[i] = i;
         }
 
         boolean offer(final byte[] element, final long epoch) {
+            if (element == null) throw new IllegalArgumentException("payload cannot be null");
+
             long tailSnapshot;
 
             while (true) {
                 tailSnapshot = tail.get();
+                final int index = (int) (tailSnapshot & mask);
 
-                final long index = tailSnapshot & mask;
-                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, (int) index);
+                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, index);
                 final long difference = seqVal - tailSnapshot;
 
                 if (difference == 0) {
                     if (tail.compareAndSet(tailSnapshot, tailSnapshot + 1)) break;
                 } else if (difference < 0) {
+                    // full
                     return false;
                 } else {
                     Thread.onSpinWait();
@@ -297,6 +353,7 @@ public final class Ingress {
 
             final int bufferIndex = (int) (tailSnapshot & mask);
 
+            // Publish payload+epoch, then publish sequence as "ready".
             BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);
             EPOCH_HANDLE.setRelease(epochs, bufferIndex, epoch);
             SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);
@@ -309,14 +366,15 @@ public final class Ingress {
 
             while (true) {
                 headSnapshot = head.get();
+                final int index = (int) (headSnapshot & mask);
 
-                final long index = headSnapshot & mask;
-                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, (int) index);
+                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, index);
                 final long difference = seqVal - (headSnapshot + 1);
 
                 if (difference == 0) {
                     if (head.compareAndSet(headSnapshot, headSnapshot + 1)) break;
                 } else if (difference < 0) {
+                    // empty
                     return false;
                 } else {
                     Thread.onSpinWait();
@@ -325,12 +383,19 @@ public final class Ingress {
 
             final int bufferIndex = (int) (headSnapshot & mask);
 
-            // Acquire loads match the producer's release stores.
-            out.payload = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
-            out.epoch = (long) EPOCH_HANDLE.getAcquire(epochs, bufferIndex);
+            // Acquire loads match producer's release stores.
+            final byte[] payload = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
+            final long epoch = (long) EPOCH_HANDLE.getAcquire(epochs, bufferIndex);
 
-            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + mask + 1);
-            BUFFER_HANDLE.set(buffer, bufferIndex, null);
+            // FIX: clear slot BEFORE making it available to producers again.
+            BUFFER_HANDLE.setRelease(buffer, bufferIndex, null);
+            EPOCH_HANDLE.setRelease(epochs, bufferIndex, 0L);
+
+            // Mark slot as free for the next cycle.
+            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + capacity);
+
+            out.payload = payload;
+            out.epoch = epoch;
 
             return true;
         }

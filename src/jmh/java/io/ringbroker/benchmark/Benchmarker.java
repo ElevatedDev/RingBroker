@@ -13,7 +13,7 @@ public class Benchmarker {
 
     public static void main(final String[] args) throws RunnerException {
         final Options opt = new OptionsBuilder()
-                .include(".*RingBrokerHotPathBenchmark.*")
+                .include("io.ringbroker.benchmark.*Benchmark")
                 .exclude(Benchmarker.class.getSimpleName())
                 .exclude(RawTcpClient.class.getSimpleName())
                 .build();

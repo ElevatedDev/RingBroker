@@ -44,18 +44,28 @@ public class RingBrokerBenchmark {
     private static final String TOPIC = "orders/created";
     private static final Path DATA = Paths.get("data-jmh-cluster");
 
+    // Window size for the "committed" benchmark: controls in-flight pressure.
+    private static final int INFLIGHT_WINDOW = 4096;
+
+    // Precomputed keys length: power-of-two for cheap masking.
+    private static final int KEY_POOL_SIZE = 1 << 17; // 131072
+
     @Param({"100000"})
-    private long totalMessages;
+    private int totalMessages;
 
     @Param({"adaptive-spin", "blocking", "busy-spin"})
     private String waitStrategy;
 
     private byte[] payload;
+    private byte[][] keys;
 
     // Cluster state
     private Map<Integer, ClusteredIngress> clusterIngresses;
     private Map<Integer, InMemoryOffsetStore> clusterOffsetStores;
     private ReplicaSetResolver clusterResolver;
+
+    // Fast handle to the leader to avoid map lookups in the hot loops.
+    private ClusteredIngress leader;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
@@ -80,10 +90,16 @@ public class RingBrokerBenchmark {
                     .build()
                     .toByteArray();
 
+            // Precompute keys once to remove allocation + UTF8 encoding from the benchmark.
+            keys = new byte[KEY_POOL_SIZE][];
+            for (int i = 0; i < KEY_POOL_SIZE; i++) {
+                keys[i] = ("qkey-" + i).getBytes(StandardCharsets.UTF_8);
+            }
+
             buildCluster(registry, ws);
+            leader = clusterIngresses.get(0);
 
         } catch (Exception e) {
-            // Ensure we don’t leak threads if setup fails mid-way
             try { tearDown(); } catch (Exception ignore) {}
             throw e;
         }
@@ -91,43 +107,105 @@ public class RingBrokerBenchmark {
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        // 1) Shutdown ingresses first (they may still use offset store / executors)
         if (clusterIngresses != null) {
             for (ClusteredIngress ci : clusterIngresses.values()) {
                 if (ci == null) continue;
                 try { ci.shutdown(); } catch (Exception ignore) {}
             }
         }
-
-        // 2) Close offset stores to stop flusher threads
         if (clusterOffsetStores != null) {
             for (InMemoryOffsetStore os : clusterOffsetStores.values()) {
                 if (os == null) continue;
                 try { os.close(); } catch (Exception ignore) {}
             }
         }
-
         log.info("=== Cluster benchmark complete ===");
     }
 
+    /**
+     * Fire-and-forget throughput: measures "accepted/enqueued" pressure + backpressure behaviour,
+     * not necessarily durability/quorum commit.
+     *
+     * With totalMessages=100000 and OperationsPerInvocation=100000, JMH reports msgs/sec directly.
+     */
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
     @Fork(value = 1)
     @Warmup(iterations = 1, time = 5)
     @Measurement(iterations = 3, time = 10)
+    @OperationsPerInvocation(100000)
     public void quorumPublish(final Blackhole blackhole) {
-        long written = 0;
-        final ClusteredIngress leader = clusterIngresses.get(0);
+        final ClusteredIngress l = leader;
+        final byte[] p = payload;
+        final byte[][] ks = keys;
+        final int mask = ks.length - 1;
 
+        for (int written = 0; written < totalMessages; written++) {
+            final byte[] key = ks[written & mask];
+            l.publish(TOPIC, key, p);
+        }
+
+        blackhole.consume(totalMessages);
+    }
+
+    /**
+     * Committed throughput: windowed in-flight publishing that waits for completion.
+     * This is the benchmark you want when you care about quorum and "real" completion semantics.
+     *
+     * Still reports msgs/sec directly.
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.Throughput)
+    @OutputTimeUnit(TimeUnit.SECONDS)
+    @Fork(value = 1)
+    @Warmup(iterations = 1, time = 5)
+    @Measurement(iterations = 3, time = 10)
+    @OperationsPerInvocation(100000)
+    public void quorumPublishCommittedWindowed(final Blackhole blackhole) {
+        final ClusteredIngress l = leader;
+        final byte[] p = payload;
+        final byte[][] ks = keys;
+        final int mask = ks.length - 1;
+
+        @SuppressWarnings("unchecked")
+        final CompletableFuture<Void>[] inflight = (CompletableFuture<Void>[]) new CompletableFuture[INFLIGHT_WINDOW];
+
+        int written = 0;
         while (written < totalMessages) {
-            for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
-                final byte[] key = ("qkey-" + written).getBytes(StandardCharsets.UTF_8);
-                leader.publish(TOPIC, key, payload);
+            int w = 0;
+
+            // Fill a window.
+            for (; w < INFLIGHT_WINDOW && written < totalMessages; w++, written++) {
+                final byte[] key = ks[written & mask];
+                inflight[w] = l.publish(TOPIC, key, p);
+            }
+
+            // Wait the window (sequential join avoids creating allOf() objects each window).
+            for (int i = 0; i < w; i++) {
+                inflight[i].join();
+                inflight[i] = null; // help GC in long runs / different params
             }
         }
 
         blackhole.consume(written);
+    }
+
+    /**
+     * Message-level latency probe: one publish+wait per operation. Use this to inspect p50/p99.
+     * (Do NOT multiply by 100k; this one is already "1 message op".)
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.SampleTime)
+    @OutputTimeUnit(TimeUnit.MICROSECONDS)
+    @Fork(value = 1)
+    @Warmup(iterations = 1, time = 5)
+    @Measurement(iterations = 3, time = 10)
+    public void quorumPublishSingleMessageLatency(final Blackhole blackhole) {
+        // Use a changing key to avoid pathological caching / same-partition artifacts.
+        final int idx = (int) (System.nanoTime() & (keys.length - 1));
+        leader.publish(TOPIC, keys[idx], payload).join();
+        blackhole.consume(idx);
     }
 
     private void buildCluster(final TopicRegistry registry, final WaitStrategy ws) throws IOException {
@@ -149,7 +227,6 @@ public class RingBrokerBenchmark {
         clusterIngresses = new HashMap<>(clusterSize);
         clusterOffsetStores = new HashMap<>(clusterSize);
 
-        // Deferred ingress targets for in-proc client wiring
         final Map<Integer, AtomicReference<ClusteredIngress>> targets = new HashMap<>();
         for (int i = 0; i < clusterSize; i++) targets.put(i, new AtomicReference<>());
 
@@ -157,7 +234,6 @@ public class RingBrokerBenchmark {
             final Path nodeDir = DATA.resolve("node-" + nodeId);
             Files.createDirectories(nodeDir);
 
-            // optional but helps keep layout consistent / avoids edge cases
             for (int p = 0; p < TOTAL_PARTITIONS; p++) {
                 Files.createDirectories(nodeDir.resolve("partition-" + p));
             }
@@ -168,14 +244,13 @@ public class RingBrokerBenchmark {
             final InMemoryOffsetStore offsetStore = new InMemoryOffsetStore(offsetsDir);
             clusterOffsetStores.put(nodeId, offsetStore);
 
-            // clients map is used by metadata broadcaster + replicator
             final Map<Integer, RemoteBrokerClient> clientsForNode = new ConcurrentHashMap<>();
 
             final LogMetadataStore metadataStore = new BroadcastingLogMetadataStore(
                     new JournaledLogMetadataStore(nodeDir.resolve("metadata")),
                     clientsForNode,
                     nodeId,
-                    () -> targets.keySet()
+                    targets::keySet
             );
 
             final AdaptiveReplicator rep = new AdaptiveReplicator(ackQuorum, clientsForNode, 1_000);
@@ -203,7 +278,6 @@ public class RingBrokerBenchmark {
             clusterIngresses.put(nodeId, ci);
             targets.get(nodeId).set(ci);
 
-            // Now wire in-proc clients to other nodes
             clientsForNode.putAll(buildInProcClients(targets, nodeId));
         }
     }
@@ -259,6 +333,7 @@ public class RingBrokerBenchmark {
         public CompletableFuture<io.ringbroker.api.BrokerApi.BackfillReply> sendBackfill(
                 final io.ringbroker.api.BrokerApi.Envelope envelope
         ) {
+            // not used by this benchmark
             return CompletableFuture.completedFuture(
                     io.ringbroker.api.BrokerApi.BackfillReply.newBuilder().build()
             );
