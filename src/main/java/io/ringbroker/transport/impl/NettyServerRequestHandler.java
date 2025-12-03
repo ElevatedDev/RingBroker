@@ -88,22 +88,37 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                     final long epoch = Lsn.epoch(startLsn);
                     final long startSeq = Lsn.seq(startLsn);
 
-                    if (epoch != 0) {
-                        writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
-                        break;
-                    }
-
-                    final Ingress part = ingress.getIngressMap().get(f.getPartition());
-                    if (part == null) {
-                        writeReply(ctx, corrId, BrokerApi.FetchReply.newBuilder().build());
-                        break;
-                    }
+                    final int partitionId = f.getPartition();
+                    final Ingress part = ingress.getIngressMap().get(partitionId);
+                    final var placementOpt = ingress.placementForEpoch(partitionId, epoch);
 
                     final BrokerApi.FetchReply.Builder fr = BrokerApi.FetchReply.newBuilder();
+
+                    if (placementOpt.isPresent() && !placementOpt.get().contains(ingress.getMyNodeId())) {
+                        fr.setStatus(BrokerApi.FetchReply.Status.NOT_IN_PLACEMENT);
+                        fr.addAllRedirectNodes(placementOpt.get());
+                        writeReply(ctx, corrId, fr.build());
+                        break;
+                    }
+
+                    if (part == null) {
+                        fr.setStatus(BrokerApi.FetchReply.Status.EPOCH_MISSING);
+                        fr.addAllRedirectNodes(placementOpt.orElseGet(java.util.List::of));
+                        writeReply(ctx, corrId, fr.build());
+                        break;
+                    }
+
+                    if (!part.getVirtualLog().hasEpoch(epoch)) {
+                        fr.setStatus(BrokerApi.FetchReply.Status.EPOCH_MISSING);
+                        fr.addAllRedirectNodes(placementOpt.orElseGet(java.util.List::of));
+                        writeReply(ctx, corrId, fr.build());
+                        break;
+                    }
+
                     final String topic = f.getTopic();
                     final int max = f.getMaxMessages();
 
-                    part.fetch(startSeq, max, (off, segBuf, payloadPos, payloadLen) -> {
+                    final int visited = part.fetchEpoch(epoch, startSeq, max, (off, segBuf, payloadPos, payloadLen) -> {
                         final ByteBuffer bb = segBuf.duplicate();
                         bb.position(payloadPos);
                         bb.limit(payloadPos + payloadLen);
@@ -114,6 +129,13 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                                 .setKey(ByteString.EMPTY)
                                 .setPayload(UnsafeByteOperations.unsafeWrap(bb)));
                     });
+
+                    if (visited == 0 && placementOpt.isPresent() && !placementOpt.get().isEmpty()) {
+                        fr.setStatus(BrokerApi.FetchReply.Status.EPOCH_MISSING);
+                        fr.addAllRedirectNodes(placementOpt.get());
+                    } else {
+                        fr.setStatus(BrokerApi.FetchReply.Status.OK);
+                    }
 
                     writeReply(ctx, corrId, fr.build());
                 }
@@ -178,7 +200,7 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                 }
 
                 case SEAL -> {
-                    ingress.handleSealAsync(env.getSeal())
+                    ingress.handleSealAndRollAsync(env.getSeal())
                             .whenComplete((ack, ex) -> {
                                 if (ex != null) {
                                     writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
@@ -191,6 +213,24 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                             });
                 }
 
+                case BACKFILL -> {
+                    ingress.handleBackfillAsync(env.getBackfill())
+                            .whenComplete((bf, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.BackfillReply.newBuilder()
+                                            .addRedirectNodes(-1)
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, bf);
+                                }
+                            });
+                }
+
+                case METADATA_UPDATE -> {
+                    final BrokerApi.ReplicationAck ack = ingress.handleMetadataUpdate(env.getMetadataUpdate());
+                    writeReply(ctx, corrId, ack);
+                }
+
                 default -> log.warn("Unknown envelope kind: {}", env.getKindCase());
             }
 
@@ -200,19 +240,21 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
         }
     }
 
-    private void writeReply(ChannelHandlerContext ctx, long corrId, com.google.protobuf.GeneratedMessageV3 reply) {
+    private void writeReply(final ChannelHandlerContext ctx, final long corrId, final com.google.protobuf.GeneratedMessageV3 reply) {
         final BrokerApi.Envelope.Builder b = BrokerApi.Envelope.newBuilder().setCorrelationId(corrId);
 
-        if (reply instanceof BrokerApi.PublishReply r) {
+        if (reply instanceof final BrokerApi.PublishReply r) {
             b.setPublishReply(r);
-        } else if (reply instanceof BrokerApi.CommitAck r) {
+        } else if (reply instanceof final BrokerApi.CommitAck r) {
             b.setCommitAck(r);
-        } else if (reply instanceof BrokerApi.CommittedReply r) {
+        } else if (reply instanceof final BrokerApi.CommittedReply r) {
             b.setCommittedReply(r);
-        } else if (reply instanceof BrokerApi.FetchReply r) {
+        } else if (reply instanceof final BrokerApi.FetchReply r) {
             b.setFetchReply(r);
-        } else if (reply instanceof BrokerApi.ReplicationAck r) {
+        } else if (reply instanceof final BrokerApi.ReplicationAck r) {
             b.setReplicationAck(r);
+        } else if (reply instanceof final BrokerApi.BackfillReply r) {
+            b.setBackfillReply(r);
         }
 
         if (ctx.channel().isActive()) {

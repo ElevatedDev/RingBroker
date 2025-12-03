@@ -8,8 +8,7 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Like FlashReplicator, but picks the fastest ackQuorum replicas based on EWMA of past latencies.
- * Slow replicas are still updated asynchronously after the quorum returns, for eventual durability.
+ * Latency-aware quorum replicator: waits on the fastest ackQuorum, updates the rest in the background.
  */
 @Slf4j
 public final class AdaptiveReplicator {
@@ -17,16 +16,12 @@ public final class AdaptiveReplicator {
     private final Map<Integer, RemoteBrokerClient> clients;
     private final long timeoutMillis;
 
-    /**
-     * EWMA of each replica’s latency in nanoseconds.
-     */
+    // EWMA of each replica's latency in nanoseconds.
     private final ConcurrentMap<Integer, Double> ewmaNs = new ConcurrentHashMap<>();
     private final double alpha = 0.2;
     private final double defaultNs;
 
-    /**
-     * Executor for background replication to “slow” replicas.
-     */
+    // Executor for background replication to slow replicas.
     private final ScheduledExecutorService pool = Executors.newScheduledThreadPool(
             1, r -> {
                 Thread t = new Thread(r, "adapt-quorum-bg");
@@ -45,7 +40,6 @@ public final class AdaptiveReplicator {
         this.clients = new HashMap<>(clients);
         this.timeoutMillis = timeoutMillis;
 
-        // initialize EWMA with a default (e.g. 1ms)
         this.defaultNs = TimeUnit.MILLISECONDS.toNanos(1);
 
         for (final Integer id : clients.keySet()) {
@@ -53,34 +47,30 @@ public final class AdaptiveReplicator {
         }
     }
 
-    /**
-     * Replicates the given frame to all replicas, but only **waits** on the fastest {@code ackQuorum}.
-     * Other replicas are updated **asynchronously** after quorum is reached.
-     *
-     * @param frame    BrokerApi.Envelope (must have correlationId + Publish set)
-     * @param replicas list of replica node IDs to send to
-     * @throws InterruptedException if interrupted while waiting
-     * @throws TimeoutException     if the fastest ackQuorum don’t all succeed within timeoutMillis
-     * @throws RuntimeException     on unexpected errors
-     */
     public void replicate(final BrokerApi.Envelope frame,
                           final List<Integer> replicas)
+            throws InterruptedException, TimeoutException {
+        replicate(frame, replicas, this.ackQuorum);
+    }
+
+    public void replicate(final BrokerApi.Envelope frame,
+                          final List<Integer> replicas,
+                          final int quorumOverride)
             throws InterruptedException, TimeoutException {
         if (replicas == null || replicas.isEmpty()) {
             throw new TimeoutException("No replicas provided for replication.");
         }
 
-        // 1) Sort replicas by their EWMA latency (ascending)
+        final int quorum = Math.min(Math.max(1, quorumOverride), replicas.size());
+
         final List<Integer> sorted = new ArrayList<>(replicas);
         sorted.sort(Comparator.comparingDouble(id -> ewmaNs.getOrDefault(id, defaultNs)));
 
-        // 2) Split into the “fast quorum” and the rest
-        final List<Integer> fast = sorted.subList(0, Math.min(ackQuorum, sorted.size()));
-        final List<Integer> slow = sorted.size() > ackQuorum
-                ? sorted.subList(ackQuorum, sorted.size())
+        final List<Integer> fast = sorted.subList(0, Math.min(quorum, sorted.size()));
+        final List<Integer> slow = sorted.size() > quorum
+                ? sorted.subList(quorum, sorted.size())
                 : Collections.emptyList();
 
-        // 3) Fire off sends to the fast set and measure start times
         final Map<Integer, CompletableFuture<BrokerApi.ReplicationAck>> futureMap = new HashMap<>();
         final Map<Integer, Long> startNs = new HashMap<>();
 
@@ -94,11 +84,10 @@ public final class AdaptiveReplicator {
             futureMap.put(nodeId, client.sendEnvelopeWithAck(frame));
         }
 
-        if (futureMap.size() < ackQuorum) {
+        if (futureMap.size() < quorum) {
             throw new TimeoutException("Not enough valid fast replicas to meet quorum");
         }
 
-        // 4) Wait for all fast futures, with per-call timeout
         final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         for (final Map.Entry<Integer, CompletableFuture<BrokerApi.ReplicationAck>> e : futureMap.entrySet()) {
             final int nodeId = e.getKey();
@@ -112,11 +101,9 @@ public final class AdaptiveReplicator {
             try {
                 ack = fut.get(remainingMs, TimeUnit.MILLISECONDS);
             } catch (final ExecutionException ex) {
-                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
                 fut.cancel(true);
                 throw new RuntimeException("Fast replica " + nodeId + " failed", ex.getCause());
             } catch (final TimeoutException te) {
-                // IMPORTANT: Cancel the future to trigger cleanup in NettyClusterClient
                 fut.cancel(true);
                 throw new TimeoutException("Fast replica " + nodeId +
                         " did not ack within " + timeoutMillis + "ms");
@@ -126,7 +113,6 @@ public final class AdaptiveReplicator {
                 throw new RuntimeException("Fast replica " + nodeId +
                         " returned non-SUCCESS: " + ack.getStatus());
             }
-            // 5) Update EWMA
             final long lat = System.nanoTime() - startNs.get(nodeId);
 
             ewmaNs.compute(nodeId, (id, prev) ->
@@ -134,17 +120,14 @@ public final class AdaptiveReplicator {
             );
         }
 
-        // 6) Quorum reached—now fire-and-forget to the slow replicas
         for (final int nodeId : slow) {
             final RemoteBrokerClient client = clients.get(nodeId);
             if (client == null) continue;
 
             pool.submit(() -> {
                 try {
-                    // We join() here because we are in a background thread anyway
                     final BrokerApi.ReplicationAck ack = client.sendEnvelopeWithAck(frame).join();
                     if (ack.getStatus() == BrokerApi.ReplicationAck.Status.SUCCESS) {
-                        // warm up their EWMA too, nudge downward
                         ewmaNs.computeIfPresent(nodeId, (id, prev) -> prev * 0.9);
                     }
                 } catch (final Throwable t) {
@@ -154,10 +137,11 @@ public final class AdaptiveReplicator {
         }
     }
 
-    /**
-     * Shutdown background tasks (call on broker shutdown).
-     */
     public void shutdown() {
         pool.shutdownNow();
+    }
+
+    public int getAckQuorum() {
+        return ackQuorum;
     }
 }

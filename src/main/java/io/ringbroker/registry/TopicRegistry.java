@@ -5,6 +5,7 @@ import com.google.protobuf.Descriptors.Descriptor;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -13,9 +14,9 @@ import java.util.concurrent.ConcurrentMap;
  * Registry of allowed topics and their optional Protobuf descriptors.
  */
 public final class TopicRegistry {
-    private final ConcurrentMap<String, Descriptor> topics;
+    private final ConcurrentMap<String, Optional<Descriptor>> topics;
 
-    private TopicRegistry(final Map<String, Descriptor> topics) {
+    private TopicRegistry(final Map<String, Optional<Descriptor>> topics) {
         this.topics = new ConcurrentHashMap<>(topics);
     }
 
@@ -28,7 +29,8 @@ public final class TopicRegistry {
     }
 
     public Descriptor descriptor(final String topic) {
-        return topics.get(topic);
+        final Optional<Descriptor> descriptor = topics.get(topic);
+        return descriptor == null ? null : descriptor.orElse(null);
     }
 
     public Set<String> listTopics() {
@@ -39,7 +41,7 @@ public final class TopicRegistry {
      * Add or replace a topic. Descriptor may be null to disable schema validation.
      */
     public void addTopic(final String topic, final Descriptor descriptor) {
-        topics.put(topic, descriptor);
+        topics.put(topic, Optional.ofNullable(descriptor));
     }
 
     public void removeTopic(final String topic) {
@@ -47,10 +49,10 @@ public final class TopicRegistry {
     }
 
     public static final class Builder {
-        private final Map<String, Descriptor> map = new HashMap<>();
+        private final Map<String, Optional<Descriptor>> map = new HashMap<>();
 
         public Builder topic(final String topic, final Descriptor descriptor) {
-            map.put(topic, descriptor);
+            map.put(topic, Optional.ofNullable(descriptor));
             return this;
         }
 

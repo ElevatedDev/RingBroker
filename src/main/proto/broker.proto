@@ -28,6 +28,10 @@ message Envelope {
     AppendBatchRequest append_batch = 21;
     SealRequest        seal = 22;
     EpochStatusRequest epoch_status = 23;
+    BackfillRequest    backfill = 24;
+    BackfillReply      backfill_reply = 25;
+    OpenEpochRequest   open_epoch = 26;
+    MetadataUpdate     metadata_update = 27;
   }
 }
 
@@ -88,6 +92,26 @@ message BatchMessage {
 
 message FetchReply {
   repeated MessageEvent messages = 1;
+  repeated int32 redirect_nodes = 2; // optional hint where to read if this node lacks the epoch
+  enum Status {
+    OK = 0;
+    NOT_IN_PLACEMENT = 1;
+    EPOCH_MISSING = 2;
+  }
+  Status status = 3;
+}
+
+message BackfillRequest {
+  int32 partition_id = 1;
+  int64 epoch = 2;
+  int64 offset = 3;
+  int32 max_bytes = 4;
+}
+
+message BackfillReply {
+  bytes payload = 1;
+  bool end_of_epoch = 2;
+  repeated int32 redirect_nodes = 3;
 }
 
 message ReplicationAck {
@@ -132,9 +156,33 @@ message AppendBatchRequest {
 message SealRequest {
   int32 partition_id = 1;
   int64 epoch = 2;
+  bool  seal_only = 3; // if true, do not auto-create next epoch (used for rebalance choreography)
 }
 
 message EpochStatusRequest {
   int32 partition_id = 1;
   int64 epoch = 2;
+}
+
+// Control plane: open a new epoch on storage (fencing token)
+message OpenEpochRequest {
+  int32 partition_id = 1;
+  int64 epoch = 2;
+  int64 tie_breaker = 3; // e.g., placement version or owner id
+}
+
+// Metadata broadcast (leaderless, highest configVersion wins)
+message MetadataUpdate {
+  int32 partition_id = 1;
+  int64 config_version = 2;
+  repeated EpochConfig epochs = 3;
+}
+
+message EpochConfig {
+  int64 epoch = 1;
+  int64 start_seq = 2;
+  int64 end_seq = 3;
+  int32 ack_quorum = 4;
+  repeated int32 storage_nodes = 5;
+  int64 tie_breaker = 6;
 }

@@ -7,7 +7,7 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Abstraction over the broker-to-broker transport.
  */
-public interface RemoteBrokerClient {
+public interface RemoteBrokerClient extends AutoCloseable {
 
     /**
      * Legacy method — still used by classic single-owner forwarders.
@@ -30,6 +30,16 @@ public interface RemoteBrokerClient {
         }
     }
 
-
     CompletableFuture<BrokerApi.ReplicationAck> sendEnvelopeWithAck(final BrokerApi.Envelope envelope);
+
+    default CompletableFuture<io.ringbroker.api.BrokerApi.BackfillReply> sendBackfill(final BrokerApi.Envelope envelope) {
+        final CompletableFuture<io.ringbroker.api.BrokerApi.BackfillReply> f = new CompletableFuture<>();
+        f.completeExceptionally(new UnsupportedOperationException("sendBackfill not implemented"));
+        return f;
+    }
+
+    @Override
+    default void close() {
+        // no-op
+    }
 }

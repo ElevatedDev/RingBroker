@@ -1,11 +1,14 @@
 package io.ringbroker.benchmark;
 
-import com.google.protobuf.ByteString;
-import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.broker.role.BrokerRole;
+import io.ringbroker.cluster.client.RemoteBrokerClient;
+import io.ringbroker.cluster.membership.member.Member;
 import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
+import io.ringbroker.cluster.metadata.BroadcastingLogMetadataStore;
+import io.ringbroker.cluster.metadata.JournaledLogMetadataStore;
+import io.ringbroker.cluster.metadata.LogMetadataStore;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.core.wait.AdaptiveSpin;
 import io.ringbroker.core.wait.Blocking;
@@ -14,151 +17,98 @@ import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;
-import io.ringbroker.transport.type.NettyTransport;
 import lombok.extern.slf4j.Slf4j;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
-/**
- * JMH benchmark for RingBroker performance testing.
- * This class replicates the TestMain functionality as a proper JMH benchmark.
- */
 @Slf4j
 @State(Scope.Benchmark)
 public class RingBrokerBenchmark {
 
     private static final int TOTAL_PARTITIONS = 16;
     private static final int RING_SIZE = 1 << 20;
-
     private static final long SEG_BYTES = 256L << 20;
-    private static final int BATCH_SIZE = 12000;
+    private static final int BATCH_SIZE = 12_000;
 
     private static final String TOPIC = "orders/created";
+    private static final Path DATA = Paths.get("data-jmh-cluster");
 
-    private static final Path DATA = Paths.get("data-jmh");
-    private static final Path OFFSETS = DATA.resolve("offsets"); // Dedicated offsets dir
-
-    private static final String SUB_GROUP = "sub-benchmark";
-    private static final String FETCH_GROUP = "fetch-benchmark";
-
-    // Benchmark parameters
     @Param({"100000"})
     private long totalMessages;
 
     @Param({"adaptive-spin", "blocking", "busy-spin"})
     private String waitStrategy;
 
-    // Test components
-    private ClusteredIngress ingress;
-    private NettyTransport tcpTransport;
-    private RawTcpClient client;
     private byte[] payload;
-    private InMemoryOffsetStore offsetStore; // Use field to close cleanly
+
+    // Cluster state
+    private Map<Integer, ClusteredIngress> clusterIngresses;
+    private Map<Integer, InMemoryOffsetStore> clusterOffsetStores;
+    private ReplicaSetResolver clusterResolver;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
-        // Clean data directory
-        if (Files.exists(DATA)) {
-            try (final Stream<Path> stream = Files.walk(DATA)) {
-                stream.sorted(Comparator.reverseOrder())
-                        .map(Path::toFile)
-                        .forEach(file -> {
-                            if (!file.delete()) {
-                                log.warn("Failed to delete file: {}", file.getAbsolutePath());
-                            }
-                        });
-            }
+        try {
+            wipeDir(DATA);
+            Files.createDirectories(DATA);
+
+            final TopicRegistry registry = new TopicRegistry.Builder()
+                    .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
+                    .build();
+
+            final WaitStrategy ws = switch (this.waitStrategy) {
+                case "adaptive-spin" -> new AdaptiveSpin();
+                case "blocking" -> new Blocking();
+                case "busy-spin" -> new BusySpin();
+                default -> throw new IllegalArgumentException("Unknown wait strategy: " + this.waitStrategy);
+            };
+
+            payload = EventsProto.OrderCreated.newBuilder()
+                    .setOrderId("ord-1")
+                    .setCustomer("bob")
+                    .build()
+                    .toByteArray();
+
+            buildCluster(registry, ws);
+
+        } catch (Exception e) {
+            // Ensure we don’t leak threads if setup fails mid-way
+            try { tearDown(); } catch (Exception ignore) {}
+            throw e;
         }
-
-        Files.createDirectories(DATA);
-        Files.createDirectories(OFFSETS);
-
-        // Build registry
-        final TopicRegistry registry = new TopicRegistry.Builder()
-                .topic(TOPIC, EventsProto.OrderCreated.getDescriptor())
-                .build();
-
-        // FIX: Instantiate Durable Offset Store
-        offsetStore = new InMemoryOffsetStore(OFFSETS);
-
-        // Create directory for each partition
-        for (int p = 0; p < TOTAL_PARTITIONS; p++) {
-            Files.createDirectories(DATA.resolve("partition-" + p));
-        }
-
-        final WaitStrategy waitStrategy = switch (this.waitStrategy) {
-            case "adaptive-spin" -> new AdaptiveSpin();
-            case "blocking" -> new Blocking();
-            case "busy-spin" -> new BusySpin();
-            default -> throw new IllegalArgumentException("Unknown wait strategy: " + this.waitStrategy);
-        };
-
-        final ReplicaSetResolver resolver = new ReplicaSetResolver(1, List::of);
-        final AdaptiveReplicator replicator = new AdaptiveReplicator(1, Map.of(), -1);
-
-        ingress = ClusteredIngress.create(
-                registry,
-                new RoundRobinPartitioner(),
-                TOTAL_PARTITIONS,
-                0,                     // myNodeId
-                1,                     // clusterSize (single PB)
-                new HashMap<>(),       // clusterNodes
-                DATA,
-                RING_SIZE,
-                waitStrategy,
-                SEG_BYTES,
-                BATCH_SIZE,
-                false,                 // idempotentMode
-                offsetStore,
-                BrokerRole.INGESTION, // local durable path
-                resolver,
-                replicator
-        );
-
-        // Start TCP transport
-        tcpTransport = new NettyTransport(9090, ingress, offsetStore);
-        tcpTransport.start();
-
-        // Prepare client
-        client = new RawTcpClient("localhost", 9090);
-
-        // Prepare payload
-        payload = EventsProto.OrderCreated.newBuilder()
-                .setOrderId("ord-1")
-                .setCustomer("bob")
-                .build()
-                .toByteArray();
     }
 
     @TearDown(Level.Trial)
-    public void tearDown() throws Exception {
-        if (client != null) {
-            client.close();
+    public void tearDown() {
+        // 1) Shutdown ingresses first (they may still use offset store / executors)
+        if (clusterIngresses != null) {
+            for (ClusteredIngress ci : clusterIngresses.values()) {
+                if (ci == null) continue;
+                try { ci.shutdown(); } catch (Exception ignore) {}
+            }
         }
 
-        if (tcpTransport != null) {
-            tcpTransport.stop();
+        // 2) Close offset stores to stop flusher threads
+        if (clusterOffsetStores != null) {
+            for (InMemoryOffsetStore os : clusterOffsetStores.values()) {
+                if (os == null) continue;
+                try { os.close(); } catch (Exception ignore) {}
+            }
         }
 
-        // FIX: Close offset store to stop flusher thread
-        if (offsetStore != null) {
-            offsetStore.close();
-        }
-
-        log.info("=== Benchmark complete ===");
+        log.info("=== Cluster benchmark complete ===");
     }
-
-    // [Benchmarks: directIngressPublish, tcpBatchPublish, tcpFetch remain unchanged]
 
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
@@ -166,160 +116,162 @@ public class RingBrokerBenchmark {
     @Fork(value = 1)
     @Warmup(iterations = 1, time = 5)
     @Measurement(iterations = 3, time = 10)
-    public void directIngressPublish(final Blackhole blackhole) {
+    public void quorumPublish(final Blackhole blackhole) {
         long written = 0;
+        final ClusteredIngress leader = clusterIngresses.get(0);
 
         while (written < totalMessages) {
             for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
-                final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
-
-                ingress.publish(TOPIC, key, payload);
+                final byte[] key = ("qkey-" + written).getBytes(StandardCharsets.UTF_8);
+                leader.publish(TOPIC, key, payload);
             }
         }
 
         blackhole.consume(written);
     }
 
-    @Benchmark
-    @BenchmarkMode(Mode.Throughput)
-    @OutputTimeUnit(TimeUnit.SECONDS)
-    @Fork(value = 1)
-    @Warmup(iterations = 1, time = 5)
-    @Measurement(iterations = 3, time = 10)
-    public void tcpBatchPublish(final Blackhole blackhole) throws Exception {
-        long written = 0;
+    private void buildCluster(final TopicRegistry registry, final WaitStrategy ws) throws IOException {
+        final int clusterSize = 3;
+        final int ackQuorum = 2;
 
-        final List<CompletableFuture<Void>> publishFutures = new ArrayList<>();
-
-        while (written < totalMessages) {
-            final List<BrokerApi.Message> batch = new ArrayList<>(BATCH_SIZE);
-
-            for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
-                final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
-
-                final BrokerApi.Message m = BrokerApi.Message.newBuilder()
-                        .setTopic(TOPIC)
-                        .setRetries(0)
-                        .setKey(ByteString.copyFrom(key))
-                        .setPayload(ByteString.copyFrom(payload))
-                        .build();
-
-                batch.add(m);
-            }
-
-            publishFutures.add(client.publishBatchAsync(batch));
+        final List<Member> members = new ArrayList<>(clusterSize);
+        for (int i = 0; i < clusterSize; i++) {
+            members.add(new Member(
+                    i,
+                    BrokerRole.PERSISTENCE,
+                    new InetSocketAddress("localhost", 9000 + i),
+                    System.currentTimeMillis(),
+                    1
+            ));
         }
 
-        client.finishAndFlush();
+        clusterResolver = new ReplicaSetResolver(clusterSize, () -> members);
+        clusterIngresses = new HashMap<>(clusterSize);
+        clusterOffsetStores = new HashMap<>(clusterSize);
 
-        CompletableFuture.allOf(publishFutures.toArray(new CompletableFuture[0])).join();
+        // Deferred ingress targets for in-proc client wiring
+        final Map<Integer, AtomicReference<ClusteredIngress>> targets = new HashMap<>();
+        for (int i = 0; i < clusterSize; i++) targets.put(i, new AtomicReference<>());
 
-        blackhole.consume(written);
+        for (int nodeId = 0; nodeId < clusterSize; nodeId++) {
+            final Path nodeDir = DATA.resolve("node-" + nodeId);
+            Files.createDirectories(nodeDir);
+
+            // optional but helps keep layout consistent / avoids edge cases
+            for (int p = 0; p < TOTAL_PARTITIONS; p++) {
+                Files.createDirectories(nodeDir.resolve("partition-" + p));
+            }
+
+            final Path offsetsDir = nodeDir.resolve("offsets");
+            Files.createDirectories(offsetsDir);
+
+            final InMemoryOffsetStore offsetStore = new InMemoryOffsetStore(offsetsDir);
+            clusterOffsetStores.put(nodeId, offsetStore);
+
+            // clients map is used by metadata broadcaster + replicator
+            final Map<Integer, RemoteBrokerClient> clientsForNode = new ConcurrentHashMap<>();
+
+            final LogMetadataStore metadataStore = new BroadcastingLogMetadataStore(
+                    new JournaledLogMetadataStore(nodeDir.resolve("metadata")),
+                    clientsForNode,
+                    nodeId,
+                    () -> targets.keySet()
+            );
+
+            final AdaptiveReplicator rep = new AdaptiveReplicator(ackQuorum, clientsForNode, 1_000);
+
+            final ClusteredIngress ci = ClusteredIngress.create(
+                    registry,
+                    new RoundRobinPartitioner(),
+                    TOTAL_PARTITIONS,
+                    nodeId,
+                    clusterSize,
+                    clientsForNode,
+                    nodeDir,
+                    RING_SIZE,
+                    ws,
+                    SEG_BYTES,
+                    BATCH_SIZE,
+                    false,
+                    offsetStore,
+                    BrokerRole.PERSISTENCE,
+                    clusterResolver,
+                    rep,
+                    metadataStore
+            );
+
+            clusterIngresses.put(nodeId, ci);
+            targets.get(nodeId).set(ci);
+
+            // Now wire in-proc clients to other nodes
+            clientsForNode.putAll(buildInProcClients(targets, nodeId));
+        }
     }
 
-    @Benchmark
-    @BenchmarkMode(Mode.Throughput)
-    @OutputTimeUnit(TimeUnit.SECONDS)
-    @Fork(value = 1)
-    @Warmup(iterations = 1, time = 5)
-    @Measurement(iterations = 3, time = 10)
-    public void tcpFetch(final Blackhole blackhole) {
-        long written = 0;
+    private static Map<Integer, RemoteBrokerClient> buildInProcClients(
+            final Map<Integer, AtomicReference<ClusteredIngress>> targets,
+            final int selfId
+    ) {
+        final Map<Integer, RemoteBrokerClient> m = new HashMap<>();
+        for (Map.Entry<Integer, AtomicReference<ClusteredIngress>> e : targets.entrySet()) {
+            final int id = e.getKey();
+            if (id == selfId) continue;
+            m.put(id, new InProcClient(e.getValue()));
+        }
+        return m;
+    }
 
-        final List<CompletableFuture<Void>> publishFuts = new ArrayList<>();
+    private static final class InProcClient implements RemoteBrokerClient {
+        private final AtomicReference<ClusteredIngress> target;
 
-        while (written < totalMessages) {
-            final List<BrokerApi.Message> batch = new ArrayList<>(BATCH_SIZE);
+        InProcClient(final AtomicReference<ClusteredIngress> target) {
+            this.target = target;
+        }
 
-            for (int i = 0; i < BATCH_SIZE && written < totalMessages; i++, written++) {
-                final byte[] key = ("key-" + written).getBytes(StandardCharsets.UTF_8);
+        @Override
+        public void sendMessage(final String topic, final byte[] key, final byte[] payload) {
+            // not used here
+        }
 
-                final BrokerApi.Message m = BrokerApi.Message.newBuilder()
-                        .setTopic(TOPIC)
-                        .setRetries(0)
-                        .setKey(ByteString.copyFrom(key))
-                        .setPayload(ByteString.copyFrom(payload))
-                        .build();
-
-                batch.add(m);
+        @Override
+        public CompletableFuture<io.ringbroker.api.BrokerApi.ReplicationAck> sendEnvelopeWithAck(
+                final io.ringbroker.api.BrokerApi.Envelope envelope
+        ) {
+            final ClusteredIngress ing = target.get();
+            if (ing == null) {
+                return CompletableFuture.failedFuture(new IllegalStateException("target not set"));
             }
-
-            publishFuts.add(client.publishBatchAsync(batch));
+            return switch (envelope.getKindCase()) {
+                case APPEND -> ing.handleAppendAsync(envelope.getAppend());
+                case APPEND_BATCH -> ing.handleAppendBatchAsync(envelope.getAppendBatch());
+                case SEAL -> ing.handleSealAsync(envelope.getSeal());
+                case OPEN_EPOCH -> ing.handleOpenEpochAsync(envelope.getOpenEpoch());
+                case METADATA_UPDATE -> CompletableFuture.completedFuture(
+                        ing.handleMetadataUpdate(envelope.getMetadataUpdate())
+                );
+                default -> CompletableFuture.failedFuture(
+                        new UnsupportedOperationException("Unsupported kind " + envelope.getKindCase())
+                );
+            };
         }
 
-        client.finishAndFlush();
-        CompletableFuture.allOf(publishFuts.toArray(new CompletableFuture[0])).join();
-
-        // Commit offsets to zero before fetch
-        final List<CompletableFuture<Void>> commitFuts = new ArrayList<>();
-
-        for (int p = 0; p < TOTAL_PARTITIONS; p++) {
-            commitFuts.add(client.commitAsync(TOPIC, FETCH_GROUP, p, 0L));
+        @Override
+        public CompletableFuture<io.ringbroker.api.BrokerApi.BackfillReply> sendBackfill(
+                final io.ringbroker.api.BrokerApi.Envelope envelope
+        ) {
+            return CompletableFuture.completedFuture(
+                    io.ringbroker.api.BrokerApi.BackfillReply.newBuilder().build()
+            );
         }
+    }
 
-        CompletableFuture.allOf(commitFuts.toArray(new CompletableFuture[0])).join();
-
-        // Fetch loop
-        final AtomicLong[] offs = new AtomicLong[TOTAL_PARTITIONS];
-
-        for (int p = 0; p < TOTAL_PARTITIONS; p++) {
-            final long o = client.fetchCommittedAsync(TOPIC, FETCH_GROUP, p).join();
-
-            offs[p] = new AtomicLong(o);
+    private static void wipeDir(final Path root) throws IOException {
+        if (!Files.exists(root)) return;
+        try (Stream<Path> stream = Files.walk(root)) {
+            stream.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); }
+                catch (Exception e) { /* ignore */ }
+            });
         }
-
-        long totalFetched = 0;
-
-        while (totalFetched < totalMessages) {
-            for (int p = 0; p < TOTAL_PARTITIONS && totalFetched < totalMessages; p++) {
-                final long off = offs[p].get();
-
-                final List<BrokerApi.MessageEvent> msgs = client.fetchAsync(TOPIC, p, off, 1000).join();
-
-                if (msgs.isEmpty()) continue;
-
-                for (final BrokerApi.MessageEvent ev : msgs) {
-                    offs[p].set(ev.getOffset() + 1);
-                    totalFetched++;
-                }
-
-                client.commitAsync(TOPIC, FETCH_GROUP, p, offs[p].get()).join();
-            }
-        }
-
-        blackhole.consume(totalFetched);
     }
 }
-
-/**
- * Subscribe benchmark - currently commented out in the TestMain
- * but included here so it ain't missing.
- */
-//    @Benchmark
-//    @BenchmarkMode(Mode.Throughput)
-//    @OutputTimeUnit(TimeUnit.SECONDS)
-//    @Fork(value = 1)
-//    @Warmup(iterations = 1, time = 5)
-//    // This test takes 5 billion years so a timeout is set
-//    // This is an arbitrary/placeholder value for now
-//    @Timeout(time = 30, timeUnit = TimeUnit.SECONDS)
-//    @Measurement(iterations = 3, time = 10)
-//    public void tcpSubscribe(final Blackhole blackhole) throws Exception {
-//        tcpBatchPublish(blackhole);
-//
-//        final AtomicLong received = new AtomicLong(0);
-//        final Object lock = new Object();
-//
-//        client.subscribe(TOPIC, SUB_GROUP, (seq, body) -> {
-//            final long count = received.incrementAndGet();
-//
-//            if (count >= totalMessages) {
-//                synchronized (lock) {
-//                    lock.notify();
-//                }
-//            }
-//        });
-//
-//        blackhole.consume(received.get());
-//    }
-//}
