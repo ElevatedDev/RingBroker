@@ -61,12 +61,12 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         // Volatile to ensure visibility when we resize.
         volatile long[] offsets = new long[16];
 
-        long get(int partition) {
-            long[] arr = offsets;
+        long get(final int partition) {
+            final long[] arr = offsets;
             return (partition >= 0 && partition < arr.length) ? arr[partition] : 0L;
         }
 
-        void set(int partition, long value) {
+        void set(final int partition, final long value) {
             long[] arr = offsets;
             if (partition >= arr.length) {
                 growToAtLeast(partition + 1);
@@ -77,14 +77,14 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
             arr[partition] = value;
         }
 
-        private synchronized void growToAtLeast(int minSize) {
-            long[] current = offsets;
+        private synchronized void growToAtLeast(final int minSize) {
+            final long[] current = offsets;
             if (current.length >= minSize) return;
             int newSize = current.length;
             while (newSize < minSize) {
                 newSize <<= 1;
             }
-            long[] bigger = new long[newSize];
+            final long[] bigger = new long[newSize];
             System.arraycopy(current, 0, bigger, 0, current.length);
             offsets = bigger;
         }
@@ -100,35 +100,35 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
     private final ConcurrentHashMap<String, byte[]> groupBytesCache = new ConcurrentHashMap<>();
 
     private TopicState topicState(final String topic) {
-        TopicState ts = topicMap.get(topic);
+        final TopicState ts = topicMap.get(topic);
         if (ts != null) return ts;
-        TopicState fresh = new TopicState();
-        TopicState existing = topicMap.putIfAbsent(topic, fresh);
+        final TopicState fresh = new TopicState();
+        final TopicState existing = topicMap.putIfAbsent(topic, fresh);
         return existing != null ? existing : fresh;
     }
 
     private PartitionOffsets partitionOffsets(final String topic, final String group) {
-        TopicState ts = topicState(topic);
-        PartitionOffsets po = ts.groups.get(group);
+        final TopicState ts = topicState(topic);
+        final PartitionOffsets po = ts.groups.get(group);
         if (po != null) return po;
-        PartitionOffsets fresh = new PartitionOffsets();
-        PartitionOffsets existing = ts.groups.putIfAbsent(group, fresh);
+        final PartitionOffsets fresh = new PartitionOffsets();
+        final PartitionOffsets existing = ts.groups.putIfAbsent(group, fresh);
         return existing != null ? existing : fresh;
     }
 
     private byte[] topicBytes(final String topic) {
-        byte[] cached = topicBytesCache.get(topic);
+        final byte[] cached = topicBytesCache.get(topic);
         if (cached != null) return cached;
-        byte[] fresh = topic.getBytes(StandardCharsets.UTF_8);
-        byte[] existing = topicBytesCache.putIfAbsent(topic, fresh);
+        final byte[] fresh = topic.getBytes(StandardCharsets.UTF_8);
+        final byte[] existing = topicBytesCache.putIfAbsent(topic, fresh);
         return existing != null ? existing : fresh;
     }
 
     private byte[] groupBytes(final String group) {
-        byte[] cached = groupBytesCache.get(group);
+        final byte[] cached = groupBytesCache.get(group);
         if (cached != null) return cached;
-        byte[] fresh = group.getBytes(StandardCharsets.UTF_8);
-        byte[] existing = groupBytesCache.putIfAbsent(group, fresh);
+        final byte[] fresh = group.getBytes(StandardCharsets.UTF_8);
+        final byte[] existing = groupBytesCache.putIfAbsent(group, fresh);
         return existing != null ? existing : fresh;
     }
 
@@ -162,7 +162,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
     @Override
     public void commit(final String topic, final String group, final int partition, final long offset) {
         // Fast in-memory update: nested map + array write.
-        PartitionOffsets po = partitionOffsets(topic, group);
+        final PartitionOffsets po = partitionOffsets(topic, group);
         po.set(partition, offset);
 
         // Serialize for async WAL persistence.
@@ -172,9 +172,9 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
 
     @Override
     public long fetch(final String topic, final String group, final int partition) {
-        TopicState ts = topicMap.get(topic);
+        final TopicState ts = topicMap.get(topic);
         if (ts == null) return 0L;
-        PartitionOffsets po = ts.groups.get(group);
+        final PartitionOffsets po = ts.groups.get(group);
         if (po == null) return 0L;
         return po.get(partition);
     }
@@ -237,7 +237,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         if (batch.isEmpty()) return;
 
         int totalBytes = 0;
-        for (byte[] b : batch) {
+        for (final byte[] b : batch) {
             totalBytes += (8 + b.length);
         }
 
@@ -258,7 +258,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
             if (!flusherExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
                 log.warn("Offset flusher executor did not terminate within 30s");
             }
-        } catch (InterruptedException ie) {
+        } catch (final InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
 
@@ -296,7 +296,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
 
             while (ch.position() < fileSize) {
                 lenBuf.clear();
-                int n = ch.read(lenBuf);
+                final int n = ch.read(lenBuf);
                 if (n < Integer.BYTES) break;
                 lenBuf.flip();
 
@@ -313,7 +313,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
 
                 final ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen);
                 while (payloadBuf.hasRemaining()) {
-                    int r = ch.read(payloadBuf);
+                    final int r = ch.read(payloadBuf);
                     if (r < 0) {
                         // Torn record; stop.
                         break;
@@ -359,7 +359,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         topicBytes(topic);
         groupBytes(group);
 
-        PartitionOffsets po = partitionOffsets(topic, group);
+        final PartitionOffsets po = partitionOffsets(topic, group);
         po.set(partition, offset);
     }
 
@@ -390,7 +390,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         return out;
     }
 
-    private static int putIntLE(byte[] arr, int pos, int value) {
+    private static int putIntLE(final byte[] arr, final int pos, final int value) {
         arr[pos    ] = (byte) (value       & 0xFF);
         arr[pos + 1] = (byte) ((value >> 8)  & 0xFF);
         arr[pos + 2] = (byte) ((value >> 16) & 0xFF);
@@ -398,7 +398,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         return pos + 4;
     }
 
-    private static int putLongLE(byte[] arr, int pos, long value) {
+    private static int putLongLE(final byte[] arr, final int pos, final long value) {
         arr[pos    ] = (byte) (value       & 0xFFL);
         arr[pos + 1] = (byte) ((value >> 8)  & 0xFFL);
         arr[pos + 2] = (byte) ((value >> 16) & 0xFFL);

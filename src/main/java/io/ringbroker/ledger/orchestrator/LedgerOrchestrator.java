@@ -31,7 +31,7 @@ import static java.nio.file.StandardOpenOption.WRITE;
 public final class LedgerOrchestrator implements AutoCloseable {
 
     private static final ExecutorService INDEX_BUILDER =
-            Executors.newSingleThreadExecutor(Thread.ofPlatform().name("ledger-idx-builder").factory());
+            Executors.newSingleThreadExecutor(Thread.ofPlatform().name("ledger-idx-builder").daemon(true).factory());
 
     private final Path directory;
     @Getter
@@ -114,9 +114,9 @@ public final class LedgerOrchestrator implements AutoCloseable {
 
                 // Drop garbage empty segments (typically preallocated but unused).
                 if (seg.isLogicallyEmpty()) {
-                    try { seg.close(); } catch (Exception ignored) {}
-                    try { Files.deleteIfExists(segmentPath); } catch (Exception ignored) {}
-                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(segmentPath)); } catch (Exception ignored) {}
+                    try { seg.close(); } catch (final Exception ignored) {}
+                    try { Files.deleteIfExists(segmentPath); } catch (final Exception ignored) {}
+                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(segmentPath)); } catch (final Exception ignored) {}
                     return null;
                 }
 
@@ -131,7 +131,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
             if (tempRecoveryPath != null) {
                 try {
                     Files.deleteIfExists(tempRecoveryPath);
-                } catch (IOException ignored) {
+                } catch (final IOException ignored) {
                 }
             }
         }
@@ -157,7 +157,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
 
             while (currentFilePosition < ch.size()) {
                 recordHeaderBuffer.clear();
-                int bytesRead = ch.read(recordHeaderBuffer);
+                final int bytesRead = ch.read(recordHeaderBuffer);
 
                 // 1. Check for EOF (Clean stop)
                 if (bytesRead == -1 || bytesRead == 0) break;
@@ -193,7 +193,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
                         payloadChunk.limit((int) remaining);
                     }
 
-                    int chunkRead = ch.read(payloadChunk);
+                    final int chunkRead = ch.read(payloadChunk);
                     if (chunkRead < 0) {
                         torn = true;
                         break;
@@ -236,7 +236,7 @@ public final class LedgerOrchestrator implements AutoCloseable {
     /**
      * Returns the active segment, rolling if it cannot fit `requiredBytes`.
      */
-    public LedgerSegment writable(int requiredBytes) throws IOException {
+    public LedgerSegment writable(final int requiredBytes) throws IOException {
         LedgerSegment current = activeSegment.get();
 
         if (current == null || !current.hasSpaceFor(requiredBytes)) {
@@ -397,11 +397,12 @@ public final class LedgerOrchestrator implements AutoCloseable {
             try {
                 final LedgerSegment pre = nextSegmentFuture.get();
                 if (pre != null && !isInSnapshot(pre)) {
-                    try { pre.close(); } catch (Exception ignored) {}
-                    try { Files.deleteIfExists(pre.getFile()); } catch (Exception ignored) {}
-                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(pre.getFile())); } catch (Exception ignored) {}
+                    try { pre.close(); } catch (final Exception ignored) {}
+                    try { Files.deleteIfExists(pre.getFile()); } catch (final Exception ignored) {}
+                    try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(pre.getFile())); } catch (final
+                    Exception ignored) {}
                 }
-            } catch (Exception ignored) {
+            } catch (final Exception ignored) {
             }
         }
 
@@ -409,21 +410,21 @@ public final class LedgerOrchestrator implements AutoCloseable {
         final LedgerSegment[] snap = segmentSnapshot;
         for (final LedgerSegment s : snap) {
             if (s != null) {
-                try { s.buildDenseIndexIfMissingOrStale(); } catch (Exception ignored) {}
+                try { s.buildDenseIndexIfMissingOrStale(); } catch (final Exception ignored) {}
             }
         }
 
         // Close all segments (avoid mmap leaks).
         for (final LedgerSegment s : snap) {
             if (s != null) {
-                try { s.close(); } catch (Exception ignored) {}
+                try { s.close(); } catch (final Exception ignored) {}
             }
         }
 
         final LedgerSegment current = activeSegment.getAndSet(null);
         if (current != null) try {
             current.close();
-        } catch (Exception ignored) {
+        } catch (final Exception ignored) {
         }
     }
 

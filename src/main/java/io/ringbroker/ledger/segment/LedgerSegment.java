@@ -267,7 +267,7 @@ public final class LedgerSegment implements AutoCloseable {
         }
     }
 
-    public boolean hasSpaceFor(int payloadBytes) {
+    public boolean hasSpaceFor(final int payloadBytes) {
         return (capacity - buf.position()) >= (payloadBytes + MIN_RECORD_OVERHEAD);
     }
 
@@ -508,16 +508,16 @@ public final class LedgerSegment implements AutoCloseable {
         try {
             // Ensure idx exists for tests + production determinism.
             buildDenseIndexIfMissingOrStale();
-        } catch (Exception ignored) {}
+        } catch (final Exception ignored) {}
 
         final DenseOffsetIndex idx = this.denseIndex;
         if (idx != null) {
-            try { idx.close(); } catch (Exception ignored) {}
+            try { idx.close(); } catch (final Exception ignored) {}
         }
 
         if (buf != null) {
-            try { buf.force(); } catch (Exception ignored) {}
-            try { UNSAFE.invokeCleaner(buf); } catch (Exception ignored) {}
+            try { buf.force(); } catch (final Exception ignored) {}
+            try { UNSAFE.invokeCleaner(buf); } catch (final Exception ignored) {}
         }
     }
 
@@ -644,7 +644,7 @@ public final class LedgerSegment implements AutoCloseable {
 
         @Override
         public void close() {
-            try { UNSAFE.invokeCleaner(idxBuf); } catch (Exception ignored) {}
+            try { UNSAFE.invokeCleaner(idxBuf); } catch (final Exception ignored) {}
         }
     }
 }

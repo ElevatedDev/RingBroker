@@ -20,20 +20,14 @@ import java.util.Map;
 import java.util.concurrent.*;
 
 /**
- * Lightweight SWIM‑style gossip. Each broker sends a 48‑byte UDP ping once per second containing
- * its {@code brokerId}, {@code role} and a monotonic heartbeat counter. Peers reply with an ACK.
- * Any member missing 3 consecutive pings is marked dead.
+ * Lightweight SWIM-style gossip.
  */
 @Slf4j
 public final class SwimGossipService implements GossipService {
 
-    // Cache values to avoid array clone overhead in hot loop
     private static final BrokerRole[] ROLES = BrokerRole.values();
     private static final long MEMBER_TIMEOUT_MS = 3_000;
 
-    /**
-     * Immutable view keyed by brokerId.
-     */
     private final ConcurrentMap<Integer, Member> view = new ConcurrentHashMap<>();
 
     private final int selfId;
@@ -41,8 +35,13 @@ public final class SwimGossipService implements GossipService {
     private final EventLoopGroup group;
     private final InetSocketAddress bind;
     private final List<InetSocketAddress> seeds;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r ->
-            new Thread(r, "gossip-flusher"));
+
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        final Thread t = new Thread(r, "gossip-flusher");
+        t.setDaemon(true);
+        return t;
+    });
+
     private volatile Channel channel;
 
     public SwimGossipService(final int selfId,
@@ -101,21 +100,18 @@ public final class SwimGossipService implements GossipService {
     private void flush() {
         final ByteBuf payload = Unpooled.buffer(4 + 1 + 8 + 1);
 
-        payload.writeInt(selfId);                               // brokerId
-        payload.writeByte(selfMember.role().ordinal());         // role
-        payload.writeLong(System.currentTimeMillis());          // timestamp
-        payload.writeByte(selfMember.vnodes());                 // weight / vnodes
+        payload.writeInt(selfId);
+        payload.writeByte(selfMember.role().ordinal());
+        payload.writeLong(System.currentTimeMillis());
+        payload.writeByte(selfMember.vnodes());
 
-        // 1) seeds (static discovery)
         for (final InetSocketAddress seed : seeds) {
             channel.writeAndFlush(new DatagramPacket(payload.retainedDuplicate(), seed));
         }
 
-        // 2) live peers discovered so far
         for (final Member m : view.values()) {
             if (m.brokerId() == selfId) continue;
-            channel.writeAndFlush(
-                    new DatagramPacket(payload.retainedDuplicate(), m.address()));
+            channel.writeAndFlush(new DatagramPacket(payload.retainedDuplicate(), m.address()));
         }
 
         payload.release();
@@ -123,17 +119,14 @@ public final class SwimGossipService implements GossipService {
 
     private void decode(final DatagramPacket pkt) {
         final ByteBuf b = pkt.content();
-        if (b.readableBytes() < 14) return; // Basic length guard
+        if (b.readableBytes() < 14) return;
 
         final int id = b.readInt();
         final int roleOrd = b.readByte();
         final long ts = b.readLong();
         final int vnodes = b.readByte();
 
-        // This prevents a delayed packet from re-adding a node we just swept.
-        if (System.currentTimeMillis() - ts > MEMBER_TIMEOUT_MS) {
-            return;
-        }
+        if (System.currentTimeMillis() - ts > MEMBER_TIMEOUT_MS) return;
 
         final BrokerRole role = (roleOrd >= 0 && roleOrd < ROLES.length) ? ROLES[roleOrd] : BrokerRole.INGESTION;
 
@@ -151,7 +144,12 @@ public final class SwimGossipService implements GossipService {
     @Override
     public void close() {
         scheduler.shutdownNow();
-        if (channel != null) channel.close();
-        group.shutdownGracefully();
+        try {
+            if (channel != null) {
+                channel.close().syncUninterruptibly();
+            }
+        } finally {
+            group.shutdownGracefully().syncUninterruptibly();
+        }
     }
 }

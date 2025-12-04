@@ -4,6 +4,7 @@ import io.ringbroker.broker.role.BrokerRole;
 import io.ringbroker.cluster.membership.member.Member;
 import lombok.experimental.UtilityClass;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
@@ -48,8 +49,15 @@ public final class HashingProvider {
     public List<Integer> topN(final int key,
                               final int n,
                               final Collection<Member> members) {
-        return members.stream()
+        final List<Member> persistenceOnly = members.stream()
                 .filter(m -> m.role() == BrokerRole.PERSISTENCE)
+                .toList();
+
+        final List<Member> candidates = persistenceOnly.isEmpty()
+                ? new ArrayList<>(members) // fallback: no persistence nodes; use all
+                : persistenceOnly;
+
+        return candidates.stream()
                 .sorted(Comparator.comparingLong(m -> -score(key, m.brokerId())))
                 .limit(n)
                 .map(Member::brokerId)
