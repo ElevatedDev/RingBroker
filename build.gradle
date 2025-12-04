@@ -19,6 +19,11 @@ java {
     withSourcesJar()
 }
 
+// Ensure UTF-8 source encoding (avoids Windows-1252 build failures).
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
 application {
     // for Gradle 7.1+ use:
     mainClass.set("io.ringbroker.BrokerMain")
@@ -123,5 +128,21 @@ jmh {
     failOnError = true            // Fail build on errors during benchmarking
     forceGC = true                // Force GC between iterations
     jvmArgsAppend = ['--enable-preview'] // Add any JVM args needed for your project
-}
 
+    // Allow quick overrides from the command line (e.g. -PjmhInclude=Foo -PjmhIterations=1).
+    if (project.hasProperty('jmhInclude')) {
+        includes = [project.property('jmhInclude')]
+    }
+    if (project.hasProperty('jmhIterations')) {
+        iterations = Integer.parseInt(project.property('jmhIterations') as String)
+    }
+    if (project.hasProperty('jmhWarmupIterations')) {
+        warmupIterations = Integer.parseInt(project.property('jmhWarmupIterations') as String)
+    }
+    if (project.hasProperty('jmhFork')) {
+        fork = Integer.parseInt(project.property('jmhFork') as String)
+    }
+    if (project.hasProperty('jmhIgnoreLock') && project.property('jmhIgnoreLock').toString().toBoolean()) {
+        jvmArgsAppend += ['-Djmh.ignoreLock=true']
+    }
+}

@@ -30,8 +30,6 @@ public final class Ingress {
 
     private static final int MAX_RETRIES = 5;
     private static final int QUEUE_CAPACITY_FACTOR = 4;
-
-    // Writer idle park, and producer backoff park (kept tiny)
     private static final long PARK_NANOS = 1_000;
 
     @Getter private final TopicRegistry registry;
@@ -47,6 +45,7 @@ public final class Ingress {
     private final boolean forceDurableWrites;
 
     private volatile Future<?> writerTask;
+    private volatile Throwable writerFailure;
 
     private Ingress(final TopicRegistry registry,
                     final RingBuffer<byte[]> ring,
@@ -99,7 +98,6 @@ public final class Ingress {
 
         if (!registry.contains(topic)) throw new IllegalArgumentException("topic not registered: " + topic);
 
-        // Keep original behavior (DLQ routing decision); note: payload does not embed topic.
         final String outTopic = retries > MAX_RETRIES ? topic + ".DLQ" : topic;
         if (!registry.contains(outTopic)) throw new IllegalArgumentException("topic not registered: " + outTopic);
 
@@ -114,12 +112,19 @@ public final class Ingress {
 
     private void offerWithBackoff(final byte[] payload, final long epoch) {
         int spins = 0;
-        while (!queue.offer(payload, epoch)) {
+
+        for (;;) {
+            final Throwable wf = writerFailure;
+            if (wf != null) {
+                throw new IllegalStateException("Ingress writer failed", wf);
+            }
+
+            if (queue.offer(payload, epoch)) return;
+
             if (Thread.currentThread().isInterrupted()) {
-                // Make shutdown responsive.
                 throw new RuntimeException("Interrupted while publishing");
             }
-            // Gentle backoff under contention/full queue.
+
             if ((++spins & 1023) == 0) {
                 LockSupport.parkNanos(PARK_NANOS);
             } else {
@@ -128,15 +133,10 @@ public final class Ingress {
         }
     }
 
-    /**
-     * Append a batch of payloads directly to the epoch's log (used for backfill).
-     */
     public void appendBackfillBatch(final long epoch, final byte[][] payloads, final int count) throws IOException {
         if (count == 0) return;
         for (int i = 0; i < count; i++) {
-            if (payloads[i] == null) {
-                throw new IllegalArgumentException("Backfill payload[" + i + "] is null");
-            }
+            if (payloads[i] == null) throw new IllegalArgumentException("Backfill payload[" + i + "] is null");
         }
 
         final int totalBytes = computeTotalBytes(payloads, count);
@@ -152,7 +152,6 @@ public final class Ingress {
     private int computeTotalBytes(final byte[][] payloads, final int count) {
         int total = 0;
         for (int i = 0; i < count; i++) {
-            // LedgerSegment stores: [len:int][crc:int][payload:bytes]
             final int len = payloads[i].length;
             total = Math.addExact(total, Integer.BYTES + Integer.BYTES + len);
         }
@@ -176,13 +175,6 @@ public final class Ingress {
         return virtualLog.forEpoch(epoch).fetch(offset, maxMessages, visitor::accept);
     }
 
-    /**
-     * Writer loop:
-     * - drains SlotRing
-     * - batches by epoch (WITHOUT peekEpoch() to avoid double queue-touch per msg)
-     * - appends to ledger
-     * - publishes to ring
-     */
     private void writerLoop() {
         final SlotRing.Entry entry = new SlotRing.Entry();
         final SlotRing.Entry carry = new SlotRing.Entry();
@@ -191,7 +183,6 @@ public final class Ingress {
         try {
             while (!Thread.currentThread().isInterrupted()) {
 
-                // First element comes either from carry (epoch boundary) or queue.
                 if (hasCarry) {
                     entry.payload = carry.payload;
                     entry.epoch = carry.epoch;
@@ -204,7 +195,6 @@ public final class Ingress {
                 }
 
                 if (entry.payload == null) {
-                    // This should never happen after SlotRing fix; fail fast with context.
                     throw new IllegalStateException("SlotRing returned null payload (epoch=" + entry.epoch + ")");
                 }
 
@@ -215,7 +205,6 @@ public final class Ingress {
                 batchBuffer[count++] = entry.payload;
                 totalBytes = Math.addExact(totalBytes, Integer.BYTES + Integer.BYTES + entry.payload.length);
 
-                // Drain as much as possible, but stop when epoch changes.
                 while (count < batchSize) {
                     if (!queue.pollInto(entry)) break;
 
@@ -236,7 +225,6 @@ public final class Ingress {
 
                 batchView.setSize(count);
 
-                // Avoid repeated forEpoch() calls
                 final LedgerOrchestrator ledger = virtualLog.forEpoch(batchEpoch);
                 final LedgerSegment segment = ledger.writable(totalBytes);
 
@@ -254,9 +242,11 @@ public final class Ingress {
                 Arrays.fill(batchBuffer, 0, count, null);
             }
         } catch (final IOException ioe) {
-            log.error("Ingress writer loop encountered an I/O error and will terminate. Partition data may be at risk.", ioe);
+            writerFailure = ioe;
+            log.error("Ingress writer loop I/O error; terminating writer.", ioe);
         } catch (final Throwable t) {
-            log.error("Ingress writer loop encountered a fatal error and will terminate.", t);
+            writerFailure = t;
+            log.error("Ingress writer loop fatal error; terminating writer.", t);
             throw (t instanceof RuntimeException) ? (RuntimeException) t : new RuntimeException(t);
         }
     }
@@ -289,14 +279,6 @@ public final class Ingress {
 
     // -------------------- SlotRing --------------------
 
-    /**
-     * MPSC-ish bounded ring (multi-producer, single-consumer).
-     *
-     * IMPORTANT FIX:
-     * The consumer MUST clear the slot BEFORE publishing it as available to producers
-     * (i.e., before updating the sequence to "free"). Otherwise, a producer may reuse
-     * the slot and then the consumer clears it to null, corrupting the queue.
-     */
     static final class SlotRing {
         private static final VarHandle SEQUENCE_HANDLE, BUFFER_HANDLE, EPOCH_HANDLE;
 
@@ -307,8 +289,8 @@ public final class Ingress {
         }
 
         private final long[] epochs;
-        private final int mask;     // capacity - 1
-        private final int capacity; // mask + 1
+        private final int mask;
+        private final int capacity;
         private final long[] sequence;
         private final byte[][] buffer;
 
@@ -316,9 +298,8 @@ public final class Ingress {
         private final PaddedAtomicLong head = new PaddedAtomicLong(0);
 
         SlotRing(final int capacityPow2) {
-            if (Integer.bitCount(capacityPow2) != 1) {
-                throw new IllegalArgumentException("capacity must be power of two");
-            }
+            if (Integer.bitCount(capacityPow2) != 1) throw new IllegalArgumentException("capacity must be power of two");
+
             this.capacity = capacityPow2;
             this.mask = capacityPow2 - 1;
 
@@ -344,7 +325,6 @@ public final class Ingress {
                 if (difference == 0) {
                     if (tail.compareAndSet(tailSnapshot, tailSnapshot + 1)) break;
                 } else if (difference < 0) {
-                    // full
                     return false;
                 } else {
                     Thread.onSpinWait();
@@ -353,7 +333,6 @@ public final class Ingress {
 
             final int bufferIndex = (int) (tailSnapshot & mask);
 
-            // Publish payload+epoch, then publish sequence as "ready".
             BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);
             EPOCH_HANDLE.setRelease(epochs, bufferIndex, epoch);
             SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);
@@ -374,7 +353,6 @@ public final class Ingress {
                 if (difference == 0) {
                     if (head.compareAndSet(headSnapshot, headSnapshot + 1)) break;
                 } else if (difference < 0) {
-                    // empty
                     return false;
                 } else {
                     Thread.onSpinWait();
@@ -383,15 +361,12 @@ public final class Ingress {
 
             final int bufferIndex = (int) (headSnapshot & mask);
 
-            // Acquire loads match producer's release stores.
             final byte[] payload = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
             final long epoch = (long) EPOCH_HANDLE.getAcquire(epochs, bufferIndex);
 
-            // FIX: clear slot BEFORE making it available to producers again.
+            // clear BEFORE publishing slot free
             BUFFER_HANDLE.setRelease(buffer, bufferIndex, null);
             EPOCH_HANDLE.setRelease(epochs, bufferIndex, 0L);
-
-            // Mark slot as free for the next cycle.
             SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + capacity);
 
             out.payload = payload;
@@ -406,14 +381,11 @@ public final class Ingress {
         }
     }
 
-    @SuppressWarnings("unused")
     private static final class PaddedAtomicLong extends AtomicLong {
         volatile long p1, p2, p3, p4, p5, p6, p7;
         volatile long q1, q2, q3, q4, q5, q6, q7;
 
-        PaddedAtomicLong(final long initial) {
-            super(initial);
-        }
+        PaddedAtomicLong(final long initial) { super(initial); }
     }
 
     private static final class ByteBatch extends AbstractList<byte[]> {
@@ -422,9 +394,7 @@ public final class Ingress {
         @Setter
         private int size;
 
-        ByteBatch(final byte[][] backing) {
-            this.backing = backing;
-        }
+        ByteBatch(final byte[][] backing) { this.backing = backing; }
 
         @Override
         public byte[] get(final int index) {
@@ -433,8 +403,6 @@ public final class Ingress {
         }
 
         @Override
-        public int size() {
-            return size;
-        }
+        public int size() { return size; }
     }
 }

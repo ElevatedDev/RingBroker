@@ -9,7 +9,6 @@ import io.ringbroker.core.wait.BusySpin;
 import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.ledger.orchestrator.VirtualLog;
 import io.ringbroker.registry.TopicRegistry;
-import lombok.extern.slf4j.Slf4j;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
@@ -20,7 +19,6 @@ import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-@Slf4j
 @State(Scope.Benchmark)
 public class RingBrokerHotPathBenchmark {
 
@@ -40,6 +38,8 @@ public class RingBrokerHotPathBenchmark {
     private Ingress ingress;
     private VirtualLog vLog;
     private Delivery delivery;
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(RingBrokerHotPathBenchmark.class);
 
     private byte[] payload;
 

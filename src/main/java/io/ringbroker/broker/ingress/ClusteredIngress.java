@@ -119,7 +119,15 @@ public final class ClusteredIngress {
         this.myNodeId = myNodeId;
         this.clusterSize = clusterSize;
         this.ingressMap = ingressMap;
-        this.clusterNodes = new ConcurrentHashMap<>(clusterNodes);
+
+        // Keep a live view of the cluster map when a concurrent map is provided (benchmark wires clients after ctor).
+        if (clusterNodes instanceof ConcurrentMap) {
+            @SuppressWarnings("unchecked")
+            final ConcurrentMap<Integer, RemoteBrokerClient> live = (ConcurrentMap<Integer, RemoteBrokerClient>) clusterNodes;
+            this.clusterNodes = live;
+        } else {
+            this.clusterNodes = new ConcurrentHashMap<>(clusterNodes);
+        }
         this.idempotentMode = idempotentMode;
         this.seenMessageIds = seenMessageIds;
         this.deliveryMap = deliveryMap;
@@ -141,19 +149,39 @@ public final class ClusteredIngress {
         for (final var e : ingressMap.entrySet()) {
             final int pid = e.getKey();
             final Ingress ing = e.getValue();
-            ing.setActiveEpoch(0L);
+            final Path partDir = baseDataDir.resolve("partition-" + pid);
 
-            final long last = ing.getVirtualLog().forEpoch(0L).getHighWaterMark();
-            final List<Integer> placementNodes = replicaResolver.replicas(pid);
-
-            final EpochPlacement placement = new EpochPlacement(0L, placementNodes, replicator.getAckQuorum());
-            metadataStore.bootstrapIfAbsent(pid, placement, Math.max(0, last + 1));
-
+            // load fences first (disk truth)
             final PartitionEpochs pe = new PartitionEpochs();
-            pe.highestSeenEpoch.set(FenceStore.loadHighest(baseDataDir.resolve("partition-" + pid)));
-            pe.active = new EpochState(0L, last);
-            pe.activePlacement = placement;
-            loadFenceState(baseDataDir.resolve("partition-" + pid), pe);
+            pe.highestSeenEpoch.set(FenceStore.loadHighest(partDir));
+            loadFenceState(partDir, pe);
+
+            // use existing metadata (if present) instead of forcing epoch=0 view
+            final LogConfiguration cfg;
+            final Optional<LogConfiguration> cur = metadataStore.current(pid);
+            if (cur.isPresent()) {
+                cfg = cur.get();
+            } else {
+                // bootstrap epoch 0 based on actual persisted HWM
+                final long last0 = ing.getVirtualLog().forEpoch(0L).getHighWaterMark();
+                final List<Integer> placementNodes = replicaResolver.replicas(pid);
+                final EpochPlacement placement0 = new EpochPlacement(0L, placementNodes, replicator.getAckQuorum());
+                cfg = metadataStore.bootstrapIfAbsent(pid, placement0, Math.max(0L, last0 + 1));
+            }
+
+            final EpochMetadata active = cfg.activeEpoch();
+            final long activeEpoch = active.epoch();
+
+            ing.setActiveEpoch(activeEpoch);
+            final long last = ing.highWaterMark(activeEpoch);
+
+            pe.active = new EpochState(activeEpoch, last);
+            pe.activePlacement = active.placement();
+            pe.lastTieBreaker.set(active.tieBreaker());
+
+            // ensure highestSeenEpoch never goes backwards
+            pe.highestSeenEpoch.accumulateAndGet(activeEpoch, Math::max);
+
             epochsByPartition.put(pid, pe);
 
             // start pipeline for local partition owner
@@ -377,6 +405,9 @@ public final class ClusteredIngress {
         @SuppressWarnings("unchecked")
         private final CompletableFuture<Void>[] publishFuts =
                 (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
+
+        // replication targets scratch (avoid per-publish allocation)
+        private int[] replicaScratch = new int[Math.max(1, clusterSize)];
 
         PartitionPipeline(final int pid, final int capacityPow2) {
             this.pid = pid;
@@ -633,10 +664,13 @@ public final class ClusteredIngress {
                         ? placementCache.getAckQuorum()
                         : ensureConfig(pid).activeEpoch().placement().getAckQuorum();
 
+                if (replicaScratch.length < placementArr.length) {
+                    replicaScratch = new int[placementArr.length];
+                }
+
                 int rc = 0;
-                final int[] replicas = new int[placementArr.length];
                 for (final int id : placementArr) {
-                    if (id != myNodeId) replicas[rc++] = id;
+                    if (id != myNodeId) replicaScratch[rc++] = id;
                 }
 
                 if (rc > 0) {
@@ -656,7 +690,8 @@ public final class ClusteredIngress {
                             .setAppendBatch(bb.build())
                             .build();
 
-                    replicator.replicate(env, toListView(replicas, rc), quorum);
+                    // HOT PATH OPT: no List boxing/allocation
+                    replicator.replicate(env, replicaScratch, rc, quorum);
                 }
 
                 for (int i = 0; i < count; i++) publishFuts[i].complete(null);
@@ -669,12 +704,6 @@ public final class ClusteredIngress {
                 Arrays.fill(payloads, 0, count, null);
                 Arrays.fill(publishFuts, 0, count, null);
             }
-        }
-
-        private List<Integer> toListView(final int[] arr, final int n) {
-            final ArrayList<Integer> out = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) out.add(arr[i]);
-            return out;
         }
     }
 
@@ -764,8 +793,6 @@ public final class ClusteredIngress {
 
     // ---------- Fast replica append paths (serialized => no CAS loops) ----------
 
-// ---------- Fast replica append paths (serialized => no CAS loops) ----------
-
     private BrokerApi.ReplicationAck appendReplicaFast(final BrokerApi.AppendRequest a) {
         final int pid = a.getPartitionId();
         final long epoch = a.getEpoch();
@@ -816,10 +843,6 @@ public final class ClusteredIngress {
                     .build();
         }
 
-        // accept
-        st.lastSeqReserved.set(seq);
-        fence.lastSeq.set(seq);
-
         try {
             ing.publishForEpoch(epoch, a.getPayload().toByteArray());
         } catch (final Throwable t) {
@@ -828,6 +851,10 @@ public final class ClusteredIngress {
                     .setErrorMessage("append failed: " + t)
                     .build();
         }
+
+        // commit state ONLY after successful write
+        st.lastSeqReserved.set(seq);
+        fence.lastSeq.set(seq);
 
         return BrokerApi.ReplicationAck.newBuilder()
                 .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
@@ -879,29 +906,36 @@ public final class ClusteredIngress {
 
         final long cur = st.lastSeqReserved.get();
 
-        // duplicate/overlap: ack immediately (no durable wait)
-        if (baseSeq <= cur) {
-            final long ackUpTo = Math.max(cur, lastSeq);
+        // fully duplicate: ack immediately
+        if (lastSeq <= cur) {
             return BrokerApi.ReplicationAck.newBuilder()
                     .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
-                    .setOffset(Lsn.encode(epoch, ackUpTo))
+                    .setOffset(Lsn.encode(epoch, cur))
                     .build();
         }
 
         final long expected = cur + 1;
-        if (baseSeq != expected) {
+
+        // gap: leader started beyond what we have
+        if (baseSeq > expected) {
             return BrokerApi.ReplicationAck.newBuilder()
                     .setStatus(BrokerApi.ReplicationAck.Status.ERROR_REPLICA_NOT_READY)
                     .setErrorMessage("Gap. expected=" + expected + " got=" + baseSeq)
                     .build();
         }
 
-        // accept
-        st.lastSeqReserved.set(lastSeq);
-        fence.lastSeq.set(lastSeq);
+        // overlap is allowed: skip already-present prefix
+        final int startIdx = (int) (expected - baseSeq); // >= 0 here
+        if (startIdx >= n) {
+            // should be impossible because lastSeq > cur, but keep it safe
+            return BrokerApi.ReplicationAck.newBuilder()
+                    .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
+                    .setOffset(Lsn.encode(epoch, cur))
+                    .build();
+        }
 
         try {
-            for (int i = 0; i < n; i++) {
+            for (int i = startIdx; i < n; i++) {
                 ing.publishForEpoch(epoch, payloads.get(i).toByteArray());
             }
         } catch (final Throwable t) {
@@ -910,6 +944,10 @@ public final class ClusteredIngress {
                     .setErrorMessage("append batch failed: " + t)
                     .build();
         }
+
+        // commit after successful writes
+        st.lastSeqReserved.set(lastSeq);
+        fence.lastSeq.set(lastSeq);
 
         return BrokerApi.ReplicationAck.newBuilder()
                 .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
@@ -1212,7 +1250,8 @@ public final class ClusteredIngress {
         final int[] count = new int[]{0};
 
         ing.fetchEpoch(epoch, offset, backfillBatchSize, (off, segBuf, payloadPos, payloadLen) -> {
-            if (written[0] + payloadLen > maxBytes) return;
+            // FIX: include 4-byte header in maxBytes accounting
+            if (written[0] + payloadLen + Integer.BYTES > maxBytes) return;
             final byte[] buf = new byte[payloadLen + Integer.BYTES];
             buf[0] = (byte) (payloadLen);
             buf[1] = (byte) (payloadLen >>> 8);
@@ -1281,7 +1320,7 @@ public final class ClusteredIngress {
 
                 final io.ringbroker.ledger.orchestrator.VirtualLog vLog =
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
-                vLog.discoverOnDisk(); // IMPORTANT: was missing for lazily created replicas
+                vLog.discoverOnDisk(); // IMPORTANT: required for lazily created replicas
 
                 final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable);
 

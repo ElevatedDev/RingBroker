@@ -17,7 +17,6 @@ import io.ringbroker.core.wait.WaitStrategy;
 import io.ringbroker.offset.InMemoryOffsetStore;
 import io.ringbroker.proto.test.EventsProto;
 import io.ringbroker.registry.TopicRegistry;
-import lombok.extern.slf4j.Slf4j;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
@@ -32,7 +31,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
-@Slf4j
 @State(Scope.Benchmark)
 public class RingBrokerBenchmark {
 
@@ -50,14 +48,29 @@ public class RingBrokerBenchmark {
     // Precomputed keys length: power-of-two for cheap masking.
     private static final int KEY_POOL_SIZE = 1 << 17; // 131072
 
+    // Replication timeout tuned for heavy in-proc load to avoid spurious quorum drops.
+    private static final long REPL_TIMEOUT_MS = 60_000L;
+
     @Param({"100000"})
     private int totalMessages;
 
     @Param({"adaptive-spin", "blocking", "busy-spin"})
     private String waitStrategy;
 
+    /**
+     * Profile:
+     *  - fast        : single-node, ingestion role (no fsync/quorum)
+     *  - quorum-lite : 3-node, quorum=2, ingestion role (replication without fsync)
+     *  - quorum      : 3-node, quorum=2, persistence role (durable path)
+     *  - frontdoor   : 1 ingestion node forwarding to 2 persistence nodes (quorum=2, durable)
+     */
+    @Param({"fast"})
+    private String profile;
+
     private byte[] payload;
     private byte[][] keys;
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(RingBrokerBenchmark.class);
 
     // Cluster state
     private Map<Integer, ClusteredIngress> clusterIngresses;
@@ -96,8 +109,9 @@ public class RingBrokerBenchmark {
                 keys[i] = ("qkey-" + i).getBytes(StandardCharsets.UTF_8);
             }
 
-            buildCluster(registry, ws);
-            leader = clusterIngresses.get(0);
+            final Profile prof = profileConfig();
+            buildCluster(registry, ws, prof);
+            leader = clusterIngresses.get(prof.leaderId());
 
         } catch (Exception e) {
             try { tearDown(); } catch (Exception ignore) {}
@@ -208,29 +222,57 @@ public class RingBrokerBenchmark {
         blackhole.consume(idx);
     }
 
-    private void buildCluster(final TopicRegistry registry, final WaitStrategy ws) throws IOException {
-        final int clusterSize = 3;
-        final int ackQuorum = 2;
+    private record Profile(int persistenceNodes,
+                          int ingestionNodes,
+                          int ackQuorum,
+                          BrokerRole persistenceRole,
+                          boolean frontdoor,
+                          int leaderId) {}
 
-        final List<Member> members = new ArrayList<>(clusterSize);
-        for (int i = 0; i < clusterSize; i++) {
-            members.add(new Member(
+    private Profile profileConfig() {
+        if ("fast".equalsIgnoreCase(profile)) {
+            return new Profile(1, 0, 1, BrokerRole.INGESTION, false, 0);
+        }
+        if ("quorum-lite".equalsIgnoreCase(profile)) {
+            return new Profile(3, 0, 2, BrokerRole.INGESTION, false, 0);
+        }
+        if ("quorum".equalsIgnoreCase(profile)) {
+            return new Profile(3, 0, 2, BrokerRole.PERSISTENCE, false, 0);
+        }
+        if ("frontdoor".equalsIgnoreCase(profile)) {
+            // ingestion node id = 2, persistence nodes = 0,1
+            return new Profile(2, 1, 2, BrokerRole.PERSISTENCE, true, 2);
+        }
+        throw new IllegalArgumentException("Unknown profile: " + profile + " (expected fast|quorum-lite|quorum|frontdoor)");
+    }
+
+    private void buildCluster(final TopicRegistry registry,
+                              final WaitStrategy ws,
+                              final Profile cfg) throws IOException {
+        final int persistenceNodes = Math.max(1, cfg.persistenceNodes());
+        final int ingestionNodes = Math.max(0, cfg.ingestionNodes());
+        final int totalNodes = persistenceNodes + ingestionNodes;
+        final int ackQuorum = Math.min(persistenceNodes, Math.max(1, cfg.ackQuorum()));
+
+        final List<Member> persistenceMembers = new ArrayList<>(persistenceNodes);
+        for (int i = 0; i < persistenceNodes; i++) {
+            persistenceMembers.add(new Member(
                     i,
-                    BrokerRole.PERSISTENCE,
+                    cfg.persistenceRole(),
                     new InetSocketAddress("localhost", 9000 + i),
                     System.currentTimeMillis(),
                     1
             ));
         }
 
-        clusterResolver = new ReplicaSetResolver(clusterSize, () -> members);
-        clusterIngresses = new HashMap<>(clusterSize);
-        clusterOffsetStores = new HashMap<>(clusterSize);
+        clusterResolver = new ReplicaSetResolver(persistenceNodes, () -> persistenceMembers);
+        clusterIngresses = new HashMap<>(totalNodes);
+        clusterOffsetStores = new HashMap<>(totalNodes);
 
         final Map<Integer, AtomicReference<ClusteredIngress>> targets = new HashMap<>();
-        for (int i = 0; i < clusterSize; i++) targets.put(i, new AtomicReference<>());
+        for (int i = 0; i < totalNodes; i++) targets.put(i, new AtomicReference<>());
 
-        for (int nodeId = 0; nodeId < clusterSize; nodeId++) {
+        for (int nodeId = 0; nodeId < totalNodes; nodeId++) {
             final Path nodeDir = DATA.resolve("node-" + nodeId);
             Files.createDirectories(nodeDir);
 
@@ -253,14 +295,14 @@ public class RingBrokerBenchmark {
                     targets::keySet
             );
 
-            final AdaptiveReplicator rep = new AdaptiveReplicator(ackQuorum, clientsForNode, 1_000);
+            final AdaptiveReplicator rep = new AdaptiveReplicator(ackQuorum, clientsForNode, REPL_TIMEOUT_MS);
 
             final ClusteredIngress ci = ClusteredIngress.create(
                     registry,
                     new RoundRobinPartitioner(),
                     TOTAL_PARTITIONS,
                     nodeId,
-                    clusterSize,
+                    persistenceNodes,
                     clientsForNode,
                     nodeDir,
                     RING_SIZE,
@@ -269,7 +311,9 @@ public class RingBrokerBenchmark {
                     BATCH_SIZE,
                     false,
                     offsetStore,
-                    BrokerRole.PERSISTENCE,
+                    (cfg.frontdoor() && nodeId >= persistenceNodes)
+                            ? BrokerRole.INGESTION
+                            : cfg.persistenceRole(),
                     clusterResolver,
                     rep,
                     metadataStore
@@ -316,6 +360,20 @@ public class RingBrokerBenchmark {
                 return CompletableFuture.failedFuture(new IllegalStateException("target not set"));
             }
             return switch (envelope.getKindCase()) {
+                case PUBLISH -> {
+                    final io.ringbroker.api.BrokerApi.Message m = envelope.getPublish();
+                    final byte[] key = m.getKey().isEmpty() ? null : m.getKey().toByteArray();
+                    yield ing.publish(
+                                    envelope.getCorrelationId(),
+                                    m.getTopic(),
+                                    key,
+                                    m.getRetries(),
+                                    m.getPayload().toByteArray()
+                            )
+                            .thenApply(v -> io.ringbroker.api.BrokerApi.ReplicationAck.newBuilder()
+                                    .setStatus(io.ringbroker.api.BrokerApi.ReplicationAck.Status.SUCCESS)
+                                    .build());
+                }
                 case APPEND -> ing.handleAppendAsync(envelope.getAppend());
                 case APPEND_BATCH -> ing.handleAppendBatchAsync(envelope.getAppendBatch());
                 case SEAL -> ing.handleSealAsync(envelope.getSeal());

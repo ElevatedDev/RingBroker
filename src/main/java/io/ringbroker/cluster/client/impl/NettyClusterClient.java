@@ -1,6 +1,7 @@
 package io.ringbroker.cluster.client.impl;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioIoHandler;
@@ -24,10 +25,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Netty client that MUST be closed to avoid leaving non-daemon event loop threads
- * running (JMH fork won't exit, ports stay bound -> BindException).
- */
 @Slf4j
 public final class NettyClusterClient implements RemoteBrokerClient {
 
@@ -49,6 +46,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
         final Bootstrap bootstrap = new Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel.class)
+                .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
@@ -71,15 +69,13 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
     @Override
     public void sendMessage(final String topic, final byte[] key, final byte[] payload) {
-        if (closed.get()) {
-            throw new IllegalStateException("NettyClusterClient is closed");
-        }
+        if (closed.get()) throw new IllegalStateException("NettyClusterClient is closed");
 
         final BrokerApi.Message msg = BrokerApi.Message.newBuilder()
                 .setTopic(topic)
                 .setRetries(0)
-                .setKey(key == null ? ByteString.EMPTY : ByteString.copyFrom(key))
-                .setPayload(ByteString.copyFrom(payload))
+                .setKey(key == null ? ByteString.EMPTY : UnsafeByteOperations.unsafeWrap(key))
+                .setPayload(UnsafeByteOperations.unsafeWrap(payload))
                 .build();
 
         final BrokerApi.Envelope env = BrokerApi.Envelope.newBuilder()
@@ -95,9 +91,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
     @Override
     public void sendEnvelope(final BrokerApi.Envelope envelope) {
-        if (closed.get()) {
-            throw new IllegalStateException("NettyClusterClient is closed");
-        }
+        if (closed.get()) throw new IllegalStateException("NettyClusterClient is closed");
 
         channel.writeAndFlush(envelope).addListener(f -> {
             if (!f.isSuccess()) {
@@ -108,9 +102,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
     @Override
     public CompletableFuture<BrokerApi.ReplicationAck> sendEnvelopeWithAck(final BrokerApi.Envelope envelope) {
-        if (closed.get()) {
-            return CompletableFuture.failedFuture(new ClosedChannelException());
-        }
+        if (closed.get()) return CompletableFuture.failedFuture(new ClosedChannelException());
 
         final long corrId = corrSeq.getAndIncrement();
         final BrokerApi.Envelope toSend = BrokerApi.Envelope.newBuilder(envelope)
@@ -127,14 +119,13 @@ public final class NettyClusterClient implements RemoteBrokerClient {
                 log.error("Failed to send Envelope corrId {}: {}", corrId, f.cause().getMessage());
             }
         });
+
         return future;
     }
 
     @Override
     public CompletableFuture<BrokerApi.BackfillReply> sendBackfill(final BrokerApi.Envelope envelope) {
-        if (closed.get()) {
-            return CompletableFuture.failedFuture(new ClosedChannelException());
-        }
+        if (closed.get()) return CompletableFuture.failedFuture(new ClosedChannelException());
 
         final long corrId = corrSeq.getAndIncrement();
         final BrokerApi.Envelope toSend = BrokerApi.Envelope.newBuilder(envelope)
@@ -151,6 +142,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
                 log.error("Failed to send Backfill corrId {}: {}", corrId, f.cause().getMessage());
             }
         });
+
         return future;
     }
 
@@ -165,13 +157,9 @@ public final class NettyClusterClient implements RemoteBrokerClient {
         pendingBackfill.clear();
 
         try {
-            if (channel != null) {
-                channel.close().syncUninterruptibly();
-            }
+            if (channel != null) channel.close().syncUninterruptibly();
         } finally {
-            if (group != null) {
-                group.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
-            }
+            if (group != null) group.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
         }
 
         log.info("NettyClusterClient closed.");

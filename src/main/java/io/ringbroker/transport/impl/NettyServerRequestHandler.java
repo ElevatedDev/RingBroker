@@ -1,4 +1,3 @@
-// src/main/java/io/ringbroker/transport/impl/NettyServerRequestHandler.java
 package io.ringbroker.transport.impl;
 
 import com.google.protobuf.ByteString;
@@ -103,14 +102,14 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                     if (part == null) {
                         fr.setStatus(BrokerApi.FetchReply.Status.EPOCH_MISSING);
-                        fr.addAllRedirectNodes(placementOpt.orElseGet(java.util.List::of));
+                        fr.addAllRedirectNodes(placementOpt.orElseGet(List::of));
                         writeReply(ctx, corrId, fr.build());
                         break;
                     }
 
                     if (!part.getVirtualLog().hasEpoch(epoch)) {
                         fr.setStatus(BrokerApi.FetchReply.Status.EPOCH_MISSING);
-                        fr.addAllRedirectNodes(placementOpt.orElseGet(java.util.List::of));
+                        fr.addAllRedirectNodes(placementOpt.orElseGet(List::of));
                         writeReply(ctx, corrId, fr.build());
                         break;
                     }
@@ -150,7 +149,7 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                                                     .setTopic(s.getTopic())
                                                     .setOffset(seq)
                                                     .setKey(ByteString.EMPTY)
-                                                    .setPayload(ByteString.copyFrom(msg)))
+                                                    .setPayload(UnsafeByteOperations.unsafeWrap(msg)))
                                             .build()
                             );
                         }
@@ -240,31 +239,23 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
         }
     }
 
-    private void writeReply(final ChannelHandlerContext ctx, final long corrId, final com.google.protobuf.GeneratedMessageV3 reply) {
+    private void writeReply(final ChannelHandlerContext ctx,
+                            final long corrId,
+                            final com.google.protobuf.GeneratedMessageV3 reply) {
         final BrokerApi.Envelope.Builder b = BrokerApi.Envelope.newBuilder().setCorrelationId(corrId);
 
-        if (reply instanceof final BrokerApi.PublishReply r) {
-            b.setPublishReply(r);
-        } else if (reply instanceof final BrokerApi.CommitAck r) {
-            b.setCommitAck(r);
-        } else if (reply instanceof final BrokerApi.CommittedReply r) {
-            b.setCommittedReply(r);
-        } else if (reply instanceof final BrokerApi.FetchReply r) {
-            b.setFetchReply(r);
-        } else if (reply instanceof final BrokerApi.ReplicationAck r) {
-            b.setReplicationAck(r);
-        } else if (reply instanceof final BrokerApi.BackfillReply r) {
-            b.setBackfillReply(r);
+        if (reply instanceof final BrokerApi.PublishReply r) b.setPublishReply(r);
+        else if (reply instanceof final BrokerApi.CommitAck r) b.setCommitAck(r);
+        else if (reply instanceof final BrokerApi.CommittedReply r) b.setCommittedReply(r);
+        else if (reply instanceof final BrokerApi.FetchReply r) b.setFetchReply(r);
+        else if (reply instanceof final BrokerApi.ReplicationAck r) b.setReplicationAck(r);
+        else if (reply instanceof final BrokerApi.BackfillReply r) b.setBackfillReply(r);
+        else if (reply instanceof final BrokerApi.MessageEvent r) b.setMessageEvent(r);
+        else {
+            log.warn("Unknown reply type: {}", reply.getClass().getName());
+            return;
         }
 
-        if (ctx.channel().isActive()) {
-            ctx.writeAndFlush(b.build());
-        }
-    }
-
-    @Override
-    public void exceptionCaught(final ChannelHandlerContext ctx, final Throwable cause) {
-        log.error("Transport error: {}", cause.getMessage());
-        ctx.close();
+        ctx.writeAndFlush(b.build());
     }
 }
