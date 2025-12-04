@@ -64,8 +64,8 @@ public class RingBrokerBenchmark {
      *  - quorum      : 3-node, quorum=2, persistence role (durable path)
      *  - frontdoor   : 1 ingestion node forwarding to 2 persistence nodes (quorum=2, durable)
      */
-    @Param({"fast"})
-    private String profile;
+    //@Param({"fast"})
+    private String profile = "frontdoor";
 
     private byte[] payload;
     private byte[][] keys;
@@ -378,9 +378,8 @@ public class RingBrokerBenchmark {
                 case APPEND_BATCH -> ing.handleAppendBatchAsync(envelope.getAppendBatch());
                 case SEAL -> ing.handleSealAsync(envelope.getSeal());
                 case OPEN_EPOCH -> ing.handleOpenEpochAsync(envelope.getOpenEpoch());
-                case METADATA_UPDATE -> CompletableFuture.completedFuture(
-                        ing.handleMetadataUpdate(envelope.getMetadataUpdate())
-                );
+                case METADATA_UPDATE -> ing.handleMetadataUpdateAsync(envelope.getMetadataUpdate());
+
                 default -> CompletableFuture.failedFuture(
                         new UnsupportedOperationException("Unsupported kind " + envelope.getKindCase())
                 );

@@ -226,8 +226,17 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                 }
 
                 case METADATA_UPDATE -> {
-                    final BrokerApi.ReplicationAck ack = ingress.handleMetadataUpdate(env.getMetadataUpdate());
-                    writeReply(ctx, corrId, ack);
+                    ingress.handleMetadataUpdateAsync(env.getMetadataUpdate())
+                            .whenComplete((ack, ex) -> {
+                                if (ex != null) {
+                                    writeReply(ctx, corrId, BrokerApi.ReplicationAck.newBuilder()
+                                            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_UNKNOWN)
+                                            .setErrorMessage(String.valueOf(ex.getMessage()))
+                                            .build());
+                                } else {
+                                    writeReply(ctx, corrId, ack);
+                                }
+                            });
                 }
 
                 default -> log.warn("Unknown envelope kind: {}", env.getKindCase());

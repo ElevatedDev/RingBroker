@@ -17,6 +17,10 @@ import java.nio.MappedByteBuffer;
 import java.util.AbstractList;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -46,6 +50,21 @@ public final class Ingress {
 
     private volatile Future<?> writerTask;
     private volatile Throwable writerFailure;
+
+    // --- NEW: waiters completed by writer thread when HWM advances ---
+    private static final CompletableFuture<Void> DONE = CompletableFuture.completedFuture(null);
+
+    private static final class SeqWaiter {
+        final long seq;
+        final CompletableFuture<Void> future;
+        SeqWaiter(final long seq, final CompletableFuture<Void> future) {
+            this.seq = seq;
+            this.future = future;
+        }
+    }
+
+    // epoch -> queue of waiters in increasing seq order (producer is pipeline; consumer is writer thread)
+    private final ConcurrentMap<Long, ConcurrentLinkedQueue<SeqWaiter>> waitersByEpoch = new ConcurrentHashMap<>();
 
     private Ingress(final TopicRegistry registry,
                     final RingBuffer<byte[]> ring,
@@ -110,6 +129,70 @@ public final class Ingress {
         offerWithBackoff(rawPayload, epoch);
     }
 
+    /**
+     * NEW: completes when the epoch's high-watermark reaches at least seq (durable write done).
+     * This is completed by the writer thread, so the pipeline never blocks/spins/polls.
+     */
+    public CompletableFuture<Void> whenPersisted(final long epoch, final long seq) {
+        if (seq < 0) return DONE;
+
+        // fast-path: already persisted
+        try {
+            if (highWaterMark(epoch) >= seq) return DONE;
+        } catch (final Throwable t) {
+            // if epoch bootstrapping fails, surface errors via future
+            return CompletableFuture.failedFuture(t);
+        }
+
+        final CompletableFuture<Void> f = new CompletableFuture<>();
+        waitersByEpoch.computeIfAbsent(epoch, __ -> new ConcurrentLinkedQueue<>())
+                .offer(new SeqWaiter(seq, f));
+
+        // NOTE: if writer already advanced, it’ll complete it on the next write;
+        // but if the epoch goes idle, we avoid leaking by doing a final check:
+        try {
+            if (highWaterMark(epoch) >= seq) {
+                // best-effort complete; writer may still drain later
+                f.complete(null);
+            }
+        } catch (final Throwable t) {
+            f.completeExceptionally(t);
+        }
+
+        return f;
+    }
+
+    private void completeWaiters(final long epoch, final long hwm) {
+        final ConcurrentLinkedQueue<SeqWaiter> q = waitersByEpoch.get(epoch);
+        if (q == null) return;
+
+        for (;;) {
+            final SeqWaiter w = q.peek();
+            if (w == null) break;
+            if (w.seq <= hwm) {
+                q.poll();
+                w.future.complete(null);
+            } else {
+                break;
+            }
+        }
+
+        if (q.isEmpty()) {
+            waitersByEpoch.remove(epoch, q);
+        }
+    }
+
+    private void failAllWaiters(final Throwable t) {
+        for (final var e : waitersByEpoch.entrySet()) {
+            final ConcurrentLinkedQueue<SeqWaiter> q = e.getValue();
+            SeqWaiter w;
+            while ((w = q.poll()) != null) {
+                w.future.completeExceptionally(t);
+            }
+        }
+        waitersByEpoch.clear();
+    }
+
     private void offerWithBackoff(final byte[] payload, final long epoch) {
         int spins = 0;
 
@@ -146,7 +229,11 @@ public final class Ingress {
         view.setSize(count);
 
         segment.appendBatchNoOffsets(view, totalBytes);
-        virtualLog.forEpoch(epoch).setHighWaterMark(segment.getLastOffset());
+        final var ledger = virtualLog.forEpoch(epoch);
+        ledger.setHighWaterMark(segment.getLastOffset());
+
+        // complete any waiters that might be waiting on this epoch
+        completeWaiters(epoch, ledger.getHighWaterMark());
     }
 
     private int computeTotalBytes(final byte[][] payloads, final int count) {
@@ -236,6 +323,9 @@ public final class Ingress {
 
                 ledger.setHighWaterMark(segment.getLastOffset());
 
+                // NEW: complete durability waiters for this epoch up to new HWM
+                completeWaiters(batchEpoch, ledger.getHighWaterMark());
+
                 final long endSeq = ring.next(count);
                 ring.publishBatch(endSeq, count, batchBuffer);
 
@@ -243,9 +333,11 @@ public final class Ingress {
             }
         } catch (final IOException ioe) {
             writerFailure = ioe;
+            failAllWaiters(ioe);
             log.error("Ingress writer loop I/O error; terminating writer.", ioe);
         } catch (final Throwable t) {
             writerFailure = t;
+            failAllWaiters(t);
             log.error("Ingress writer loop fatal error; terminating writer.", t);
             throw (t instanceof RuntimeException) ? (RuntimeException) t : new RuntimeException(t);
         }
@@ -254,6 +346,7 @@ public final class Ingress {
     public void close() throws IOException {
         final Future<?> t = writerTask;
         if (t != null) t.cancel(true);
+        failAllWaiters(new IOException("Ingress closed"));
         if (this.virtualLog != null) this.virtualLog.close();
     }
 

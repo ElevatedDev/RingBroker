@@ -33,7 +33,6 @@ public final class ClusteredIngress {
 
     private static final CompletableFuture<Void> COMPLETED_FUTURE = CompletableFuture.completedFuture(null);
 
-    private static final long APPEND_WAIT_TIMEOUT_MS = 10_000L;
     private static final long PARK_NANOS = 1_000L;
 
     private static final long SEQ_ROLLOVER_THRESHOLD = (1L << 40) - 1_000_000L;
@@ -42,6 +41,10 @@ public final class ClusteredIngress {
     // batching in leader pipeline
     private static final int PIPELINE_MAX_DRAIN = 8_192;
     private static final int PIPELINE_QUEUE_FACTOR = 8;
+
+    // --- NEW: cap in-flight per partition so async doesn’t OOM ---
+    private static final int MAX_INFLIGHT_BATCHES_PER_PARTITION = 8_192;
+    private static final long MAX_INFLIGHT_BYTES_PER_PARTITION = 256L * 1024 * 1024; // 256MB
 
     private final BackfillPlanner backfillPlanner;
     private final int backfillBatchSize = 64;
@@ -59,6 +62,10 @@ public final class ClusteredIngress {
                 t.setDaemon(true);
                 return t;
             });
+
+    // NEW: offload quorum replication and any blocking waits away from the per-partition pipeline thread
+    private final ExecutorService ioExecutor =
+            Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("broker-io").factory());
 
     private final ConcurrentMap<Integer, PartitionEpochs> epochsByPartition = new ConcurrentHashMap<>();
     private final LogMetadataStore metadataStore;
@@ -353,22 +360,14 @@ public final class ClusteredIngress {
     }
 
     public CompletableFuture<BrokerApi.ReplicationAck> handleSealAndRollAsync(final BrokerApi.SealRequest s) {
-        // IMPORTANT: keep this serialized as well (can mutate epoch state)
         return pipeline(s.getPartitionId()).submitSeal(s);
     }
 
     /**
-     * Serialize metadata updates through the per-partition pipeline to avoid races with publish/replica appends.
+     * NEW: async, do NOT block Netty event loop threads.
      */
-    public BrokerApi.ReplicationAck handleMetadataUpdate(final BrokerApi.MetadataUpdate upd) {
-        try {
-            return pipeline(upd.getPartitionId()).submitMetadataUpdate(upd).get(5, TimeUnit.SECONDS);
-        } catch (final Exception e) {
-            return BrokerApi.ReplicationAck.newBuilder()
-                    .setStatus(BrokerApi.ReplicationAck.Status.ERROR_INVALID_REQUEST)
-                    .setErrorMessage("metadata update failed: " + e)
-                    .build();
-        }
+    public CompletableFuture<BrokerApi.ReplicationAck> handleMetadataUpdateAsync(final BrokerApi.MetadataUpdate upd) {
+        return pipeline(upd.getPartitionId()).submitMetadataUpdate(upd);
     }
 
     // ---------- Pipeline core ----------
@@ -396,6 +395,9 @@ public final class ClusteredIngress {
         private final MpscQueue queue;
         private final Thread thread;
 
+        // internal “never block” queue for commit completions (unbounded)
+        private final ConcurrentLinkedQueue<Object> internalQ = new ConcurrentLinkedQueue<>();
+
         // one-item defer slot for the (single) consumer thread (used by batching)
         private Object deferred;
 
@@ -409,6 +411,14 @@ public final class ClusteredIngress {
         // replication targets scratch (avoid per-publish allocation)
         private int[] replicaScratch = new int[Math.max(1, clusterSize)];
 
+        // NEW: in-flight tracking for correctness + backpressure
+        private final ArrayDeque<PendingBatch> pending = new ArrayDeque<>();
+        private int inflightBatches = 0;
+        private long inflightBytes = 0;
+
+        // NEW: ensure per-partition replication happens in-order even though it’s off-thread
+        private CompletableFuture<Void> replTail = COMPLETED_FUTURE;
+
         PartitionPipeline(final int pid, final int capacityPow2) {
             this.pid = pid;
             this.queue = new MpscQueue(capacityPow2);
@@ -420,6 +430,10 @@ public final class ClusteredIngress {
         void stop() { thread.interrupt(); }
 
         private Object pollOne() {
+            // Commit completions first (prevents starvation + drains in-flight)
+            final Object internal = internalQ.poll();
+            if (internal != null) return internal;
+
             final Object d = deferred;
             if (d != null) {
                 deferred = null;
@@ -515,19 +529,26 @@ public final class ClusteredIngress {
                         continue;
                     }
 
-                    // IMPORTANT: never let one bad message kill the whole pipeline
                     try {
-                        if (obj instanceof PublishTask first) {
+                        if (obj instanceof CommitDoneTask cd) {
+                            onCommitDone(cd);
+                        } else if (obj instanceof PublishTask first) {
                             drainAndProcessPublish(first);
                         } else if (obj instanceof ReplicaAppendTask ra) {
+                            // Don’t accept epoch mutation tasks while publishes are in-flight (preserves old semantics)
+                            if (!pending.isEmpty()) { deferOne(ra); continue; }
                             ra.future.complete(appendReplicaFast(ra.req));
                         } else if (obj instanceof ReplicaAppendBatchTask rb) {
+                            if (!pending.isEmpty()) { deferOne(rb); continue; }
                             rb.future.complete(appendReplicaBatchFast(rb.req));
                         } else if (obj instanceof SealTask st) {
+                            if (!pending.isEmpty()) { deferOne(st); continue; }
                             st.future.complete(handleSeal(st.req));
                         } else if (obj instanceof OpenEpochTask oe) {
+                            if (!pending.isEmpty()) { deferOne(oe); continue; }
                             oe.future.complete(handleOpenEpoch(oe.req));
                         } else if (obj instanceof MetadataUpdateTask mu) {
+                            if (!pending.isEmpty()) { deferOne(mu); continue; }
                             mu.future.complete(applyMetadataUpdate(mu.req));
                         } else {
                             // ignore unknown
@@ -538,9 +559,17 @@ public final class ClusteredIngress {
                     }
                 }
             } finally {
-                // On shutdown/crash: fail everything still queued so callers don’t hang forever
                 final Throwable stop = new IllegalStateException("Partition pipeline stopped: " + pid);
 
+                // Fail pending publish batches
+                PendingBatch pb;
+                while ((pb = pending.pollFirst()) != null) {
+                    pb.fail(stop);
+                }
+                inflightBatches = 0;
+                inflightBytes = 0;
+
+                // Drain queued tasks
                 final Object d = deferred;
                 if (d != null) completeTaskExceptionally(d, stop);
                 deferred = null;
@@ -548,6 +577,13 @@ public final class ClusteredIngress {
                 Object obj;
                 while ((obj = queue.poll()) != null) {
                     completeTaskExceptionally(obj, stop);
+                }
+
+                Object in;
+                while ((in = internalQ.poll()) != null) {
+                    if (in instanceof CommitDoneTask cd) {
+                        cd.pending.fail(stop);
+                    }
                 }
             }
         }
@@ -575,14 +611,48 @@ public final class ClusteredIngress {
             return BrokerApi.ReplicationAck.newBuilder().setStatus(BrokerApi.ReplicationAck.Status.SUCCESS).build();
         }
 
+        private void onCommitDone(final CommitDoneTask cd) {
+            // Remove pending batch (expected head, but keep it safe)
+            PendingBatch head = pending.peekFirst();
+            if (head == cd.pending) {
+                pending.pollFirst();
+            } else {
+                // rare: search
+                final Iterator<PendingBatch> it = pending.iterator();
+                while (it.hasNext()) {
+                    if (it.next() == cd.pending) {
+                        it.remove();
+                        break;
+                    }
+                }
+            }
+
+            inflightBatches = Math.max(0, inflightBatches - 1);
+            inflightBytes = Math.max(0L, inflightBytes - cd.pending.bytes);
+
+            if (cd.error == null) cd.pending.succeed();
+            else cd.pending.fail(unwrap(cd.error));
+        }
+
+        private Throwable unwrap(final Throwable t) {
+            if (t instanceof CompletionException ce && ce.getCause() != null) return ce.getCause();
+            if (t instanceof ExecutionException ee && ee.getCause() != null) return ee.getCause();
+            return t;
+        }
+
         private void drainAndProcessPublish(final PublishTask first) {
-            // Validate once
             if (!registry.contains(first.topic)) {
                 first.future.completeExceptionally(new IllegalArgumentException("Unknown topic: " + first.topic));
                 return;
             }
 
-            // group by (topic,retries) contiguous
+            // backpressure: refuse if too much inflight
+            if (inflightBatches >= MAX_INFLIGHT_BATCHES_PER_PARTITION || inflightBytes >= MAX_INFLIGHT_BYTES_PER_PARTITION) {
+                first.future.completeExceptionally(new RejectedExecutionException(
+                        "Backpressure: pid=" + pid + " inflightBatches=" + inflightBatches + " inflightBytes=" + inflightBytes));
+                return;
+            }
+
             int count = 0;
             final String topic = first.topic;
             final int retries = first.retries;
@@ -609,6 +679,21 @@ public final class ClusteredIngress {
                 count++;
             }
 
+            // compute bytes for inflight accounting
+            long batchBytes = 0;
+            for (int i = 0; i < count; i++) batchBytes += payloads[i].length;
+
+            // if adding this batch would exceed inflight caps, fail the whole batch immediately
+            if ((inflightBatches + 1) > MAX_INFLIGHT_BATCHES_PER_PARTITION ||
+                    (inflightBytes + batchBytes) > MAX_INFLIGHT_BYTES_PER_PARTITION) {
+                final Throwable bp = new RejectedExecutionException(
+                        "Backpressure: pid=" + pid + " inflightBatches=" + inflightBatches + " inflightBytes=" + inflightBytes);
+                for (int i = 0; i < count; i++) publishFuts[i].completeExceptionally(bp);
+                Arrays.fill(payloads, 0, count, null);
+                Arrays.fill(publishFuts, 0, count, null);
+                return;
+            }
+
             try {
                 refreshEpochFromMetadata(pid);
                 final PartitionEpochs pe = partitionEpochs(pid);
@@ -618,9 +703,8 @@ public final class ClusteredIngress {
                 // rollover check is based on projected reservation
                 final long cur = st.lastSeqReserved.get();
                 if (!st.sealed && (cur + count) >= SEQ_ROLLOVER_THRESHOLD) {
+                    // Rollover is rare; keep existing behavior (may block) to avoid correctness complexity.
                     maybeTriggerRollover(pid, pe, st, cur + count);
-
-                    // After rollover, we MUST re-load active epoch/state before reserving.
                     refreshEpochFromMetadata(pid);
                     st = pe.active;
                     if (st == null) throw new IllegalStateException("No active epoch state after rollover");
@@ -632,7 +716,7 @@ public final class ClusteredIngress {
 
                 final long epoch = st.epochId;
 
-                // reserve range atomically (pipeline is serialized, but this avoids torn logic and is safer)
+                // reserve range atomically
                 final long prev = st.lastSeqReserved.getAndAdd(count);
                 final long baseSeq = prev + 1;
                 final long lastSeq = prev + count;
@@ -650,11 +734,7 @@ public final class ClusteredIngress {
                     ing.publishForEpoch(epoch, payloads[i]);
                 }
 
-                if (!awaitPersisted(ing, epoch, lastSeq, APPEND_WAIT_TIMEOUT_MS)) {
-                    throw new RuntimeException("timeout waiting for durable seq=" + lastSeq);
-                }
-
-                // replicate as a batch
+                // figure replication targets
                 final EpochPlacement placementCache = pe.activePlacement;
                 final int[] placementArr = placementCache != null
                         ? placementCache.getStorageNodesArray()
@@ -673,6 +753,22 @@ public final class ClusteredIngress {
                     if (id != myNodeId) replicaScratch[rc++] = id;
                 }
 
+                // copy futures for this batch into a stable array (scratch will be cleared)
+                @SuppressWarnings("unchecked")
+                final CompletableFuture<Void>[] futs = (CompletableFuture<Void>[]) new CompletableFuture<?>[count];
+                System.arraycopy(publishFuts, 0, futs, 0, count);
+
+                final PendingBatch pb = new PendingBatch(epoch, lastSeq, batchBytes, futs);
+                pending.addLast(pb);
+                inflightBatches++;
+                inflightBytes += batchBytes;
+
+                // Durability future (completed by writer thread)
+                final CompletableFuture<Void> durableF = ing.whenPersisted(epoch, lastSeq);
+
+                // Replication is store-then-forward (preserves original behavior):
+                // replicate starts only after durable completes, and is ordered by replTail.
+                final CompletableFuture<Void> commitF;
                 if (rc > 0) {
                     final BrokerApi.AppendBatchRequest.Builder bb = BrokerApi.AppendBatchRequest.newBuilder()
                             .setPartitionId(pid)
@@ -690,20 +786,66 @@ public final class ClusteredIngress {
                             .setAppendBatch(bb.build())
                             .build();
 
-                    // HOT PATH OPT: no List boxing/allocation
-                    replicator.replicate(env, replicaScratch, rc, quorum);
+                    final int[] targetsCopy = Arrays.copyOf(replicaScratch, rc);
+                    final int quorumCopy = quorum;
+
+                    final CompletableFuture<Void> replF = durableF.thenCompose(__ -> replicateOrderedAsync(env, targetsCopy, quorumCopy));
+                    commitF = replF;
+                } else {
+                    commitF = durableF; // local-only
                 }
 
-                for (int i = 0; i < count; i++) publishFuts[i].complete(null);
+                // completion MUST NOT block producer threads, so enqueue into internalQ
+                commitF.whenComplete((v, err) -> internalQ.offer(new CommitDoneTask(pb, err)));
 
             } catch (final Throwable t) {
-                for (int i = 0; i < count; i++) {
-                    publishFuts[i].completeExceptionally(t);
-                }
+                for (int i = 0; i < count; i++) publishFuts[i].completeExceptionally(t);
             } finally {
                 Arrays.fill(payloads, 0, count, null);
                 Arrays.fill(publishFuts, 0, count, null);
             }
+        }
+
+        private CompletableFuture<Void> replicateOrderedAsync(final BrokerApi.Envelope env,
+                                                              final int[] replicas,
+                                                              final int quorum) {
+            // Chain in-order per partition. Ensure chain continues even if this batch fails.
+            final CompletableFuture<Void> run =
+                    replTail.thenRunAsync(() -> {
+                        try {
+                            replicator.replicate(env, replicas, replicas.length, quorum);
+                        } catch (final Throwable t) {
+                            throw new CompletionException(t);
+                        }
+                    }, ioExecutor);
+
+            // keep the ordering chain alive even on failure
+            replTail = run.handle((v, e) -> null);
+
+            return run;
+        }
+    }
+
+    // ---- NEW: pending publish batch ----
+    private static final class PendingBatch {
+        final long epoch;
+        final long lastSeq;
+        final long bytes;
+        final CompletableFuture<Void>[] futures;
+
+        PendingBatch(final long epoch, final long lastSeq, final long bytes, final CompletableFuture<Void>[] futures) {
+            this.epoch = epoch;
+            this.lastSeq = lastSeq;
+            this.bytes = bytes;
+            this.futures = futures;
+        }
+
+        void succeed() {
+            for (final CompletableFuture<Void> f : futures) f.complete(null);
+        }
+
+        void fail(final Throwable t) {
+            for (final CompletableFuture<Void> f : futures) f.completeExceptionally(t);
         }
     }
 
@@ -714,6 +856,7 @@ public final class ClusteredIngress {
     private record SealTask(BrokerApi.SealRequest req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record OpenEpochTask(BrokerApi.OpenEpochRequest req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record MetadataUpdateTask(BrokerApi.MetadataUpdate req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
+    private record CommitDoneTask(PendingBatch pending, Throwable error) {}
 
     /**
      * Low-allocation MPSC ring queue.
@@ -927,7 +1070,6 @@ public final class ClusteredIngress {
         // overlap is allowed: skip already-present prefix
         final int startIdx = (int) (expected - baseSeq); // >= 0 here
         if (startIdx >= n) {
-            // should be impossible because lastSeq > cur, but keep it safe
             return BrokerApi.ReplicationAck.newBuilder()
                     .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
                     .setOffset(Lsn.encode(epoch, cur))
@@ -1250,7 +1392,6 @@ public final class ClusteredIngress {
         final int[] count = new int[]{0};
 
         ing.fetchEpoch(epoch, offset, backfillBatchSize, (off, segBuf, payloadPos, payloadLen) -> {
-            // FIX: include 4-byte header in maxBytes accounting
             if (written[0] + payloadLen + Integer.BYTES > maxBytes) return;
             final byte[] buf = new byte[payloadLen + Integer.BYTES];
             buf[0] = (byte) (payloadLen);
@@ -1284,24 +1425,6 @@ public final class ClusteredIngress {
         return reply.build();
     }
 
-    private boolean awaitPersisted(final Ingress ing, final long epoch, final long targetSeq, final long timeoutMs) {
-        if (targetSeq < 0) return true;
-
-        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        long spins = 0;
-
-        while (System.nanoTime() < deadline) {
-            if (ing.highWaterMark(epoch) >= targetSeq) return true;
-            if (spins < 1_000) {
-                spins++;
-                Thread.onSpinWait();
-            } else {
-                LockSupport.parkNanos(PARK_NANOS);
-            }
-        }
-        return ing.highWaterMark(epoch) >= targetSeq;
-    }
-
     private Ingress getOrCreateIngress(final int partitionId, final long epoch) {
         final Ingress existing = ingressMap.get(partitionId);
         if (existing != null && existing.getActiveEpoch() == epoch) return existing;
@@ -1320,7 +1443,7 @@ public final class ClusteredIngress {
 
                 final io.ringbroker.ledger.orchestrator.VirtualLog vLog =
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
-                vLog.discoverOnDisk(); // IMPORTANT: required for lazily created replicas
+                vLog.discoverOnDisk();
 
                 final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable);
 
@@ -1338,7 +1461,6 @@ public final class ClusteredIngress {
                 final EpochPlacement placement = new EpochPlacement(epoch, placementNodes, replicator.getAckQuorum());
                 metadataStore.bootstrapIfAbsent(pid, placement, Math.max(0, last + 1));
 
-                // ensure pipeline exists once ingress exists
                 pipeline(pid);
 
                 return ingress;
@@ -1391,13 +1513,8 @@ public final class ClusteredIngress {
     }
 
     /**
-     * Trigger rollover when the projected last sequence would exceed threshold.
-     *
-     * IMPORTANT: This method performs:
-     *  - local seal + fence persistence,
-     *  - replication of a sealOnly=true request,
-     *  - replication of an explicit OpenEpoch request (with a leader-chosen tieBreaker),
-     *  - metadataStore update and local state advance.
+     * Kept as-is (rare path). If you want this fully non-blocking too, say so and we’ll make
+     * it a state machine + ordered control-plane replication.
      */
     private void maybeTriggerRollover(final int partitionId, final PartitionEpochs pe, final EpochState st, final long projectedLastSeq) {
         if (st.sealed) return;
@@ -1428,7 +1545,6 @@ public final class ClusteredIngress {
             for (final int id : placementArr) if (id != myNodeId) replicas.add(id);
             final int quorum = cfg.activeEpoch().placement().getAckQuorum();
 
-            // replicate a SEAL-ONLY to replicas (do NOT ask replicas to locally invent tieBreakers)
             if (!replicas.isEmpty()) {
                 final BrokerApi.Envelope sealEnv = BrokerApi.Envelope.newBuilder()
                         .setCorrelationId(System.nanoTime())
@@ -1441,7 +1557,6 @@ public final class ClusteredIngress {
                 replicator.replicate(sealEnv, replicas, quorum);
             }
 
-            // leader chooses tieBreaker + opens next epoch explicitly
             final long newEpochId = st.epochId + 1;
             final long nextTieBreaker = computeTieBreaker(partitionId);
 
@@ -1507,6 +1622,7 @@ public final class ClusteredIngress {
 
         backfillExecutor.shutdownNow();
         adminExecutor.shutdownNow();
+        ioExecutor.shutdownNow();
 
         try { replicator.shutdown(); } catch (final Exception ignored) {}
 
