@@ -7,6 +7,9 @@ import io.ringbroker.cluster.client.impl.NettyClusterClient;
 import io.ringbroker.cluster.membership.gossip.impl.SwimGossipService;
 import io.ringbroker.cluster.membership.replicator.AdaptiveReplicator;
 import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
+import io.ringbroker.cluster.metadata.BroadcastingLogMetadataStore;
+import io.ringbroker.cluster.metadata.JournaledLogMetadataStore;
+import io.ringbroker.cluster.metadata.LogMetadataStore;
 import io.ringbroker.cluster.partitioner.Partitioner;
 import io.ringbroker.cluster.partitioner.impl.RoundRobinPartitioner;
 import io.ringbroker.config.impl.BrokerConfig;
@@ -124,6 +127,13 @@ public class Application {
                 clusterNodes,
                 cfg.getReplicationTimeoutMillis());
 
+        final LogMetadataStore metadataStore = new BroadcastingLogMetadataStore(
+                new JournaledLogMetadataStore(dataDir.resolve("metadata")),
+                clusterNodes,
+                cfg.getNodeId(),
+                () -> gossip.view().keySet()
+        );
+
         /* Create the clustered ingress */
         final ClusteredIngress ingress = ClusteredIngress.create(
                 registry,
@@ -141,7 +151,8 @@ public class Application {
                 store,
                 cfg.getBrokerRole(),
                 resolver,
-                replicator
+                replicator,
+                metadataStore
         );
 
         /* Start gRPC transport */
@@ -161,7 +172,7 @@ public class Application {
                 store.close();
                 gossip.close();
                 log.info("Shutdown complete.");
-            } catch (Exception e) {
+            } catch (final Exception e) {
                 log.error("Error during shutdown", e);
             }
         }));
