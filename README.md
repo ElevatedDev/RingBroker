@@ -19,7 +19,7 @@ append-only storage — plus **cluster semantics** for epoch-based placement, re
   Benchmarks observed locally (Dell Precision 3590):  
   - **Ingestion path:** ~**15M msg/s** (JMH)  
   - **Persistence path:** ~**6M msg/s** (JMH)
-  - **Frontdoor (INGESTION->PERSISTENCE Quorum e2e):~**2.7M msgs/s**
+  - **Frontdoor (INGESTION->PERSISTENCE Quorum e2e):** ~**2.7M msgs/s**
 
 - **Clustered by design (no Raft)**
   - **Epoch-based logs** per partition: `epoch-XXXXXXXX` directories under each partition
@@ -385,3 +385,4 @@ The included `InMemoryOffsetStore` provides:
 ```
 
 ---
+
