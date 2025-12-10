@@ -8,7 +8,7 @@ plugins {
 }
 
 group = 'io.ringbroker'
-version = '0.1.0-SNAPSHOT'
+version = '0.0.1-BETA'
 
 /* ----------  JVM  ---------- */
 java {
@@ -22,11 +22,6 @@ java {
 // Ensure UTF-8 source encoding (avoids Windows-1252 build failures).
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
-}
-
-application {
-    // for Gradle 7.1+ use:
-    mainClass.set("io.ringbroker.BrokerMain")
 }
 
 /* ----------  Repos & Versions ---------- */
@@ -43,6 +38,7 @@ ext {
     jupiterVersion = '5.12.2'
     junitPlatformVersion = '1.12.2'  // Added matching platform version
     annotationVersion = '1.3.2'
+    testcontainersVersion = '1.20.3'
 }
 
 /* ----------  Dependencies ---------- */
@@ -73,6 +69,9 @@ dependencies {
     // JUnit 5
     testImplementation "org.junit.jupiter:junit-jupiter:$jupiterVersion"
     testImplementation "org.junit.platform:junit-platform-launcher:$junitPlatformVersion"
+    testImplementation platform("org.testcontainers:testcontainers-bom:$testcontainersVersion")
+    testImplementation "org.testcontainers:junit-jupiter"
+    testImplementation "org.testcontainers:testcontainers"
 
     compileOnly "javax.annotation:javax.annotation-api:$annotationVersion"
 
@@ -96,13 +95,15 @@ protobuf {
 
 /* ----------  Application entry‑point ---------- */
 application {
-    mainClass = 'io.ringbroker.BrokerMain'
+    mainClass = 'io.ringbroker.Application'
 }
 
 /* ----------  Tests ---------- */
 test {
     useJUnitPlatform()
     jvmArgs '--enable-preview'
+    // Fat jar is required for the Testcontainers-based cluster integration test.
+    dependsOn tasks.named('shadowJar')
 }
 
 /* ----------  Jar manifest ---------- */
@@ -111,7 +112,7 @@ jar {
         attributes(
                 'Implementation-Title': 'RingBroker',
                 'Implementation-Version': version,
-                'Main-Class': application.mainClass
+                'Main-Class': application.mainClass.get()
         )
     }
 }
