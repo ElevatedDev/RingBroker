@@ -3,6 +3,7 @@ package io.ringbroker.transport.impl;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.protobuf.ProtobufDecoder;
@@ -18,6 +19,7 @@ import io.ringbroker.cluster.membership.resolver.ReplicaSetResolver;
 import io.ringbroker.cluster.metadata.JournaledLogMetadataStore;
 import io.ringbroker.core.wait.Blocking;
 import io.ringbroker.offset.InMemoryOffsetStore;
+import io.ringbroker.offset.OffsetStore;
 import io.ringbroker.registry.TopicRegistry;
 import io.ringbroker.transport.type.NettyTransport;
 import org.junit.jupiter.api.AfterEach;
@@ -28,10 +30,12 @@ import org.junit.jupiter.api.io.TempDir;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Lightweight Netty roundtrip (no containers) to validate request/response wiring.
@@ -88,6 +92,49 @@ final class NettyServerRequestHandlerTest {
     }
 
     @Test
+    void commitAndCommittedRoundTripOnHandler() {
+        final CapturingOffsetStore store = new CapturingOffsetStore();
+        final EmbeddedChannel ch = new EmbeddedChannel(new NettyServerRequestHandler(null, store));
+        try {
+            final BrokerApi.Envelope commit = BrokerApi.Envelope.newBuilder()
+                    .setCorrelationId(1)
+                    .setCommit(BrokerApi.CommitRequest.newBuilder()
+                            .setTopic("t")
+                            .setGroup("g")
+                            .setPartition(0)
+                            .setOffset(42L)
+                            .build())
+                    .build();
+            ch.writeInbound(commit);
+            ch.runPendingTasks();
+            ch.flushOutbound();
+
+            final BrokerApi.Envelope commitAck = ch.readOutbound();
+            assertTrue(commitAck != null && commitAck.hasCommitAck(), "commit ack should be returned");
+            assertTrue(commitAck.getCommitAck().getSuccess(), "commit ack should mark success");
+
+            final BrokerApi.Envelope committed = BrokerApi.Envelope.newBuilder()
+                    .setCorrelationId(2)
+                    .setCommitted(BrokerApi.CommittedRequest.newBuilder()
+                            .setTopic("t")
+                            .setGroup("g")
+                            .setPartition(0)
+                            .build())
+                    .build();
+            ch.writeInbound(committed);
+            ch.runPendingTasks();
+            ch.flushOutbound();
+
+            final BrokerApi.Envelope committedReply = ch.readOutbound();
+            assertTrue(committedReply != null && committedReply.hasCommittedReply(), "committed reply should be returned");
+            assertEquals(42L, committedReply.getCommittedReply().getOffset());
+        } finally {
+            ch.finishAndReleaseAll();
+            ch.close();
+        }
+    }
+
+    @Test
     void publishAndFetchRoundTrip() throws Exception {
         final int port = transport.getPort();
         final NioEventLoopGroup group = new NioEventLoopGroup(1);
@@ -121,6 +168,24 @@ final class NettyServerRequestHandlerTest {
             assertEquals("hello", reply.getFetchReply().getMessages(0).getPayload().toStringUtf8());
         } finally {
             group.shutdownGracefully().syncUninterruptibly();
+        }
+    }
+
+    private static final class CapturingOffsetStore implements OffsetStore {
+        private final Map<String, Long> offsets = new ConcurrentHashMap<>();
+
+        @Override
+        public void commit(final String topic, final String group, final int partition, final long offset) {
+            offsets.put(key(topic, group, partition), offset);
+        }
+
+        @Override
+        public long fetch(final String topic, final String group, final int partition) {
+            return offsets.getOrDefault(key(topic, group, partition), 0L);
+        }
+
+        private String key(final String topic, final String group, final int partition) {
+            return topic + "|" + group + "|" + partition;
         }
     }
 
