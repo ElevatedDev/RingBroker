@@ -32,7 +32,11 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
             switch (env.getKindCase()) {
                 case PUBLISH -> {
                     final var m = env.getPublish();
-                    ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
+                    final int partitionId = m.getPartitionId();
+                    final var fut = (partitionId != 0)
+                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
+                            : ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray());
+                    fut
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
                                     log.error("Publish failed (corrId: {}): {}", corrId, ex.getMessage());
@@ -51,7 +55,10 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                     final List<CompletableFuture<Void>> futures = new ArrayList<>(list.size());
 
                     for (final var m : list) {
-                        futures.add(ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray()));
+                        final int partitionId = m.getPartitionId();
+                        futures.add((partitionId != 0)
+                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
+                                : ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray()));
                     }
 
                     CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))

@@ -319,6 +319,31 @@ public final class ClusteredIngress {
         return publish(defaultCorrelationId, topic, key, 0, payload);
     }
 
+    /**
+     * Publish to a specific partition (used by internal forwarding to preserve routing).
+     */
+    public CompletableFuture<Void> publishToPartition(final long correlationId,
+                                                      final String topic,
+                                                      final int partitionId,
+                                                      final byte[] key,
+                                                      final int retries,
+                                                      final byte[] payload) {
+        final int ownerNode = Math.floorMod(partitionId, clusterSize);
+
+        if (ownerNode == myNodeId) {
+            if (idempotentMode && shouldDropDuplicate(partitionId, key, payload)) return COMPLETED_FUTURE;
+            return pipeline(partitionId).submitPublish(correlationId, topic, retries, payload);
+        }
+
+        final RemoteBrokerClient ownerClient = clusterNodes.get(ownerNode);
+        if (ownerClient == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("No client for owner " + ownerNode));
+        }
+
+        final BrokerApi.Envelope env = buildPublishEnvelope(correlationId, topic, key, payload, partitionId, retries);
+        return forwardWithRetry(ownerClient, env, partitionId, 0);
+    }
+
     public void subscribeTopic(final String topic, final String group, final BiConsumer<Long, byte[]> handler) {
         if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
 
