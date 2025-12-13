@@ -28,7 +28,7 @@ tasks.withType(JavaCompile).configureEach {
 repositories { mavenCentral() }
 
 ext {
-    grpcVersion = '1.72.0'
+    grpcVersion = '1.77.0'
     protobufVersion = '3.25.7'
     jacksonVersion = '2.19.0'
     picocliVersion = '4.7.7'
