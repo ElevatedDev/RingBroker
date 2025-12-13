@@ -14,18 +14,25 @@ import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.ingress.ClusteredIngress;
 import io.ringbroker.offset.OffsetStore;
 import io.ringbroker.transport.impl.NettyServerRequestHandler;
-import lombok.RequiredArgsConstructor;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+import java.net.InetSocketAddress;
+
 @Slf4j
-@RequiredArgsConstructor
 public class NettyTransport {
-    private final int port;
+    @Getter private int port;
     private final ClusteredIngress ingress;
     private final OffsetStore offsetStore;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
+
+    public NettyTransport(final int port, final ClusteredIngress ingress, final OffsetStore offsetStore) {
+        this.port = port;
+        this.ingress = ingress;
+        this.offsetStore = offsetStore;
+    }
 
     public void start() throws InterruptedException {
         final IoHandlerFactory factory = NioIoHandler.newFactory();
@@ -72,6 +79,7 @@ public class NettyTransport {
                 .childOption(ChannelOption.SO_KEEPALIVE, true);
 
         final ChannelFuture f = b.bind(port).sync();
+        port = ((InetSocketAddress) f.channel().localAddress()).getPort();
         log.info("Netty Transport started on port {}", port);
 
         f.channel().closeFuture().addListener(cf -> stop());
