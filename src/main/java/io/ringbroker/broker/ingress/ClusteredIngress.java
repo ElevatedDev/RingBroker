@@ -1180,49 +1180,76 @@ public final class ClusteredIngress {
 
             for (final EpochMetadata em : cfg.epochs()) {
                 final long epoch = em.epoch();
+                final long sealedEnd = em.endSeq();
                 if (!em.isSealed()) continue;
                 if (!em.placement().getStorageNodes().contains(myNodeId)) continue;
-                if (ing.getVirtualLog().hasEpoch(epoch)) continue;
+
+                final boolean epochExists = ing.getVirtualLog().hasEpoch(epoch);
+                final long localHwm = epochExists ? ing.getVirtualLog().forEpoch(epoch).getHighWaterMark() : -1L;
+                if (localHwm >= sealedEnd) {
+                    backfillPlanner.markPresent(pid, epoch);
+                    continue;
+                }
+
+                long nextOffset = Math.max(0L, localHwm + 1);
+                boolean completed = false;
 
                 for (final int target : em.placement().getStorageNodesArray()) {
                     if (target == myNodeId) continue;
                     final RemoteBrokerClient client = clusterNodes.get(target);
                     if (client == null) continue;
                     try {
-                        final BrokerApi.Envelope req = BrokerApi.Envelope.newBuilder()
-                                .setBackfill(BrokerApi.BackfillRequest.newBuilder()
-                                        .setPartitionId(pid)
-                                        .setEpoch(epoch)
-                                        .setOffset(0)
-                                        .setMaxBytes(256 * 1024)
-                                        .build())
-                                .build();
-                        final BrokerApi.BackfillReply reply = client.sendBackfill(req).get(5, TimeUnit.SECONDS);
-                        if (!reply.getRedirectNodesList().isEmpty()) continue;
-                        final byte[] payload = reply.getPayload().toByteArray();
-                        if (payload.length == 0) continue;
+                        while (true) {
+                            if (nextOffset > sealedEnd) {
+                                completed = true;
+                                break;
+                            }
+                            final BrokerApi.Envelope req = BrokerApi.Envelope.newBuilder()
+                                    .setBackfill(BrokerApi.BackfillRequest.newBuilder()
+                                            .setPartitionId(pid)
+                                            .setEpoch(epoch)
+                                            .setOffset(nextOffset)
+                                            .setMaxBytes(256 * 1024)
+                                            .build())
+                                    .build();
+                            final BrokerApi.BackfillReply reply = client.sendBackfill(req).get(5, TimeUnit.SECONDS);
+                            if (!reply.getRedirectNodesList().isEmpty()) break;
+                            final byte[] payload = reply.getPayload().toByteArray();
+                            if (payload.length == 0) {
+                                if (reply.getEndOfEpoch()) completed = true;
+                                break;
+                            }
 
-                        int pos = 0;
-                        int count = 0;
-                        final byte[][] batch = new byte[backfillBatchSize][];
-                        while (pos + Integer.BYTES <= payload.length && count < backfillBatchSize) {
-                            final int len = (payload[pos] & 0xFF) |
-                                    ((payload[pos + 1] & 0xFF) << 8) |
-                                    ((payload[pos + 2] & 0xFF) << 16) |
-                                    ((payload[pos + 3] & 0xFF) << 24);
-                            pos += Integer.BYTES;
-                            if (pos + len > payload.length) break;
-                            final byte[] rec = new byte[len];
-                            System.arraycopy(payload, pos, rec, 0, len);
-                            batch[count++] = rec;
-                            pos += len;
-                        }
-                        if (count > 0) {
+                            int pos = 0;
+                            int count = 0;
+                            final byte[][] batch = new byte[backfillBatchSize][];
+                            while (pos + Integer.BYTES <= payload.length && count < backfillBatchSize) {
+                                final int len = (payload[pos] & 0xFF) |
+                                        ((payload[pos + 1] & 0xFF) << 8) |
+                                        ((payload[pos + 2] & 0xFF) << 16) |
+                                        ((payload[pos + 3] & 0xFF) << 24);
+                                pos += Integer.BYTES;
+                                if (pos + len > payload.length) break;
+                                final byte[] rec = new byte[len];
+                                System.arraycopy(payload, pos, rec, 0, len);
+                                batch[count++] = rec;
+                                pos += len;
+                            }
+                            if (count == 0) break;
+
                             ing.appendBackfillBatch(epoch, batch, count);
-                            backfillPlanner.markPresent(pid, epoch);
+                            nextOffset += count;
+
+                            if (reply.getEndOfEpoch()) {
+                                completed = true;
+                                break;
+                            }
                         }
-                        if (reply.getEndOfEpoch()) break;
                     } catch (final Exception ignored) {
+                    }
+                    if (completed) {
+                        backfillPlanner.markPresent(pid, epoch);
+                        break;
                     }
                 }
             }
