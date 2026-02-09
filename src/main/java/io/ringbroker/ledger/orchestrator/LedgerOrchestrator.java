@@ -275,23 +275,35 @@ public final class LedgerOrchestrator implements AutoCloseable {
     }
 
     private LedgerSegment rollToNextSegment() throws IOException {
+        final LedgerSegment previousActive = activeSegment.get();
+        final long baseOffset = (previousActive != null) ? previousActive.getLastOffset() : this.highWaterMark;
+
         LedgerSegment nextActiveSegment = null;
         if (nextSegmentFuture != null && nextSegmentFuture.isDone()) {
             try {
-                nextActiveSegment = nextSegmentFuture.get();
+                final LedgerSegment candidate = nextSegmentFuture.get();
+                if (candidate != null && candidate.getLastOffset() == baseOffset) {
+                    nextActiveSegment = candidate;
+                } else if (candidate != null) {
+                    discardPreallocatedSegment(candidate);
+                }
             } catch (final Exception ignored) {
             }
         }
 
         if (nextActiveSegment == null) {
-            final LedgerSegment previousActive = activeSegment.get();
-            final long baseOffset = (previousActive != null) ? previousActive.getLastOffset() : this.highWaterMark;
             nextActiveSegment = createNewSegment(baseOffset);
         }
 
         // Once used (or ignored), clear the future reference.
         nextSegmentFuture = null;
         return nextActiveSegment;
+    }
+
+    private void discardPreallocatedSegment(final LedgerSegment segment) {
+        try { segment.close(); } catch (final Exception ignored) {}
+        try { Files.deleteIfExists(segment.getFile()); } catch (final Exception ignored) {}
+        try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(segment.getFile())); } catch (final Exception ignored) {}
     }
 
     private void preAllocateNextSegment() {

@@ -337,6 +337,82 @@ public final class LedgerSegment implements AutoCloseable {
 
     // ---- Append APIs ----
 
+    public int appendFramedBatchNoOffsets(final ByteBuffer framedPayloads, final int maxMessages) throws IOException {
+        if (maxMessages <= 0) return 0;
+        if (framedPayloads == null || framedPayloads.remaining() < Integer.BYTES) return 0;
+
+        final int remainingCapacity = capacity - buf.position();
+        if (remainingCapacity < MIN_RECORD_SIZE) return 0;
+
+        final ByteBuffer scan = framedPayloads.duplicate();
+        int count = 0;
+        int requiredBytes = 0;
+
+        while (count < maxMessages && scan.remaining() >= Integer.BYTES) {
+            final int len = readLittleEndianInt(scan);
+            if (len < 0 || scan.remaining() < len) break;
+
+            final int recordBytes = Math.addExact(MIN_RECORD_OVERHEAD, len);
+            if (recordBytes > (remainingCapacity - requiredBytes)) break;
+
+            requiredBytes = Math.addExact(requiredBytes, recordBytes);
+            scan.position(scan.position() + len);
+            count++;
+        }
+
+        if (count == 0) return 0;
+
+        if (buf.position() + requiredBytes > capacity) {
+            throw new IOException("Segment full for framed batch: " + file);
+        }
+
+        long curr = lastOffset;
+        boolean firstSet = (firstOffset != FIRST_OFFSET_UNSET);
+        final boolean doCrc = !skipRecordCrc;
+        final int baseIdx = countAcquire();
+
+        for (int i = 0; i < count; i++) {
+            final int len = readLittleEndianInt(framedPayloads);
+            final int payloadPos = framedPayloads.position();
+
+            final int ridx = baseIdx + i;
+            if ((ridx & HINT_MASK) == 0) {
+                hintPositions[ridx >>> HINT_SHIFT] = buf.position();
+            }
+
+            buf.putInt(len);
+
+            final ByteBuffer payload = framedPayloads.duplicate();
+            payload.position(payloadPos);
+            payload.limit(payloadPos + len);
+
+            if (doCrc) {
+                recordCrc.reset();
+                recordCrc.update(payload.duplicate());
+                buf.putInt((int) recordCrc.getValue());
+            } else {
+                buf.putInt(0);
+            }
+
+            buf.put(payload);
+            framedPayloads.position(payloadPos + len);
+
+            curr++;
+            if (!firstSet) {
+                UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET, curr);
+                firstOffset = curr;
+                firstSet = true;
+            }
+        }
+
+        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET, curr);
+        lastOffset = curr;
+
+        COUNT_HANDLE.setRelease(this, baseIdx + count);
+        updateHeaderOnDisk();
+        return count;
+    }
+
     public void appendBatchNoOffsets(final List<byte[]> msgs, final int totalBytes) throws IOException {
         if (msgs.isEmpty()) return;
 
@@ -456,6 +532,14 @@ public final class LedgerSegment implements AutoCloseable {
         final long[] offs = appendBatch(msgs, totalBytes);
         if (!msgs.isEmpty()) buf.force();
         return offs;
+    }
+
+    private static int readLittleEndianInt(final ByteBuffer src) {
+        final int b0 = src.get() & 0xFF;
+        final int b1 = src.get() & 0xFF;
+        final int b2 = src.get() & 0xFF;
+        final int b3 = src.get() & 0xFF;
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
     }
 
     private void updateHeaderOnDisk() {

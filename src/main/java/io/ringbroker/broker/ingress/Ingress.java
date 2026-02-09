@@ -13,6 +13,7 @@ import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.util.AbstractList;
 import java.util.Arrays;
@@ -50,6 +51,12 @@ public final class Ingress {
 
     private volatile Future<?> writerTask;
     private volatile Throwable writerFailure;
+
+    // Mapping between ring cursor space and durable ledger sequence space.
+    // Updated by writer thread after each published batch.
+    private volatile long ringSeqDelta = Long.MIN_VALUE; // ledgerSeq = ringSeq + ringSeqDelta
+    private volatile long lastPublishedRingSeq = -1L;
+    private volatile long lastPublishedLedgerSeq = -1L;
 
     // --- NEW: waiters completed by writer thread when HWM advances ---
     private static final CompletableFuture<Void> DONE = CompletableFuture.completedFuture(null);
@@ -136,7 +143,6 @@ public final class Ingress {
     public CompletableFuture<Void> whenPersisted(final long epoch, final long seq) {
         if (seq < 0) return DONE;
 
-        // fast-path: already persisted
         try {
             if (highWaterMark(epoch) >= seq) return DONE;
         } catch (final Throwable t) {
@@ -149,7 +155,6 @@ public final class Ingress {
                 .offer(new SeqWaiter(seq, f));
 
         // NOTE: if writer already advanced, it’ll complete it on the next write;
-        // but if the epoch goes idle, we avoid leaking by doing a final check:
         try {
             if (highWaterMark(epoch) >= seq) {
                 // best-effort complete; writer may still drain later
@@ -236,6 +241,42 @@ public final class Ingress {
         completeWaiters(epoch, ledger.getHighWaterMark());
     }
 
+    public int appendBackfillEncodedBatch(final long epoch, final ByteBuffer framedPayloads, final int maxMessages) throws IOException {
+        Objects.requireNonNull(framedPayloads, "framedPayloads");
+        if (maxMessages <= 0 || framedPayloads.remaining() < Integer.BYTES) return 0;
+
+        final var ledger = virtualLog.forEpoch(epoch);
+        int appended = 0;
+        long lastOffset = -1L;
+
+        while (appended < maxMessages && framedPayloads.remaining() >= Integer.BYTES) {
+            final int len = peekLittleEndianInt(framedPayloads);
+            if (len < 0) break;
+            final int frameBytes;
+            try {
+                frameBytes = Math.addExact(Integer.BYTES, len);
+            } catch (final ArithmeticException ignored) {
+                break;
+            }
+            if (framedPayloads.remaining() < frameBytes) break;
+
+            final LedgerSegment segment = ledger.writable(len);
+            final int written = segment.appendFramedBatchNoOffsets(framedPayloads, maxMessages - appended);
+            if (written <= 0) {
+                throw new IOException("Failed to append framed backfill payload for epoch " + epoch);
+            }
+            appended += written;
+            lastOffset = segment.getLastOffset();
+        }
+
+        if (appended > 0) {
+            ledger.setHighWaterMark(lastOffset);
+            completeWaiters(epoch, ledger.getHighWaterMark());
+        }
+
+        return appended;
+    }
+
     private int computeTotalBytes(final byte[][] payloads, final int count) {
         int total = 0;
         for (int i = 0; i < count; i++) {
@@ -243,6 +284,15 @@ public final class Ingress {
             total = Math.addExact(total, Integer.BYTES + Integer.BYTES + len);
         }
         return total;
+    }
+
+    private static int peekLittleEndianInt(final ByteBuffer src) {
+        final int pos = src.position();
+        final int b0 = src.get(pos) & 0xFF;
+        final int b1 = src.get(pos + 1) & 0xFF;
+        final int b2 = src.get(pos + 2) & 0xFF;
+        final int b3 = src.get(pos + 3) & 0xFF;
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
     }
 
     @PostConstruct
@@ -321,13 +371,21 @@ public final class Ingress {
                     segment.appendBatchNoOffsets(batchView, totalBytes);
                 }
 
-                ledger.setHighWaterMark(segment.getLastOffset());
+                final long endLedgerSeq = segment.getLastOffset();
+                final long startLedgerSeq = endLedgerSeq - count + 1;
+                ledger.setHighWaterMark(endLedgerSeq);
 
                 // NEW: complete durability waiters for this epoch up to new HWM
                 completeWaiters(batchEpoch, ledger.getHighWaterMark());
 
                 final long endSeq = ring.next(count);
+                final long startRingSeq = endSeq - count + 1;
                 ring.publishBatch(endSeq, count, batchBuffer);
+
+                // Publish mapping after ring visibility for tail-cache consumers.
+                ringSeqDelta = startLedgerSeq - startRingSeq;
+                lastPublishedRingSeq = endSeq;
+                lastPublishedLedgerSeq = endLedgerSeq;
 
                 Arrays.fill(batchBuffer, 0, count, null);
             }
@@ -368,6 +426,34 @@ public final class Ingress {
 
     public long highWaterMark(final long epoch) {
         return virtualLog.forEpoch(epoch).getHighWaterMark();
+    }
+
+    public boolean hasRingMapping() {
+        return ringSeqDelta != Long.MIN_VALUE;
+    }
+
+    public long ringSeqDelta() {
+        return ringSeqDelta;
+    }
+
+    public long lastPublishedRingSeq() {
+        return lastPublishedRingSeq;
+    }
+
+    public long lastPublishedLedgerSeq() {
+        return lastPublishedLedgerSeq;
+    }
+
+    public long ledgerSeqForRingSeq(final long ringSeq) {
+        final long delta = ringSeqDelta;
+        if (delta == Long.MIN_VALUE) throw new IllegalStateException("Ring mapping unavailable");
+        return ringSeq + delta;
+    }
+
+    public long ringSeqForLedgerSeq(final long ledgerSeq) {
+        final long delta = ringSeqDelta;
+        if (delta == Long.MIN_VALUE) throw new IllegalStateException("Ring mapping unavailable");
+        return ledgerSeq - delta;
     }
 
     // -------------------- SlotRing --------------------

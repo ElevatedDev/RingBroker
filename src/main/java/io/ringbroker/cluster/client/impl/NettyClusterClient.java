@@ -21,7 +21,9 @@ import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -36,12 +38,20 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     private final ConcurrentMap<Long, CompletableFuture<BrokerApi.BackfillReply>> pendingBackfill =
             new ConcurrentHashMap<>();
 
+    private final long requestTimeoutMillis;
     private final AtomicLong corrSeq = new AtomicLong(1L);
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public NettyClusterClient(final String host, final int port) throws InterruptedException {
+        this(host, port, Long.getLong("ringbroker.cluster.requestTimeoutMillis", 5_000L));
+    }
+
+    public NettyClusterClient(final String host,
+                              final int port,
+                              final long requestTimeoutMillis) throws InterruptedException {
         final IoHandlerFactory factory = NioIoHandler.newFactory();
         this.group = new MultiThreadIoEventLoopGroup(1, factory);
+        this.requestTimeoutMillis = Math.max(1L, requestTimeoutMillis);
 
         final Bootstrap bootstrap = new Bootstrap()
                 .group(group)
@@ -111,7 +121,13 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
         final CompletableFuture<BrokerApi.ReplicationAck> future = new CompletableFuture<>();
         pendingAcks.put(corrId, future);
-        future.whenComplete((res, ex) -> pendingAcks.remove(corrId));
+        final ScheduledFuture<?> timeoutTask = channel.eventLoop().schedule(() -> {
+            future.completeExceptionally(new TimeoutException("Replication ack timeout corrId=" + corrId));
+        }, requestTimeoutMillis, TimeUnit.MILLISECONDS);
+        future.whenComplete((res, ex) -> {
+            pendingAcks.remove(corrId);
+            timeoutTask.cancel(false);
+        });
 
         channel.writeAndFlush(toSend).addListener(f -> {
             if (!f.isSuccess()) {
@@ -134,7 +150,13 @@ public final class NettyClusterClient implements RemoteBrokerClient {
 
         final CompletableFuture<BrokerApi.BackfillReply> future = new CompletableFuture<>();
         pendingBackfill.put(corrId, future);
-        future.whenComplete((res, ex) -> pendingBackfill.remove(corrId));
+        final ScheduledFuture<?> timeoutTask = channel.eventLoop().schedule(() -> {
+            future.completeExceptionally(new TimeoutException("Backfill timeout corrId=" + corrId));
+        }, requestTimeoutMillis, TimeUnit.MILLISECONDS);
+        future.whenComplete((res, ex) -> {
+            pendingBackfill.remove(corrId);
+            timeoutTask.cancel(false);
+        });
 
         channel.writeAndFlush(toSend).addListener(f -> {
             if (!f.isSuccess()) {

@@ -13,9 +13,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -33,9 +34,11 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                 case PUBLISH -> {
                     final var m = env.getPublish();
                     final int partitionId = m.getPartitionId();
+                    final byte[] key = m.getKey().isEmpty() ? null : m.getKey().toByteArray();
+                    final byte[] payload = m.getPayload().toByteArray();
                     final var fut = (partitionId != 0)
-                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
-                            : ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray());
+                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, key, m.getRetries(), payload)
+                            : ingress.publish(corrId, m.getTopic(), key, m.getRetries(), payload);
                     fut
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
@@ -52,27 +55,36 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                 case BATCH -> {
                     final var list = env.getBatch().getMessagesList();
-                    final List<CompletableFuture<Void>> futures = new ArrayList<>(list.size());
+                    if (list.isEmpty()) {
+                        writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
+                        break;
+                    }
+                    final AtomicInteger remaining = new AtomicInteger(list.size());
+                    final AtomicReference<Throwable> firstError = new AtomicReference<>();
 
                     for (final var m : list) {
                         final int partitionId = m.getPartitionId();
-                        futures.add((partitionId != 0)
-                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray())
-                                : ingress.publish(corrId, m.getTopic(), m.getKey().toByteArray(), m.getRetries(), m.getPayload().toByteArray()));
-                    }
-
-                    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                            .whenComplete((v, ex) -> {
-                                if (ex != null) {
-                                    log.error("Batch publish failed (corrId: {}): {}", corrId, ex.getMessage());
+                        final byte[] key = m.getKey().isEmpty() ? null : m.getKey().toByteArray();
+                        final byte[] payload = m.getPayload().toByteArray();
+                        final CompletableFuture<Void> f = (partitionId != 0)
+                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, key, m.getRetries(), payload)
+                                : ingress.publish(corrId, m.getTopic(), key, m.getRetries(), payload);
+                        f.whenComplete((v, ex) -> {
+                            if (ex != null) firstError.compareAndSet(null, ex);
+                            if (remaining.decrementAndGet() == 0) {
+                                final Throwable err = firstError.get();
+                                if (err != null) {
+                                    log.error("Batch publish failed (corrId: {}): {}", corrId, err.getMessage());
                                     writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder()
                                             .setSuccess(false)
-                                            .setError(String.valueOf(ex.getMessage()))
+                                            .setError(String.valueOf(err.getMessage()))
                                             .build());
                                 } else {
                                     writeReply(ctx, corrId, BrokerApi.PublishReply.newBuilder().setSuccess(true).build());
                                 }
-                            });
+                            }
+                        });
+                    }
                 }
 
                 case COMMIT -> {
@@ -148,13 +160,13 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                 case SUBSCRIBE -> {
                     final var s = env.getSubscribe();
-                    ingress.subscribeTopic(s.getTopic(), s.getGroup(), (seq, msg) -> {
+                    ingress.subscribeTopic(s.getTopic(), s.getGroup(), (lsn, msg) -> {
                         if (ctx.channel().isActive()) {
                             ctx.writeAndFlush(
                                     BrokerApi.Envelope.newBuilder()
                                             .setMessageEvent(BrokerApi.MessageEvent.newBuilder()
                                                     .setTopic(s.getTopic())
-                                                    .setOffset(seq)
+                                                    .setOffset(lsn)
                                                     .setKey(ByteString.EMPTY)
                                                     .setPayload(UnsafeByteOperations.unsafeWrap(msg)))
                                             .build()
