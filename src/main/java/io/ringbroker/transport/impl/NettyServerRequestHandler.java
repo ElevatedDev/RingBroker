@@ -16,11 +16,15 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Slf4j
 @RequiredArgsConstructor
 public class NettyServerRequestHandler extends SimpleChannelInboundHandler<BrokerApi.Envelope> {
+
+    private static final int SUBSCRIBE_FLUSH_BATCH = 64;
+    private static final long SUBSCRIBE_FLUSH_MAX_DELAY_NANOS = 1_000_000L; // 1ms
 
     private final ClusteredIngress ingress;
     private final OffsetStore offsetStore;
@@ -34,11 +38,9 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                 case PUBLISH -> {
                     final var m = env.getPublish();
                     final int partitionId = m.getPartitionId();
-                    final byte[] key = m.getKey().isEmpty() ? null : m.getKey().toByteArray();
-                    final byte[] payload = m.getPayload().toByteArray();
                     final var fut = (partitionId != 0)
-                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, key, m.getRetries(), payload)
-                            : ingress.publish(corrId, m.getTopic(), key, m.getRetries(), payload);
+                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey(), m.getRetries(), m.getPayload())
+                            : ingress.publish(corrId, m.getTopic(), m.getKey(), m.getRetries(), m.getPayload());
                     fut
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
@@ -64,11 +66,9 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                     for (final var m : list) {
                         final int partitionId = m.getPartitionId();
-                        final byte[] key = m.getKey().isEmpty() ? null : m.getKey().toByteArray();
-                        final byte[] payload = m.getPayload().toByteArray();
                         final CompletableFuture<Void> f = (partitionId != 0)
-                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, key, m.getRetries(), payload)
-                                : ingress.publish(corrId, m.getTopic(), key, m.getRetries(), payload);
+                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey(), m.getRetries(), m.getPayload())
+                                : ingress.publish(corrId, m.getTopic(), m.getKey(), m.getRetries(), m.getPayload());
                         f.whenComplete((v, ex) -> {
                             if (ex != null) firstError.compareAndSet(null, ex);
                             if (remaining.decrementAndGet() == 0) {
@@ -160,18 +160,35 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
 
                 case SUBSCRIBE -> {
                     final var s = env.getSubscribe();
-                    ingress.subscribeTopic(s.getTopic(), s.getGroup(), (lsn, msg) -> {
-                        if (ctx.channel().isActive()) {
-                            ctx.writeAndFlush(
+                    final AtomicInteger pendingWrites = new AtomicInteger(0);
+                    final AtomicLong lastFlushNanos = new AtomicLong(System.nanoTime());
+
+                    ingress.subscribeTopicZeroCopy(s.getTopic(), s.getGroup(), (lsn, payloadView) -> {
+                        if (!ctx.channel().isActive()) return;
+
+                        ctx.executor().execute(() -> {
+                            if (!ctx.channel().isActive()) return;
+
+                            ctx.write(
                                     BrokerApi.Envelope.newBuilder()
                                             .setMessageEvent(BrokerApi.MessageEvent.newBuilder()
                                                     .setTopic(s.getTopic())
                                                     .setOffset(lsn)
                                                     .setKey(ByteString.EMPTY)
-                                                    .setPayload(UnsafeByteOperations.unsafeWrap(msg)))
+                                                    .setPayload(UnsafeByteOperations.unsafeWrap(payloadView)))
                                             .build()
                             );
-                        }
+
+                            final int queued = pendingWrites.incrementAndGet();
+                            final long now = System.nanoTime();
+                            if (queued >= SUBSCRIBE_FLUSH_BATCH
+                                    || !ctx.channel().isWritable()
+                                    || (now - lastFlushNanos.get()) >= SUBSCRIBE_FLUSH_MAX_DELAY_NANOS) {
+                                pendingWrites.set(0);
+                                lastFlushNanos.set(now);
+                                ctx.flush();
+                            }
+                        });
                     });
                 }
 

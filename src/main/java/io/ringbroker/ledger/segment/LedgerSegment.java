@@ -200,6 +200,28 @@ public final class LedgerSegment implements AutoCloseable {
         return firstOffset == FIRST_OFFSET_UNSET && countAcquire() == 0;
     }
 
+    /**
+     * Rebase an empty segment to a new base last-offset so it can be safely reused
+     * as the next active segment after the previous segment is sealed.
+     */
+    public void rebaseEmpty(final long baseLastOffset) {
+        if (!isLogicallyEmpty()) {
+            throw new IllegalStateException("Cannot rebase non-empty segment: " + file);
+        }
+
+        // Empty segment state: no records, cursor at payload start.
+        buf.position(HEADER_SIZE);
+        COUNT_HANDLE.setRelease(this, 0);
+
+        UNSAFE.putOrderedLong(this, FIRST_OFF_OFFSET, FIRST_OFFSET_UNSET);
+        this.firstOffset = FIRST_OFFSET_UNSET;
+
+        UNSAFE.putOrderedLong(this, LAST_OFF_OFFSET, baseLastOffset);
+        this.lastOffset = baseLastOffset;
+
+        updateHeaderOnDisk();
+    }
+
     private void rebuildHintsAndCountFromSegment() {
         int pos = HEADER_SIZE;
         final int maxPos = capacity - MIN_RECORD_OVERHEAD;
@@ -269,6 +291,14 @@ public final class LedgerSegment implements AutoCloseable {
 
     public boolean hasSpaceFor(final int payloadBytes) {
         return (capacity - buf.position()) >= (payloadBytes + MIN_RECORD_OVERHEAD);
+    }
+
+    /**
+     * Remaining writable bytes in this segment.
+     * Writer access is single-threaded per segment.
+     */
+    public int remainingBytes() {
+        return capacity - buf.position();
     }
 
     /**

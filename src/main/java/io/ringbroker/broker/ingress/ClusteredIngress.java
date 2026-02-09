@@ -1,5 +1,6 @@
 package io.ringbroker.broker.ingress;
 
+import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.delivery.Delivery;
@@ -20,6 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -27,12 +30,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
+import java.util.zip.CRC32C;
 
 @Slf4j
 @Getter
 public final class ClusteredIngress {
 
     private static final CompletableFuture<Void> COMPLETED_FUTURE = CompletableFuture.completedFuture(null);
+    private static final byte[] EMPTY_BYTES = new byte[0];
 
     private static final long PARK_NANOS = 1_000L;
 
@@ -48,8 +53,18 @@ public final class ClusteredIngress {
     private static final long MAX_INFLIGHT_BYTES_PER_PARTITION = 256L * 1024 * 1024; // 256MB
     private static final int SUBSCRIBE_FETCH_BATCH = 512;
     private static final long SUBSCRIBE_IDLE_NANOS = 200_000L; // 0.2ms
+    private static final int SUBSCRIBE_COMMIT_BATCH = 64;
+    private static final long SUBSCRIBE_COMMIT_MAX_DELAY_NANOS = 2_000_000L; // 2ms
     private static final int FORWARD_MAX_RETRIES = 2;
     private static final int MAX_BACKFILL_REPLY_BYTES = 1 * 1024 * 1024;
+    private static final int INITIAL_BACKFILL_SCRATCH_BYTES = 64 * 1024;
+    private static final ThreadLocal<byte[]> BACKFILL_SCRATCH =
+            ThreadLocal.withInitial(() -> new byte[INITIAL_BACKFILL_SCRATCH_BYTES]);
+    private static final int INITIAL_REPLICA_APPEND_SCRATCH = 256;
+    private static final ThreadLocal<byte[][]> REPLICA_APPEND_SCRATCH =
+            ThreadLocal.withInitial(() -> new byte[INITIAL_REPLICA_APPEND_SCRATCH][]);
+    private static final ThreadLocal<CRC32C> MESSAGE_ID_CRC = ThreadLocal.withInitial(CRC32C::new);
+    private static final ThreadLocal<byte[]> MESSAGE_ID_INT_SCRATCH = ThreadLocal.withInitial(() -> new byte[Integer.BYTES]);
 
     private final BackfillPlanner backfillPlanner;
     private final int backfillBatchSize = 64;
@@ -237,7 +252,7 @@ public final class ClusteredIngress {
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
                 vLog.discoverOnDisk();
 
-                final Ingress ingress = Ingress.create(registry, ring, vLog, 0L, batchSize, forceDurable);
+                final Ingress ingress = Ingress.create(registry, ring, vLog, 0L, batchSize, forceDurable, true);
                 ingressMap.put(pid, ingress);
                 deliveryMap.put(pid, new Delivery(ring));
 
@@ -318,6 +333,25 @@ public final class ClusteredIngress {
         return publish(defaultCorrelationId, topic, key, 0, payload);
     }
 
+    public CompletableFuture<Void> publish(final long correlationId,
+                                           final String topic,
+                                           final com.google.protobuf.ByteString key,
+                                           final int retries,
+                                           final com.google.protobuf.ByteString payload) {
+        return publish(
+                correlationId,
+                topic,
+                byteStringToArrayOrNull(key),
+                retries,
+                byteStringToArray(payload)
+        );
+    }
+
+    @FunctionalInterface
+    public interface MessageViewHandler {
+        void accept(long lsn, ByteBuffer payload);
+    }
+
     /**
      * Publish to a specific partition (used by internal forwarding to preserve routing).
      */
@@ -338,11 +372,62 @@ public final class ClusteredIngress {
         return forwardWithRetry(env, partitionId, 0);
     }
 
+    public CompletableFuture<Void> publishToPartition(final long correlationId,
+                                                      final String topic,
+                                                      final int partitionId,
+                                                      final com.google.protobuf.ByteString key,
+                                                      final int retries,
+                                                      final com.google.protobuf.ByteString payload) {
+        return publishToPartition(
+                correlationId,
+                topic,
+                partitionId,
+                byteStringToArrayOrNull(key),
+                retries,
+                byteStringToArray(payload)
+        );
+    }
+
     public void subscribeTopic(final String topic, final String group, final BiConsumer<Long, byte[]> handler) {
         if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
 
         for (final int partitionId : ingressMap.keySet()) {
-            ioExecutor.submit(() -> runSubscriptionLoop(topic, group, partitionId, handler));
+            ioExecutor.submit(() -> runSubscriptionLoop(
+                    topic,
+                    group,
+                    partitionId,
+                    handler::accept,
+                    payload -> payload,
+                    (segBuf, payloadPos, payloadLen) -> {
+                        final byte[] payload = new byte[payloadLen];
+                        final var dup = segBuf.duplicate();
+                        dup.position(payloadPos);
+                        dup.get(payload, 0, payloadLen);
+                        return payload;
+                    }
+            ));
+        }
+    }
+
+    public void subscribeTopicZeroCopy(final String topic,
+                                       final String group,
+                                       final MessageViewHandler handler) {
+        if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
+
+        for (final int partitionId : ingressMap.keySet()) {
+            ioExecutor.submit(() -> runSubscriptionLoop(
+                    topic,
+                    group,
+                    partitionId,
+                    handler::accept,
+                    payload -> ByteBuffer.wrap(payload).asReadOnlyBuffer(),
+                    (segBuf, payloadPos, payloadLen) -> {
+                        final ByteBuffer view = segBuf.duplicate();
+                        view.position(payloadPos);
+                        view.limit(payloadPos + payloadLen);
+                        return view.slice().asReadOnlyBuffer();
+                    }
+            ));
         }
     }
 
@@ -420,6 +505,7 @@ public final class ClusteredIngress {
         @SuppressWarnings("unchecked")
         private final CompletableFuture<Void>[] publishFuts =
                 (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
+        private final ArrayDeque<CompletableFuture<Void>[]> futureArrayPool = new ArrayDeque<>();
 
         // replication targets scratch (avoid per-publish allocation)
         private int[] replicaScratch = new int[Math.max(1, clusterSize)];
@@ -572,7 +658,7 @@ public final class ClusteredIngress {
                 // Fail pending publish batches
                 PendingBatch pb;
                 while ((pb = pending.pollFirst()) != null) {
-                    pb.fail(stop);
+                    completePendingFailure(pb, stop);
                 }
                 inflightBatches = 0;
                 inflightBytes = 0;
@@ -590,7 +676,7 @@ public final class ClusteredIngress {
                 Object in;
                 while ((in = internalQ.poll()) != null) {
                     if (in instanceof CommitDoneTask cd) {
-                        cd.pending.fail(stop);
+                        completePendingFailure(cd.pending, stop);
                     }
                 }
             }
@@ -638,14 +724,40 @@ public final class ClusteredIngress {
             inflightBatches = Math.max(0, inflightBatches - 1);
             inflightBytes = Math.max(0L, inflightBytes - cd.pending.bytes);
 
-            if (cd.error == null) cd.pending.succeed();
-            else cd.pending.fail(unwrap(cd.error));
+            if (cd.error == null) completePendingSuccess(cd.pending);
+            else completePendingFailure(cd.pending, unwrap(cd.error));
         }
 
         private Throwable unwrap(final Throwable t) {
             if (t instanceof CompletionException ce && ce.getCause() != null) return ce.getCause();
             if (t instanceof ExecutionException ee && ee.getCause() != null) return ee.getCause();
             return t;
+        }
+
+        @SuppressWarnings("unchecked")
+        private CompletableFuture<Void>[] acquireFutureArray() {
+            final CompletableFuture<Void>[] arr = futureArrayPool.pollFirst();
+            if (arr != null) return arr;
+            return (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
+        }
+
+        private void releaseFutureArray(final CompletableFuture<Void>[] arr, final int used) {
+            Arrays.fill(arr, 0, used, null);
+            futureArrayPool.offerFirst(arr);
+        }
+
+        private void completePendingSuccess(final PendingBatch pb) {
+            for (int i = 0; i < pb.futureCount; i++) {
+                pb.futures[i].complete(null);
+            }
+            releaseFutureArray(pb.futures, pb.futureCount);
+        }
+
+        private void completePendingFailure(final PendingBatch pb, final Throwable t) {
+            for (int i = 0; i < pb.futureCount; i++) {
+                pb.futures[i].completeExceptionally(t);
+            }
+            releaseFutureArray(pb.futures, pb.futureCount);
         }
 
         private void drainAndProcessPublish(final PublishTask first) {
@@ -677,7 +789,7 @@ public final class ClusteredIngress {
                     deferOne(o);
                     break;
                 }
-                if (!Objects.equals(topic, p.topic) || retries != p.retries) {
+                if (!topic.equals(p.topic) || retries != p.retries) {
                     deferOne(p);
                     break;
                 }
@@ -738,9 +850,7 @@ public final class ClusteredIngress {
                 final Ingress ing = getOrCreateIngress(pid, epoch);
 
                 // enqueue into ingress queue (fast)
-                for (int i = 0; i < count; i++) {
-                    ing.publishForEpoch(epoch, payloads[i]);
-                }
+                ing.publishBatchForEpoch(epoch, payloads, count);
 
                 // figure replication targets
                 final EpochPlacement placementCache = pe.activePlacement;
@@ -761,12 +871,11 @@ public final class ClusteredIngress {
                     if (id != myNodeId) replicaScratch[rc++] = id;
                 }
 
-                // copy futures for this batch into a stable array (scratch will be cleared)
-                @SuppressWarnings("unchecked")
-                final CompletableFuture<Void>[] futs = (CompletableFuture<Void>[]) new CompletableFuture<?>[count];
+                // copy futures for this batch into a stable pooled array (scratch will be cleared)
+                final CompletableFuture<Void>[] futs = acquireFutureArray();
                 System.arraycopy(publishFuts, 0, futs, 0, count);
 
-                final PendingBatch pb = new PendingBatch(epoch, lastSeq, batchBytes, futs);
+                final PendingBatch pb = new PendingBatch(epoch, lastSeq, batchBytes, futs, count);
                 pending.addLast(pb);
                 inflightBatches++;
                 inflightBytes += batchBytes;
@@ -840,20 +949,18 @@ public final class ClusteredIngress {
         final long lastSeq;
         final long bytes;
         final CompletableFuture<Void>[] futures;
+        final int futureCount;
 
-        PendingBatch(final long epoch, final long lastSeq, final long bytes, final CompletableFuture<Void>[] futures) {
+        PendingBatch(final long epoch,
+                     final long lastSeq,
+                     final long bytes,
+                     final CompletableFuture<Void>[] futures,
+                     final int futureCount) {
             this.epoch = epoch;
             this.lastSeq = lastSeq;
             this.bytes = bytes;
             this.futures = futures;
-        }
-
-        void succeed() {
-            for (final CompletableFuture<Void> f : futures) f.complete(null);
-        }
-
-        void fail(final Throwable t) {
-            for (final CompletableFuture<Void> f : futures) f.completeExceptionally(t);
+            this.futureCount = futureCount;
         }
     }
 
@@ -865,6 +972,12 @@ public final class ClusteredIngress {
     private record OpenEpochTask(BrokerApi.OpenEpochRequest req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record MetadataUpdateTask(BrokerApi.MetadataUpdate req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record CommitDoneTask(PendingBatch pending, Throwable error) {}
+
+    private static final class SubscriptionCommitState {
+        long pendingLsn = Long.MIN_VALUE;
+        int pendingCount = 0;
+        long lastCommitNanos = System.nanoTime();
+    }
 
     /**
      * Low-allocation MPSC ring queue.
@@ -881,8 +994,8 @@ public final class ClusteredIngress {
         private final long[] sequence;
         private final Object[] buffer;
 
-        private final AtomicLong tail = new AtomicLong(0);
-        private final AtomicLong head = new AtomicLong(0);
+        private final PaddedCounter tail = new PaddedCounter(0L);
+        private final PaddedCounter head = new PaddedCounter(0L);
 
         MpscQueue(final int capacityPow2) {
             if (Integer.bitCount(capacityPow2) != 1) throw new IllegalArgumentException("capacity must be pow2");
@@ -940,6 +1053,36 @@ public final class ClusteredIngress {
 
             return item;
         }
+
+        private static final class PaddedCounter {
+            private static final VarHandle VALUE;
+
+            static {
+                try {
+                    VALUE = MethodHandles.lookup().findVarHandle(PaddedCounter.class, "value", long.class);
+                } catch (final ReflectiveOperationException e) {
+                    throw new ExceptionInInitializerError(e);
+                }
+            }
+
+            @SuppressWarnings("unused")
+            private long p1, p2, p3, p4, p5, p6, p7;
+            private volatile long value;
+            @SuppressWarnings("unused")
+            private long q1, q2, q3, q4, q5, q6, q7;
+
+            PaddedCounter(final long initial) {
+                VALUE.setRelease(this, initial);
+            }
+
+            long get() {
+                return (long) VALUE.getVolatile(this);
+            }
+
+            boolean compareAndSet(final long expect, final long update) {
+                return VALUE.compareAndSet(this, expect, update);
+            }
+        }
     }
 
     // ---------- Fast replica append paths (serialized => no CAS loops) ----------
@@ -995,7 +1138,7 @@ public final class ClusteredIngress {
         }
 
         try {
-            ing.publishForEpoch(epoch, a.getPayload().toByteArray());
+            ing.publishForEpoch(epoch, byteStringToArray(a.getPayload()));
         } catch (final Throwable t) {
             return BrokerApi.ReplicationAck.newBuilder()
                     .setStatus(BrokerApi.ReplicationAck.Status.ERROR_PERSISTENCE_FAILED)
@@ -1085,8 +1228,15 @@ public final class ClusteredIngress {
         }
 
         try {
-            for (int i = startIdx; i < n; i++) {
-                ing.publishForEpoch(epoch, payloads.get(i).toByteArray());
+            final int toWrite = n - startIdx;
+            final byte[][] scratch = ensureReplicaAppendScratch(toWrite);
+            try {
+                for (int i = 0; i < toWrite; i++) {
+                    scratch[i] = byteStringToArray(payloads.get(startIdx + i));
+                }
+                ing.publishBatchForEpoch(epoch, scratch, toWrite);
+            } finally {
+                Arrays.fill(scratch, 0, toWrite, null);
             }
         } catch (final Throwable t) {
             return BrokerApi.ReplicationAck.newBuilder()
@@ -1240,25 +1390,26 @@ public final class ClusteredIngress {
 
     private void loadFenceState(final Path partitionDir, final PartitionEpochs pe) {
         try {
-            Files.list(partitionDir)
-                    .filter(p -> p.getFileName().toString().endsWith(".fence"))
-                    .forEach(p -> {
-                        final String name = p.getFileName().toString();
-                        try {
-                            final String epochStr = name.substring("epoch-".length(), name.indexOf(".fence"));
-                            final long epoch = Long.parseLong(epochStr);
-                            final FenceStore.PartitionFence fence = FenceStore.loadEpochFence(partitionDir, epoch);
-                            if (fence != null) {
-                                final PartitionEpochState pes = new PartitionEpochState();
-                                pes.sealed.set(fence.sealed());
-                                pes.sealedEndSeq = fence.sealedEndSeq();
-                                pes.lastSeq.set(fence.lastSeq());
-                                pe.epochFences.put(epoch, pes);
-                                pe.highestSeenEpoch.accumulateAndGet(epoch, Math::max);
+            try (var files = Files.list(partitionDir)) {
+                files.filter(p -> p.getFileName().toString().endsWith(".fence"))
+                        .forEach(p -> {
+                            final String name = p.getFileName().toString();
+                            try {
+                                final String epochStr = name.substring("epoch-".length(), name.indexOf(".fence"));
+                                final long epoch = Long.parseLong(epochStr);
+                                final FenceStore.PartitionFence fence = FenceStore.loadEpochFence(partitionDir, epoch);
+                                if (fence != null) {
+                                    final PartitionEpochState pes = new PartitionEpochState();
+                                    pes.sealed.set(fence.sealed());
+                                    pes.sealedEndSeq = fence.sealedEndSeq();
+                                    pes.lastSeq.set(fence.lastSeq());
+                                    pe.epochFences.put(epoch, pes);
+                                    pe.highestSeenEpoch.accumulateAndGet(epoch, Math::max);
+                                }
+                            } catch (final Exception ignored) {
                             }
-                        } catch (final Exception ignored) {
-                        }
-                    });
+                        });
+            }
         } catch (final IOException ignored) {
         }
     }
@@ -1421,7 +1572,7 @@ public final class ClusteredIngress {
             return reply.build();
         }
 
-        final byte[] out = new byte[maxBytes];
+        final byte[] out = ensureBackfillScratch(maxBytes);
         final int[] encodedBytes = new int[]{0};
         final int[] count = new int[]{0};
 
@@ -1444,7 +1595,7 @@ public final class ClusteredIngress {
         }
 
         final long hwm = ing.getVirtualLog().forEpoch(epoch).getHighWaterMark();
-        reply.setPayload(UnsafeByteOperations.unsafeWrap(out, 0, encodedBytes[0]));
+        reply.setPayload(ByteString.copyFrom(out, 0, encodedBytes[0]));
         reply.setEndOfEpoch(offset + count[0] > hwm);
 
         return reply.build();
@@ -1470,7 +1621,7 @@ public final class ClusteredIngress {
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
                 vLog.discoverOnDisk();
 
-                final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable);
+                final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable, true);
 
                 deliveryMap.putIfAbsent(pid, new Delivery(ring));
                 if (idempotentMode) {
@@ -1549,20 +1700,43 @@ public final class ClusteredIngress {
         return metadataStore.bootstrapIfAbsent(partitionId, ep, 0L);
     }
 
-    private void runSubscriptionLoop(final String topic,
-                                     final String group,
-                                     final int partitionId,
-                                     final BiConsumer<Long, byte[]> handler) {
+    @FunctionalInterface
+    private interface SubscriptionConsumer<T> {
+        void accept(long lsn, T payload);
+    }
+
+    @FunctionalInterface
+    private interface RingPayloadMapper<T> {
+        T map(byte[] payload);
+    }
+
+    @FunctionalInterface
+    private interface LedgerPayloadMapper<T> {
+        T map(MappedByteBuffer segmentBuffer, int payloadPos, int payloadLen);
+    }
+
+    private <T> void runSubscriptionLoop(final String topic,
+                                         final String group,
+                                         final int partitionId,
+                                         final SubscriptionConsumer<T> consumer,
+                                         final RingPayloadMapper<T> ringMapper,
+                                         final LedgerPayloadMapper<T> ledgerMapper) {
         long cursor = Math.max(0L, offsetStore.fetch(topic, group, partitionId));
         if (cursor <= ((1L << 40) - 1)) {
             cursor = Lsn.encode(0L, cursor);
         }
+        final long[] nextSeq = new long[1];
+        final SubscriptionCommitState commitState = new SubscriptionCommitState();
 
         for (;;) {
-            if (closed.get() || Thread.currentThread().isInterrupted()) return;
+            if (closed.get() || Thread.currentThread().isInterrupted()) {
+                flushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                return;
+            }
             try {
                 final Ingress ing = ingressMap.get(partitionId);
                 if (ing == null) {
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                     LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
                     continue;
                 }
@@ -1585,9 +1759,10 @@ public final class ClusteredIngress {
                         final long mappedSeq = ing.ledgerSeqForRingSeq(ringSeq);
                         if (mappedSeq == seq) {
                             final long lsn = Lsn.encode(epoch, seq);
-                            handler.accept(lsn, msg);
-                            offsetStore.commit(topic, group, partitionId, lsn);
+                            consumer.accept(lsn, ringMapper.map(msg));
+                            markSubscriptionDelivered(lsn, commitState);
                             cursor = Lsn.encode(epoch, seq + 1);
+                            maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                             continue;
                         }
                     }
@@ -1599,24 +1774,22 @@ public final class ClusteredIngress {
                         cursor = Lsn.encode(epoch + 1, nextStart);
                         continue;
                     }
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                     LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
                     continue;
                 }
 
-                final long[] nextSeq = new long[]{seq};
+                nextSeq[0] = seq;
                 final int visited = ing.fetchEpoch(epoch, seq, SUBSCRIBE_FETCH_BATCH, (off, segBuf, payloadPos, payloadLen) -> {
-                    final byte[] payload = new byte[payloadLen];
-                    final var dup = segBuf.duplicate();
-                    dup.position(payloadPos);
-                    dup.get(payload, 0, payloadLen);
                     final long lsn = Lsn.encode(epoch, off);
-                    handler.accept(lsn, payload);
-                    offsetStore.commit(topic, group, partitionId, lsn);
+                    consumer.accept(lsn, ledgerMapper.map(segBuf, payloadPos, payloadLen));
+                    markSubscriptionDelivered(lsn, commitState);
                     nextSeq[0] = off + 1;
                 });
 
                 if (visited > 0) {
                     cursor = Lsn.encode(epoch, nextSeq[0]);
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                     continue;
                 }
 
@@ -1626,16 +1799,51 @@ public final class ClusteredIngress {
                     continue;
                 }
 
+                maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                 LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
             } catch (final InterruptedException ie) {
                 Thread.currentThread().interrupt();
+                flushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                 return;
             } catch (final Throwable t) {
                 log.warn("Subscription loop error for topic={} group={} partition={}: {}",
                         topic, group, partitionId, t.toString());
+                maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
                 LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
             }
         }
+    }
+
+    private static void markSubscriptionDelivered(final long lsn, final SubscriptionCommitState state) {
+        state.pendingLsn = lsn;
+        state.pendingCount++;
+    }
+
+    private static boolean shouldFlushSubscriptionCommit(final SubscriptionCommitState state, final long nowNanos) {
+        if (state.pendingCount <= 0) return false;
+        if (state.pendingCount >= SUBSCRIBE_COMMIT_BATCH) return true;
+        return (nowNanos - state.lastCommitNanos) >= SUBSCRIBE_COMMIT_MAX_DELAY_NANOS;
+    }
+
+    private void maybeFlushSubscriptionCommit(final String topic,
+                                              final String group,
+                                              final int partitionId,
+                                              final SubscriptionCommitState state,
+                                              final long nowNanos) {
+        if (!shouldFlushSubscriptionCommit(state, nowNanos)) return;
+        flushSubscriptionCommit(topic, group, partitionId, state, nowNanos);
+    }
+
+    private void flushSubscriptionCommit(final String topic,
+                                         final String group,
+                                         final int partitionId,
+                                         final SubscriptionCommitState state,
+                                         final long nowNanos) {
+        if (state.pendingCount <= 0) return;
+        offsetStore.commit(topic, group, partitionId, state.pendingLsn);
+        state.pendingCount = 0;
+        state.pendingLsn = Long.MIN_VALUE;
+        state.lastCommitNanos = nowNanos;
     }
 
     private Long nextEpochStartSeq(final int partitionId, final long epoch) {
@@ -1794,11 +2002,35 @@ public final class ClusteredIngress {
         }
     }
 
+    private static byte[] byteStringToArray(final com.google.protobuf.ByteString bytes) {
+        if (bytes == null || bytes.isEmpty()) return EMPTY_BYTES;
+        final int len = bytes.size();
+        final byte[] out = new byte[len];
+        bytes.copyTo(out, 0);
+        return out;
+    }
+
+    private static byte[] byteStringToArrayOrNull(final com.google.protobuf.ByteString bytes) {
+        if (bytes == null || bytes.isEmpty()) return null;
+        return byteStringToArray(bytes);
+    }
+
     private long computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
-        final int keyHash = (key != null ? Arrays.hashCode(key) : 0);
-        final int payloadHash = Arrays.hashCode(payload);
-        final int combined = 31 * keyHash + payloadHash;
-        return (((long) partitionId) << 32) ^ (combined & 0xFFFF_FFFFL);
+        final CRC32C crc = MESSAGE_ID_CRC.get();
+        crc.reset();
+        crcUpdateInt(crc, partitionId);
+
+        if (key != null) {
+            crcUpdateInt(crc, key.length);
+            crc.update(key, 0, key.length);
+        } else {
+            crcUpdateInt(crc, 0);
+        }
+
+        crcUpdateInt(crc, payload.length);
+        crc.update(payload, 0, payload.length);
+
+        return (((long) partitionId) << 32) ^ (crc.getValue() & 0xFFFF_FFFFL);
     }
 
     private static void writeLittleEndianInt(final byte[] dst, final int pos, final int value) {
@@ -1806,5 +2038,38 @@ public final class ClusteredIngress {
         dst[pos + 1] = (byte) (value >>> 8);
         dst[pos + 2] = (byte) (value >>> 16);
         dst[pos + 3] = (byte) (value >>> 24);
+    }
+
+    private static void crcUpdateInt(final CRC32C crc, final int value) {
+        final byte[] scratch = MESSAGE_ID_INT_SCRATCH.get();
+        scratch[0] = (byte) (value);
+        scratch[1] = (byte) (value >>> 8);
+        scratch[2] = (byte) (value >>> 16);
+        scratch[3] = (byte) (value >>> 24);
+        crc.update(scratch, 0, Integer.BYTES);
+    }
+
+    private static byte[] ensureBackfillScratch(final int minSize) {
+        byte[] out = BACKFILL_SCRATCH.get();
+        if (out.length >= minSize) return out;
+        int next = out.length;
+        while (next < minSize) {
+            next <<= 1;
+        }
+        out = new byte[next];
+        BACKFILL_SCRATCH.set(out);
+        return out;
+    }
+
+    private static byte[][] ensureReplicaAppendScratch(final int minSize) {
+        byte[][] scratch = REPLICA_APPEND_SCRATCH.get();
+        if (scratch.length >= minSize) return scratch;
+        int next = scratch.length;
+        while (next < minSize) {
+            next <<= 1;
+        }
+        scratch = new byte[next][];
+        REPLICA_APPEND_SCRATCH.set(scratch);
+        return scratch;
     }
 }

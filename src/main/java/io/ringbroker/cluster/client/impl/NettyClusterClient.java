@@ -25,10 +25,16 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public final class NettyClusterClient implements RemoteBrokerClient {
+
+    private static final Object SHARED_GROUP_LOCK = new Object();
+    private static final AtomicInteger SHARED_GROUP_REFS = new AtomicInteger(0);
+    private static final int SHARED_GROUP_THREADS = Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+    private static volatile EventLoopGroup sharedGroup;
 
     private final Channel channel;
     private final EventLoopGroup group;
@@ -49,8 +55,7 @@ public final class NettyClusterClient implements RemoteBrokerClient {
     public NettyClusterClient(final String host,
                               final int port,
                               final long requestTimeoutMillis) throws InterruptedException {
-        final IoHandlerFactory factory = NioIoHandler.newFactory();
-        this.group = new MultiThreadIoEventLoopGroup(1, factory);
+        this.group = acquireSharedGroup();
         this.requestTimeoutMillis = Math.max(1L, requestTimeoutMillis);
 
         final Bootstrap bootstrap = new Bootstrap()
@@ -70,9 +75,20 @@ public final class NettyClusterClient implements RemoteBrokerClient {
                     }
                 });
 
-        this.channel = bootstrap.connect(new InetSocketAddress(host, port))
-                .sync()
-                .channel();
+        try {
+            this.channel = bootstrap.connect(new InetSocketAddress(host, port))
+                    .sync()
+                    .channel();
+        } catch (final InterruptedException ie) {
+            releaseSharedGroup();
+            throw ie;
+        } catch (final RuntimeException re) {
+            releaseSharedGroup();
+            throw re;
+        } catch (final Error err) {
+            releaseSharedGroup();
+            throw err;
+        }
 
         log.info("NettyClusterClient connected to {}:{}", host, port);
     }
@@ -181,9 +197,36 @@ public final class NettyClusterClient implements RemoteBrokerClient {
         try {
             if (channel != null) channel.close().syncUninterruptibly();
         } finally {
-            if (group != null) group.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
+            releaseSharedGroup();
         }
 
         log.info("NettyClusterClient closed.");
+    }
+
+    private static EventLoopGroup acquireSharedGroup() {
+        synchronized (SHARED_GROUP_LOCK) {
+            EventLoopGroup g = sharedGroup;
+            if (g == null || g.isShuttingDown() || g.isShutdown() || g.isTerminated()) {
+                g = new MultiThreadIoEventLoopGroup(SHARED_GROUP_THREADS, NioIoHandler.newFactory());
+                sharedGroup = g;
+            }
+            SHARED_GROUP_REFS.incrementAndGet();
+            return g;
+        }
+    }
+
+    private static void releaseSharedGroup() {
+        EventLoopGroup g = null;
+        synchronized (SHARED_GROUP_LOCK) {
+            final int refs = SHARED_GROUP_REFS.decrementAndGet();
+            if (refs <= 0) {
+                SHARED_GROUP_REFS.set(0);
+                g = sharedGroup;
+                sharedGroup = null;
+            }
+        }
+        if (g != null) {
+            g.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
+        }
     }
 }

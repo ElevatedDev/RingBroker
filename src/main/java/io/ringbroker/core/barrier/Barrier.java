@@ -18,6 +18,7 @@ public final class Barrier {
     private final WaitStrategy waitStrategy;
     private final Lock lock = new ReentrantLock();
     private final Condition condition = lock.newCondition();
+    private volatile int waiters;
     /**
      * -- GETTER --
      * Check if an alert has been raised.
@@ -36,9 +37,14 @@ public final class Barrier {
      * Called by producers to wake up any blocked consumer.
      */
     public void signal() {
+        if (waiters == 0) {
+            return;
+        }
         lock.lock();
         try {
-            condition.signalAll();
+            if (waiters > 0) {
+                condition.signalAll();
+            }
         } finally {
             lock.unlock();
         }
@@ -54,14 +60,22 @@ public final class Barrier {
     }
 
     /**
-     * Called by wait strategies to block the consumer thread.
+     * Called by wait strategies to block the consumer thread until {@code seq} is published.
+     * Re-checks cursor under lock to avoid missed wakeups.
      */
-    public void block() throws InterruptedException {
+    public void block(final long seq) throws InterruptedException {
         lock.lock();
         try {
-            // Only wait if not alerted (to avoid waiting when we should be breaking out)
-            if (!alerted) {
-                condition.await();
+            if (alerted) return;
+            if (cursor.getValue() >= seq) return;
+
+            waiters++;
+            try {
+                while (!alerted && cursor.getValue() < seq) {
+                    condition.await();
+                }
+            } finally {
+                waiters--;
             }
         } finally {
             lock.unlock();

@@ -10,7 +10,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Latency-aware quorum replicator (failover-safe).
@@ -94,6 +93,10 @@ public final class AdaptiveReplicator {
 
         final int n = replicaCount;
         final int quorum = Math.min(Math.max(1, quorumOverride), n);
+        final int availableCandidates = countAvailableCandidates(replicas, n);
+        if (availableCandidates < quorum) {
+            throw new TimeoutException("Not enough replicas available to start quorum=" + quorum + " (started=0)");
+        }
 
         final long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
 
@@ -115,16 +118,12 @@ public final class AdaptiveReplicator {
         while (started < quorum) {
             final int idx = pickBestAvailableIndex(replicas, n, attempted);
             if (idx < 0) {
-                final long rem = deadlineNs - System.nanoTime();
-                if (rem <= 0) break;
-                LockSupport.parkNanos(Math.min(rem, TimeUnit.MILLISECONDS.toNanos(1)));
-                continue;
+                break;
             }
-
-            attempted[idx] = true;
 
             final int nodeId = replicas[idx];
             final RemoteBrokerClient client = clients.get(nodeId);
+            attempted[idx] = true;
             if (client == null) continue;
 
             final long startNs = System.nanoTime();
@@ -177,10 +176,9 @@ public final class AdaptiveReplicator {
                 final int idx = pickBestAvailableIndex(replicas, n, attempted);
                 if (idx < 0) break;
 
-                attempted[idx] = true;
-
                 final int nodeId = replicas[idx];
                 final RemoteBrokerClient client = clients.get(nodeId);
+                attempted[idx] = true;
                 if (client == null) continue;
 
                 final long startNs = System.nanoTime();
@@ -195,7 +193,7 @@ public final class AdaptiveReplicator {
             }
 
             // EARLY EXIT: all attempted completed, none left, cannot reach quorum.
-            if (doneCount == started && started == n && successes < quorum) break;
+            if (doneCount == started && started >= availableCandidates && successes < quorum) break;
         }
 
         if (successes < quorum) {
@@ -288,6 +286,16 @@ public final class AdaptiveReplicator {
             }
         }
         return bestIdx;
+    }
+
+    private int countAvailableCandidates(final int[] replicas, final int n) {
+        int available = 0;
+        for (int i = 0; i < n; i++) {
+            if (clients.get(replicas[i]) != null) {
+                available++;
+            }
+        }
+        return available;
     }
 
     public void shutdown() {

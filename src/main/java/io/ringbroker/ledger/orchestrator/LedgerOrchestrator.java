@@ -14,6 +14,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -57,13 +58,22 @@ public final class LedgerOrchestrator implements AutoCloseable {
     public static LedgerOrchestrator bootstrap(@NonNull final Path directory, final int segmentCapacity) throws IOException {
         Files.createDirectories(directory);
 
-        final List<LedgerSegment> recoveredSegments = Files.list(directory)
-                .filter(p -> p.getFileName().toString().endsWith(LedgerConstant.SEGMENT_EXT))
-                .sorted(Comparator.comparing(p -> p.getFileName().toString()))
-                .map(path -> recoverAndOpenSegment(path, directory))
-                .filter(java.util.Objects::nonNull)
-                .sorted(Comparator.comparingLong(LedgerSegment::getFirstOffset).thenComparingLong(LedgerSegment::getLastOffset))
-                .toList();
+        final ArrayList<Path> segmentPaths = new ArrayList<>();
+        try (final var files = Files.list(directory)) {
+            files.filter(p -> p.getFileName().toString().endsWith(LedgerConstant.SEGMENT_EXT))
+                    .forEach(segmentPaths::add);
+        }
+        segmentPaths.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+        final ArrayList<LedgerSegment> recoveredSegments = new ArrayList<>(segmentPaths.size());
+        for (final Path path : segmentPaths) {
+            final LedgerSegment recovered = recoverAndOpenSegment(path, directory);
+            if (recovered != null) {
+                recoveredSegments.add(recovered);
+            }
+        }
+        recoveredSegments.sort(Comparator.comparingLong(LedgerSegment::getFirstOffset)
+                .thenComparingLong(LedgerSegment::getLastOffset));
 
         // Offsets start at 0; if there are no segments yet, HWM is -1.
         final long currentHwm = recoveredSegments.isEmpty() ? -1L : recoveredSegments.getLast().getLastOffset();
@@ -97,7 +107,6 @@ public final class LedgerOrchestrator implements AutoCloseable {
             }
         }
 
-        orchestrator.preAllocateNextSegment();
         return orchestrator;
     }
 
@@ -249,12 +258,13 @@ public final class LedgerOrchestrator implements AutoCloseable {
             current = rollToNextSegment();
             activeSegment.set(current);
             addToSnapshotIfMissing(current);
-            preAllocateNextSegment();
 
             // Build .idx off the hot path for sealed segments.
             if (sealed != null && !sealed.isLogicallyEmpty()) {
                 INDEX_BUILDER.execute(sealed::buildDenseIndexIfMissingOrStale);
             }
+        } else {
+            maybePreAllocateNextSegment(current, requiredBytes);
         }
         return current;
     }
@@ -282,10 +292,15 @@ public final class LedgerOrchestrator implements AutoCloseable {
         if (nextSegmentFuture != null && nextSegmentFuture.isDone()) {
             try {
                 final LedgerSegment candidate = nextSegmentFuture.get();
-                if (candidate != null && candidate.getLastOffset() == baseOffset) {
-                    nextActiveSegment = candidate;
-                } else if (candidate != null) {
-                    discardPreallocatedSegment(candidate);
+                if (candidate != null) {
+                    if (candidate.isLogicallyEmpty()) {
+                        if (candidate.getLastOffset() != baseOffset) {
+                            candidate.rebaseEmpty(baseOffset);
+                        }
+                        nextActiveSegment = candidate;
+                    } else {
+                        discardPreallocatedSegment(candidate);
+                    }
                 }
             } catch (final Exception ignored) {
             }
@@ -304,6 +319,21 @@ public final class LedgerOrchestrator implements AutoCloseable {
         try { segment.close(); } catch (final Exception ignored) {}
         try { Files.deleteIfExists(segment.getFile()); } catch (final Exception ignored) {}
         try { Files.deleteIfExists(LedgerSegment.indexPathForSegment(segment.getFile())); } catch (final Exception ignored) {}
+    }
+
+    /**
+     * Defer preallocation until the active segment is reasonably close to full.
+     * This avoids background file creation I/O when rollover is not imminent.
+     */
+    private void maybePreAllocateNextSegment(final LedgerSegment current, final int requiredBytes) {
+        if (current == null) return;
+        if (nextSegmentFuture != null && !nextSegmentFuture.isDone()) return;
+
+        final int remaining = current.remainingBytes();
+        final long trigger = Math.max((long) requiredBytes * 4L, Math.max(1L, ((long) segmentCapacity) >>> 3));
+        if (remaining > trigger) return;
+
+        preAllocateNextSegment();
     }
 
     private void preAllocateNextSegment() {

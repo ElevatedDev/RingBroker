@@ -14,6 +14,12 @@ import java.util.concurrent.ConcurrentMap;
  */
 @Slf4j
 public final class ClientReplicationHandler extends SimpleChannelInboundHandler<BrokerApi.Envelope> {
+    private static final BrokerApi.ReplicationAck ACK_SUCCESS = BrokerApi.ReplicationAck.newBuilder()
+            .setStatus(BrokerApi.ReplicationAck.Status.SUCCESS)
+            .build();
+    private static final BrokerApi.ReplicationAck ACK_PERSISTENCE_FAILED = BrokerApi.ReplicationAck.newBuilder()
+            .setStatus(BrokerApi.ReplicationAck.Status.ERROR_PERSISTENCE_FAILED)
+            .build();
 
     private final ConcurrentMap<Long, CompletableFuture<BrokerApi.ReplicationAck>> pendingAcks;
     private final ConcurrentMap<Long, CompletableFuture<BrokerApi.BackfillReply>> pendingBackfill;
@@ -41,11 +47,7 @@ public final class ClientReplicationHandler extends SimpleChannelInboundHandler<
         if (envelope.hasPublishReply()) {
             final CompletableFuture<BrokerApi.ReplicationAck> fut = pendingAcks.remove(corrId);
             if (fut != null) {
-                final BrokerApi.ReplicationAck.Status status =
-                        envelope.getPublishReply().getSuccess()
-                                ? BrokerApi.ReplicationAck.Status.SUCCESS
-                                : BrokerApi.ReplicationAck.Status.ERROR_PERSISTENCE_FAILED;
-                fut.complete(BrokerApi.ReplicationAck.newBuilder().setStatus(status).build());
+                fut.complete(envelope.getPublishReply().getSuccess() ? ACK_SUCCESS : ACK_PERSISTENCE_FAILED);
             } else {
                 log.warn("PublishReply for unknown corrId {}", corrId);
             }
