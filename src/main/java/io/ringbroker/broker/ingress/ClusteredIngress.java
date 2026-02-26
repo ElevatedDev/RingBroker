@@ -689,8 +689,10 @@ public final class ClusteredIngress {
 
                 Object in;
                 while ((in = internalQ.poll()) != null) {
-                    if (in instanceof CommitDoneTask cd) {
-                        completePendingFailure(cd.pending, stop);
+                    if (in instanceof CommitDoneTask) {
+                        // Pending batches were already failed above. Commit callbacks can race
+                        // with shutdown and enqueue duplicate completion notifications here.
+                        // Draining without re-completing avoids double-releasing pooled arrays.
                     }
                 }
                 futureArrayPool.clear();
