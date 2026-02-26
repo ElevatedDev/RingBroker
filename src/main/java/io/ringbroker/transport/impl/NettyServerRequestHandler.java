@@ -37,10 +37,7 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
             switch (env.getKindCase()) {
                 case PUBLISH -> {
                     final var m = env.getPublish();
-                    final int partitionId = m.getPartitionId();
-                    final var fut = (partitionId != 0)
-                            ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey(), m.getRetries(), m.getPayload())
-                            : ingress.publish(corrId, m.getTopic(), m.getKey(), m.getRetries(), m.getPayload());
+                    final CompletableFuture<Void> fut = publishMessage(corrId, m);
                     fut
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
@@ -65,10 +62,7 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
                     final AtomicReference<Throwable> firstError = new AtomicReference<>();
 
                     for (final var m : list) {
-                        final int partitionId = m.getPartitionId();
-                        final CompletableFuture<Void> f = (partitionId != 0)
-                                ? ingress.publishToPartition(corrId, m.getTopic(), partitionId, m.getKey(), m.getRetries(), m.getPayload())
-                                : ingress.publish(corrId, m.getTopic(), m.getKey(), m.getRetries(), m.getPayload());
+                        final CompletableFuture<Void> f = publishMessage(corrId, m);
                         f.whenComplete((v, ex) -> {
                             if (ex != null) firstError.compareAndSet(null, ex);
                             if (remaining.decrementAndGet() == 0) {
@@ -302,5 +296,20 @@ public class NettyServerRequestHandler extends SimpleChannelInboundHandler<Broke
         }
 
         ctx.writeAndFlush(b.build());
+    }
+
+    private CompletableFuture<Void> publishMessage(final long corrId, final BrokerApi.Message m) {
+        if (m.hasPartitionId()) {
+            final int partitionId = m.getPartitionId();
+            if (partitionId < 0 || partitionId >= ingress.getTotalPartitions()) {
+                return CompletableFuture.failedFuture(
+                        new IllegalArgumentException("partition_id out of range: " + partitionId)
+                );
+            }
+            return ingress.publishToPartition(
+                    corrId, m.getTopic(), partitionId, m.getKey(), m.getRetries(), m.getPayload()
+            );
+        }
+        return ingress.publish(corrId, m.getTopic(), m.getKey(), m.getRetries(), m.getPayload());
     }
 }

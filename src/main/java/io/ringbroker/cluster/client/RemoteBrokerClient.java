@@ -12,14 +12,13 @@ public interface RemoteBrokerClient extends AutoCloseable {
     byte[] EMPTY_BYTES = new byte[0];
 
     /**
-     * Legacy method — still used by classic single-owner forwarders.
+     * Legacy method still used by single-owner forwarders.
      */
     void sendMessage(String topic, byte[] key, byte[] payload);
 
     /**
-     * NEW: zero-copy path for replication.  Default impl falls back to
-     * {@link #sendMessage(String, byte[], byte[])} if you only have a
-     * basic client implementation.
+     * Envelope path for replication. Default implementation falls back to
+     * {@link #sendMessage(String, byte[], byte[])} for basic clients.
      */
     default void sendEnvelope(final BrokerApi.Envelope envelope) {
         if (envelope.hasPublish()) {

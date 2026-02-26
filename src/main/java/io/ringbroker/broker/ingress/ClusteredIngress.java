@@ -48,7 +48,7 @@ public final class ClusteredIngress {
     private static final int PIPELINE_MAX_DRAIN = 8_192;
     private static final int PIPELINE_QUEUE_FACTOR = 8;
 
-    // --- NEW: cap in-flight per partition so async doesn’t OOM ---
+    // Cap in-flight work per partition.
     private static final int MAX_INFLIGHT_BATCHES_PER_PARTITION = 8_192;
     private static final long MAX_INFLIGHT_BYTES_PER_PARTITION = 256L * 1024 * 1024; // 256MB
     private static final int SUBSCRIBE_FETCH_BATCH = 512;
@@ -83,7 +83,7 @@ public final class ClusteredIngress {
                 return t;
             });
 
-    // NEW: offload quorum replication and any blocking waits away from the per-partition pipeline thread
+    // Offload quorum replication and blocking waits from partition pipelines.
     private final ExecutorService ioExecutor =
             Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("broker-io").factory());
 
@@ -317,6 +317,11 @@ public final class ClusteredIngress {
                                            final byte[] payload) {
 
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
+        if (!isValidPartitionId(partitionId)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Partitioner returned out-of-range partition: " + partitionId)
+            );
+        }
         final int ownerNode = resolveWriteOwner(partitionId);
 
         if (ownerNode == myNodeId) {
@@ -361,6 +366,12 @@ public final class ClusteredIngress {
                                                       final byte[] key,
                                                       final int retries,
                                                       final byte[] payload) {
+        if (!isValidPartitionId(partitionId)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("partition_id out of range: " + partitionId)
+            );
+        }
+
         final int ownerNode = resolveWriteOwner(partitionId);
 
         if (ownerNode == myNodeId) {
@@ -386,6 +397,10 @@ public final class ClusteredIngress {
                 retries,
                 byteStringToArray(payload)
         );
+    }
+
+    private boolean isValidPartitionId(final int partitionId) {
+        return partitionId >= 0 && partitionId < totalPartitions;
     }
 
     public void subscribeTopic(final String topic, final String group, final BiConsumer<Long, byte[]> handler) {
@@ -461,9 +476,7 @@ public final class ClusteredIngress {
         return pipeline(s.getPartitionId()).submitSeal(s);
     }
 
-    /**
-     * NEW: async, do NOT block Netty event loop threads.
-     */
+    /** Runs metadata updates asynchronously to keep Netty event loops non-blocking. */
     public CompletableFuture<BrokerApi.ReplicationAck> handleMetadataUpdateAsync(final BrokerApi.MetadataUpdate upd) {
         return pipeline(upd.getPartitionId()).submitMetadataUpdate(upd);
     }
@@ -487,19 +500,20 @@ public final class ClusteredIngress {
 
     private final class PartitionPipeline implements Runnable {
         private static final int OFFER_SPIN_LIMIT = 256;
-        private static final long OFFER_PARK_NANOS = 1_000L; // 1µs backoff when full
+        private static final long OFFER_PARK_NANOS = 1_000L;
+        private static final int FUTURE_ARRAY_POOL_MAX = 64;
 
         private final int pid;
         private final MpscQueue queue;
         private final Thread thread;
 
-        // internal “never block” queue for commit completions (unbounded)
+        // Internal queue for commit completions.
         private final ConcurrentLinkedQueue<Object> internalQ = new ConcurrentLinkedQueue<>();
 
-        // one-item defer slot for the (single) consumer thread (used by batching)
+        // One deferred slot for the pipeline consumer.
         private Object deferred;
 
-        // batch scratch (reused) — never allow 0-length
+        // Batch scratch.
         private final int maxDrain = Math.max(1, Math.min(PIPELINE_MAX_DRAIN, Math.max(1, batchSize)));
         private final byte[][] payloads = new byte[maxDrain][];
         @SuppressWarnings("unchecked")
@@ -507,15 +521,15 @@ public final class ClusteredIngress {
                 (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
         private final ArrayDeque<CompletableFuture<Void>[]> futureArrayPool = new ArrayDeque<>();
 
-        // replication targets scratch (avoid per-publish allocation)
+        // Replication targets scratch.
         private int[] replicaScratch = new int[Math.max(1, clusterSize)];
 
-        // NEW: in-flight tracking for correctness + backpressure
+        // In-flight tracking for backpressure.
         private final ArrayDeque<PendingBatch> pending = new ArrayDeque<>();
         private int inflightBatches = 0;
         private long inflightBytes = 0;
 
-        // NEW: ensure per-partition replication happens in-order even though it’s off-thread
+        // Keep per-partition replication ordered, even when executed off-thread.
         private CompletableFuture<Void> replTail = COMPLETED_FUTURE;
 
         PartitionPipeline(final int pid, final int capacityPow2) {
@@ -679,6 +693,7 @@ public final class ClusteredIngress {
                         completePendingFailure(cd.pending, stop);
                     }
                 }
+                futureArrayPool.clear();
             }
         }
 
@@ -743,7 +758,9 @@ public final class ClusteredIngress {
 
         private void releaseFutureArray(final CompletableFuture<Void>[] arr, final int used) {
             Arrays.fill(arr, 0, used, null);
-            futureArrayPool.offerFirst(arr);
+            if (futureArrayPool.size() < FUTURE_ARRAY_POOL_MAX) {
+                futureArrayPool.offerFirst(arr);
+            }
         }
 
         private void completePendingSuccess(final PendingBatch pb) {
@@ -782,7 +799,7 @@ public final class ClusteredIngress {
             count++;
 
             while (count < payloads.length) {
-                final Object o = queue.poll(); // IMPORTANT: do not consume deferred here
+                final Object o = queue.poll(); // Do not consume deferred here.
                 if (o == null) break;
 
                 if (!(o instanceof PublishTask p)) {
@@ -943,7 +960,7 @@ public final class ClusteredIngress {
         }
     }
 
-    // ---- NEW: pending publish batch ----
+    // Pending publish batch.
     private static final class PendingBatch {
         final long epoch;
         final long lastSeq;
@@ -1047,7 +1064,7 @@ public final class ClusteredIngress {
             final int idx = (int) (h & mask);
             final Object item = BUF.getAcquire(buffer, idx);
 
-            // IMPORTANT: clear BEFORE making slot available
+            // Clear before making the slot available.
             BUF.setRelease(buffer, idx, null);
             SEQ.setRelease(sequence, idx, h + capacity);
 

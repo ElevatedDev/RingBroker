@@ -60,7 +60,7 @@ public final class Ingress {
     private volatile long lastPublishedRingSeq = -1L;
     private volatile long lastPublishedLedgerSeq = -1L;
 
-    // --- NEW: waiters completed by writer thread when HWM advances ---
+    // Waiters completed by the writer thread as the HWM advances.
     private static final CompletableFuture<Void> DONE = CompletableFuture.completedFuture(null);
 
     private static final class SeqWaiter {
@@ -169,8 +169,7 @@ public final class Ingress {
     }
 
     /**
-     * NEW: completes when the epoch's high-watermark reaches at least seq (durable write done).
-     * This is completed by the writer thread, so the pipeline never blocks/spins/polls.
+     * Completes when an epoch high-watermark reaches at least {@code seq}.
      */
     public CompletableFuture<Void> whenPersisted(final long epoch, final long seq) {
         if (seq < 0) return DONE;
@@ -186,7 +185,7 @@ public final class Ingress {
         waitersByEpoch.computeIfAbsent(epoch, __ -> new ConcurrentLinkedQueue<>())
                 .offer(new SeqWaiter(seq, f));
 
-        // NOTE: if writer already advanced, it’ll complete it on the next write;
+        // Best-effort completion for races where the writer already advanced.
         try {
             if (highWaterMark(epoch) >= seq) {
                 // best-effort complete; writer may still drain later

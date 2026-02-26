@@ -18,16 +18,11 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
 
-/*
- * Hyper-optimized, Durable, Low-Latency OffsetStore backed by the LedgerOrchestrator.
- *
- * Hot-path goals:
- *  - commit(): O(1) with minimal allocations & string work
- *  - fetch(): O(1) with simple nested map + array read
- */
+/** Durable in-memory offset store backed by a WAL. */
 @Slf4j
 public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
 
@@ -40,6 +35,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
     /* Idle park duration for flusher. 1 microsecond. */
     private static final long PARK_NANOS = 1_000L;
     private static final int INITIAL_FRAMED_BATCH_CAPACITY = 1 << 20; // 1MB
+    private static final int MAX_COMMIT_POOL_SIZE = BATCH_SIZE * 8;
 
     private final Path storageDir;
 
@@ -159,6 +155,7 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
      */
     private final ConcurrentLinkedQueue<PendingCommit> commitQueue = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<PendingCommit> commitPool = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger pooledCommitCount = new AtomicInteger(0);
 
     private final ExecutorService flusherExecutor = Executors.newSingleThreadExecutor(
             Thread.ofPlatform().name("offset-flusher").factory()
@@ -170,19 +167,13 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
         this.storageDir = Objects.requireNonNull(storageDir, "storageDir");
         Files.createDirectories(storageDir);
 
-        // Phase 1: recovery from existing segments.
         recoverStateFromDisk();
-
-        // Phase 2: WAL bootstrap.
         this.wal = LedgerOrchestrator.bootstrap(storageDir, OFFSET_SEGMENT_CAPACITY);
-
-        // Phase 3: start flusher loop.
         flusherExecutor.submit(this::flusherLoop);
     }
 
     @Override
     public void commit(final String topic, final String group, final int partition, final long offset) {
-        // Fast in-memory update: nested map + array write.
         final PartitionOffsets po = partitionOffsets(topic, group);
         po.set(partition, offset);
 
@@ -322,7 +313,11 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
 
     private PendingCommit acquireCommit() {
         final PendingCommit reused = commitPool.poll();
-        return (reused != null) ? reused : new PendingCommit();
+        if (reused != null) {
+            pooledCommitCount.decrementAndGet();
+            return reused;
+        }
+        return new PendingCommit();
     }
 
     private void recycleBatch(final PendingCommit[] batch, final int count) {
@@ -331,7 +326,25 @@ public final class InMemoryOffsetStore implements OffsetStore, AutoCloseable {
             batch[i] = null;
             if (c != null) {
                 c.clear();
-                commitPool.offer(c);
+                tryOfferPooledCommit(c);
+            }
+        }
+    }
+
+    private void tryOfferPooledCommit(final PendingCommit commit) {
+        if (tryReservePoolSlot()) {
+            commitPool.offer(commit);
+        }
+    }
+
+    private boolean tryReservePoolSlot() {
+        for (;;) {
+            final int current = pooledCommitCount.get();
+            if (current >= MAX_COMMIT_POOL_SIZE) {
+                return false;
+            }
+            if (pooledCommitCount.compareAndSet(current, current + 1)) {
+                return true;
             }
         }
     }
