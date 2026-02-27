@@ -17,6 +17,7 @@ import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.util.AbstractList;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,8 +35,18 @@ public final class Ingress {
     private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
     private static final int MAX_RETRIES = 5;
-    private static final int QUEUE_CAPACITY_FACTOR = 4;
-    private static final long PARK_NANOS = 1_000;
+    private static final boolean IS_WINDOWS =
+            System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    private static final int QUEUE_CAPACITY_FACTOR =
+            positiveIntProperty("ringbroker.ingress.queueCapacityFactor", 8);
+    private static final int BACKOFF_SPINS_BEFORE_YIELD =
+            positiveIntProperty("ringbroker.ingress.backoff.spinsBeforeYield", 2_048);
+    private static final int BACKOFF_YIELDS_BEFORE_PARK =
+            positiveIntProperty("ringbroker.ingress.backoff.yieldsBeforePark", 64);
+    private static final long PRODUCER_PARK_NANOS =
+            nonNegativeLongProperty("ringbroker.ingress.backoff.producerParkNanos", IS_WINDOWS ? 0L : 1_000L);
+    private static final long WRITER_IDLE_PARK_NANOS =
+            nonNegativeLongProperty("ringbroker.ingress.backoff.writerParkNanos", IS_WINDOWS ? 0L : 1_000L);
 
     @Getter private final TopicRegistry registry;
     @Getter private final RingBuffer<byte[]> ring;
@@ -44,7 +55,7 @@ public final class Ingress {
     private final AtomicLong activeEpoch = new AtomicLong();
 
     private final int batchSize;
-    private final SlotRing queue;
+    private final SpscQueue queue;
     private final int maxEnqueueBatch;
     private final byte[][] batchBuffer;
     private final ByteBatch batchView;
@@ -95,7 +106,7 @@ public final class Ingress {
         this.publishRingMapping = publishRingMapping;
 
         final int capacity = nextPowerOfTwo(batchSize * QUEUE_CAPACITY_FACTOR);
-        this.queue = new SlotRing(capacity);
+        this.queue = new SpscQueue(capacity);
         this.maxEnqueueBatch = batchSize;
         this.batchBuffer = new byte[batchSize][];
         this.batchView = new ByteBatch(batchBuffer);
@@ -117,8 +128,15 @@ public final class Ingress {
                                  final int batchSize,
                                  final boolean durable,
                                  final boolean publishRingMapping) throws IOException {
-
-        final Ingress ingress = new Ingress(registry, ring, log, epoch, batchSize, durable, publishRingMapping);
+        final Ingress ingress = new Ingress(
+                registry,
+                ring,
+                log,
+                epoch,
+                batchSize,
+                durable,
+                publishRingMapping
+        );
         ingress.writerTask = EXECUTOR.submit(ingress::writerLoop);
         return ingress;
     }
@@ -127,6 +145,44 @@ public final class Ingress {
         final int v = Math.max(2, x);
         final int highest = Integer.highestOneBit(v);
         return (v == highest) ? v : highest << 1;
+    }
+
+    private static int positiveIntProperty(final String key, final int fallback) {
+        final String raw = System.getProperty(key);
+        if (raw == null || raw.isBlank()) return fallback;
+        try {
+            final int parsed = Integer.parseInt(raw.trim());
+            return (parsed > 0) ? parsed : fallback;
+        } catch (final NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private static long nonNegativeLongProperty(final String key, final long fallback) {
+        final String raw = System.getProperty(key);
+        if (raw == null || raw.isBlank()) return fallback;
+        try {
+            final long parsed = Long.parseLong(raw.trim());
+            return Math.max(0L, parsed);
+        } catch (final NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private static void applyBackoff(final int spins, final long parkNanos) {
+        if (spins < BACKOFF_SPINS_BEFORE_YIELD) {
+            Thread.onSpinWait();
+            return;
+        }
+        if (spins < BACKOFF_SPINS_BEFORE_YIELD + BACKOFF_YIELDS_BEFORE_PARK) {
+            Thread.yield();
+            return;
+        }
+        if (parkNanos > 0L) {
+            LockSupport.parkNanos(parkNanos);
+        } else {
+            Thread.yield();
+        }
     }
 
     public void publish(final String topic, final byte[] payload) {
@@ -243,12 +299,7 @@ public final class Ingress {
             if (Thread.currentThread().isInterrupted()) {
                 throw new RuntimeException("Interrupted while publishing");
             }
-
-            if ((++spins & 1023) == 0) {
-                LockSupport.parkNanos(PARK_NANOS);
-            } else {
-                Thread.onSpinWait();
-            }
+            applyBackoff(++spins, PRODUCER_PARK_NANOS);
         }
     }
 
@@ -266,12 +317,7 @@ public final class Ingress {
             if (Thread.currentThread().isInterrupted()) {
                 throw new RuntimeException("Interrupted while publishing batch");
             }
-
-            if ((++spins & 1023) == 0) {
-                LockSupport.parkNanos(PARK_NANOS);
-            } else {
-                Thread.onSpinWait();
-            }
+            applyBackoff(++spins, PRODUCER_PARK_NANOS);
         }
     }
 
@@ -378,9 +424,10 @@ public final class Ingress {
     }
 
     private void writerLoop() {
-        final SlotRing.Entry entry = new SlotRing.Entry();
-        final SlotRing.Entry carry = new SlotRing.Entry();
+        final SpscQueue.Entry entry = new SpscQueue.Entry();
+        final SpscQueue.Entry carry = new SpscQueue.Entry();
         boolean hasCarry = false;
+        int idleSpins = 0;
         long cachedEpoch = Long.MIN_VALUE;
         LedgerOrchestrator cachedLedger = null;
 
@@ -391,15 +438,17 @@ public final class Ingress {
                     entry.payload = carry.payload;
                     entry.epoch = carry.epoch;
                     hasCarry = false;
+                    idleSpins = 0;
                 } else {
                     if (!queue.pollInto(entry)) {
-                        LockSupport.parkNanos(PARK_NANOS);
+                        applyBackoff(++idleSpins, WRITER_IDLE_PARK_NANOS);
                         continue;
                     }
+                    idleSpins = 0;
                 }
 
                 if (entry.payload == null) {
-                    throw new IllegalStateException("SlotRing returned null payload (epoch=" + entry.epoch + ")");
+                    throw new IllegalStateException("SpscQueue returned null payload (epoch=" + entry.epoch + ")");
                 }
 
                 int count = 0;
@@ -413,7 +462,7 @@ public final class Ingress {
                     if (!queue.pollInto(entry)) break;
 
                     if (entry.payload == null) {
-                        throw new IllegalStateException("SlotRing returned null payload (epoch=" + entry.epoch + ")");
+                        throw new IllegalStateException("SpscQueue returned null payload (epoch=" + entry.epoch + ")");
                     }
 
                     if (entry.epoch != batchEpoch) {
@@ -535,66 +584,67 @@ public final class Ingress {
         return ledgerSeq - delta;
     }
 
-    // -------------------- SlotRing --------------------
+    // -------------------- SpscQueue --------------------
 
-    static final class SlotRing {
-        private static final VarHandle SEQUENCE_HANDLE, BUFFER_HANDLE, EPOCH_HANDLE;
+    static final class SpscQueue {
+        private static final VarHandle BUFFER_HANDLE;
+        private static final VarHandle EPOCH_HANDLE;
+        private static final VarHandle HEAD_HANDLE;
+        private static final VarHandle TAIL_HANDLE;
 
         static {
-            SEQUENCE_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
-            BUFFER_HANDLE = MethodHandles.arrayElementVarHandle(byte[][].class);
-            EPOCH_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
+            try {
+                BUFFER_HANDLE = MethodHandles.arrayElementVarHandle(byte[][].class);
+                EPOCH_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
+                final MethodHandles.Lookup lookup = MethodHandles.lookup();
+                HEAD_HANDLE = lookup.findVarHandle(SpscQueue.class, "head", long.class);
+                TAIL_HANDLE = lookup.findVarHandle(SpscQueue.class, "tail", long.class);
+            } catch (final Exception e) {
+                throw new ExceptionInInitializerError(e);
+            }
         }
 
-        private final long[] epochs;
         private final int mask;
         private final int capacity;
-        private final long[] sequence;
         private final byte[][] buffer;
+        private final long[] epochs;
 
-        private final PaddedCounter tail = new PaddedCounter(0L);
-        private final PaddedCounter head = new PaddedCounter(0L);
+        private volatile long head;
+        private volatile long tail;
 
-        SlotRing(final int capacityPow2) {
-            if (Integer.bitCount(capacityPow2) != 1) throw new IllegalArgumentException("capacity must be power of two");
+        private long producerHeadCache;
+        private long consumerTailCache;
 
+        SpscQueue(final int capacityPow2) {
+            if (Integer.bitCount(capacityPow2) != 1) {
+                throw new IllegalArgumentException("capacity must be power of two");
+            }
             this.capacity = capacityPow2;
             this.mask = capacityPow2 - 1;
-
-            this.sequence = new long[capacityPow2];
             this.buffer = new byte[capacityPow2][];
             this.epochs = new long[capacityPow2];
-
-            for (int i = 0; i < capacityPow2; i++) sequence[i] = i;
+            this.head = 0L;
+            this.tail = 0L;
+            this.producerHeadCache = 0L;
+            this.consumerTailCache = 0L;
         }
 
         boolean offer(final byte[] element, final long epoch) {
             if (element == null) throw new IllegalArgumentException("payload cannot be null");
 
-            long tailSnapshot;
-
-            while (true) {
-                tailSnapshot = tail.get();
-                final int index = (int) (tailSnapshot & mask);
-
-                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, index);
-                final long difference = seqVal - tailSnapshot;
-
-                if (difference == 0) {
-                    if (tail.compareAndSet(tailSnapshot, tailSnapshot + 1)) break;
-                } else if (difference < 0) {
+            final long tailSnapshot = this.tail;
+            final long wrapPoint = tailSnapshot - capacity;
+            if (producerHeadCache <= wrapPoint) {
+                producerHeadCache = (long) HEAD_HANDLE.getAcquire(this);
+                if (producerHeadCache <= wrapPoint) {
                     return false;
-                } else {
-                    Thread.onSpinWait();
                 }
             }
 
-            final int bufferIndex = (int) (tailSnapshot & mask);
-
-            BUFFER_HANDLE.setRelease(buffer, bufferIndex, element);
-            EPOCH_HANDLE.setRelease(epochs, bufferIndex, epoch);
-            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, tailSnapshot + 1);
-
+            final int index = (int) (tailSnapshot & mask);
+            BUFFER_HANDLE.setRelease(buffer, index, element);
+            EPOCH_HANDLE.setRelease(epochs, index, epoch);
+            TAIL_HANDLE.setRelease(this, tailSnapshot + 1);
             return true;
         }
 
@@ -602,97 +652,50 @@ public final class Ingress {
             if (count <= 0) return true;
             if (count > capacity) return false;
 
-            long tailSnapshot;
-
-            while (true) {
-                tailSnapshot = tail.get();
-
-                boolean retry = false;
-                for (int i = 0; i < count; i++) {
-                    final long seq = tailSnapshot + i;
-                    final int index = (int) (seq & mask);
-
-                    final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, index);
-                    final long difference = seqVal - seq;
-
-                    if (difference == 0) {
-                        continue;
-                    }
-                    if (difference < 0) {
-                        return false;
-                    }
-                    retry = true;
-                    break;
+            final long tailSnapshot = this.tail;
+            final long wrapPoint = tailSnapshot + count - capacity;
+            if (producerHeadCache <= wrapPoint) {
+                producerHeadCache = (long) HEAD_HANDLE.getAcquire(this);
+                if (producerHeadCache <= wrapPoint) {
+                    return false;
                 }
-
-                if (retry) {
-                    Thread.onSpinWait();
-                    continue;
-                }
-
-                if (tail.compareAndSet(tailSnapshot, tailSnapshot + count)) break;
             }
 
             for (int i = 0; i < count; i++) {
                 final long seq = tailSnapshot + i;
                 final int index = (int) (seq & mask);
-
                 BUFFER_HANDLE.setRelease(buffer, index, elements[offset + i]);
                 EPOCH_HANDLE.setRelease(epochs, index, epoch);
-                SEQUENCE_HANDLE.setRelease(sequence, index, seq + 1);
             }
+            TAIL_HANDLE.setRelease(this, tailSnapshot + count);
             return true;
         }
 
         boolean pollInto(final Entry out) {
-            long headSnapshot;
-
-            while (true) {
-                headSnapshot = head.get();
-                final int index = (int) (headSnapshot & mask);
-
-                final long seqVal = (long) SEQUENCE_HANDLE.getVolatile(this.sequence, index);
-                final long difference = seqVal - (headSnapshot + 1);
-
-                if (difference == 0) {
-                    if (head.compareAndSet(headSnapshot, headSnapshot + 1)) break;
-                } else if (difference < 0) {
+            final long headSnapshot = this.head;
+            if (headSnapshot >= consumerTailCache) {
+                consumerTailCache = (long) TAIL_HANDLE.getAcquire(this);
+                if (headSnapshot >= consumerTailCache) {
                     return false;
-                } else {
-                    Thread.onSpinWait();
                 }
             }
 
-            final int bufferIndex = (int) (headSnapshot & mask);
+            final int index = (int) (headSnapshot & mask);
+            final byte[] payload = (byte[]) BUFFER_HANDLE.getAcquire(buffer, index);
+            final long epoch = (long) EPOCH_HANDLE.getAcquire(epochs, index);
 
-            final byte[] payload = (byte[]) BUFFER_HANDLE.getAcquire(buffer, bufferIndex);
-            final long epoch = (long) EPOCH_HANDLE.getAcquire(epochs, bufferIndex);
-
-            // clear BEFORE publishing slot free
-            BUFFER_HANDLE.setRelease(buffer, bufferIndex, null);
-            EPOCH_HANDLE.setRelease(epochs, bufferIndex, 0L);
-            SEQUENCE_HANDLE.setRelease(sequence, bufferIndex, headSnapshot + capacity);
+            BUFFER_HANDLE.setRelease(buffer, index, null);
+            EPOCH_HANDLE.setRelease(epochs, index, 0L);
+            HEAD_HANDLE.setRelease(this, headSnapshot + 1);
 
             out.payload = payload;
             out.epoch = epoch;
-
             return true;
         }
 
         static final class Entry {
             byte[] payload;
             long epoch;
-        }
-    }
-
-    private static final class PaddedCounter extends AtomicLong {
-        @SuppressWarnings("unused")
-        volatile long p1, p2, p3, p4, p5, p6, p7;
-        @SuppressWarnings("unused")
-        volatile long q1, q2, q3, q4, q5, q6, q7;
-
-        PaddedCounter(final long initial) {
-            super(initial);
         }
     }
 
