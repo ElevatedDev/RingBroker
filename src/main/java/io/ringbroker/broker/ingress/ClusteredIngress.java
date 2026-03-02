@@ -1,5 +1,7 @@
 package io.ringbroker.broker.ingress;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import io.ringbroker.api.BrokerApi;
 import io.ringbroker.broker.delivery.Delivery;
 import io.ringbroker.broker.role.BrokerRole;
@@ -19,6 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -26,12 +30,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
+import java.util.zip.CRC32C;
 
 @Slf4j
 @Getter
 public final class ClusteredIngress {
 
     private static final CompletableFuture<Void> COMPLETED_FUTURE = CompletableFuture.completedFuture(null);
+    private static final byte[] EMPTY_BYTES = new byte[0];
 
     private static final long PARK_NANOS = 1_000L;
 
@@ -42,9 +48,23 @@ public final class ClusteredIngress {
     private static final int PIPELINE_MAX_DRAIN = 8_192;
     private static final int PIPELINE_QUEUE_FACTOR = 8;
 
-    // --- NEW: cap in-flight per partition so async doesn’t OOM ---
+    // Cap in-flight work per partition.
     private static final int MAX_INFLIGHT_BATCHES_PER_PARTITION = 8_192;
     private static final long MAX_INFLIGHT_BYTES_PER_PARTITION = 256L * 1024 * 1024; // 256MB
+    private static final int SUBSCRIBE_FETCH_BATCH = 512;
+    private static final long SUBSCRIBE_IDLE_NANOS = 200_000L; // 0.2ms
+    private static final int SUBSCRIBE_COMMIT_BATCH = 64;
+    private static final long SUBSCRIBE_COMMIT_MAX_DELAY_NANOS = 2_000_000L; // 2ms
+    private static final int FORWARD_MAX_RETRIES = 2;
+    private static final int MAX_BACKFILL_REPLY_BYTES = 1 * 1024 * 1024;
+    private static final int INITIAL_BACKFILL_SCRATCH_BYTES = 64 * 1024;
+    private static final ThreadLocal<byte[]> BACKFILL_SCRATCH =
+            ThreadLocal.withInitial(() -> new byte[INITIAL_BACKFILL_SCRATCH_BYTES]);
+    private static final int INITIAL_REPLICA_APPEND_SCRATCH = 256;
+    private static final ThreadLocal<byte[][]> REPLICA_APPEND_SCRATCH =
+            ThreadLocal.withInitial(() -> new byte[INITIAL_REPLICA_APPEND_SCRATCH][]);
+    private static final ThreadLocal<CRC32C> MESSAGE_ID_CRC = ThreadLocal.withInitial(CRC32C::new);
+    private static final ThreadLocal<byte[]> MESSAGE_ID_INT_SCRATCH = ThreadLocal.withInitial(() -> new byte[Integer.BYTES]);
 
     private final BackfillPlanner backfillPlanner;
     private final int backfillBatchSize = 64;
@@ -63,7 +83,7 @@ public final class ClusteredIngress {
                 return t;
             });
 
-    // NEW: offload quorum replication and any blocking waits away from the per-partition pipeline thread
+    // Offload quorum replication and blocking waits from partition pipelines.
     private final ExecutorService ioExecutor =
             Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("broker-io").factory());
 
@@ -232,7 +252,7 @@ public final class ClusteredIngress {
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
                 vLog.discoverOnDisk();
 
-                final Ingress ingress = Ingress.create(registry, ring, vLog, 0L, batchSize, forceDurable);
+                final Ingress ingress = Ingress.create(registry, ring, vLog, 0L, batchSize, forceDurable, true);
                 ingressMap.put(pid, ingress);
                 deliveryMap.put(pid, new Delivery(ring));
 
@@ -297,26 +317,44 @@ public final class ClusteredIngress {
                                            final byte[] payload) {
 
         final int partitionId = partitioner.selectPartition(key, totalPartitions);
-        final int ownerNode = Math.floorMod(partitionId, clusterSize);
+        if (!isValidPartitionId(partitionId)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Partitioner returned out-of-range partition: " + partitionId)
+            );
+        }
+        final int ownerNode = resolveWriteOwner(partitionId);
 
         if (ownerNode == myNodeId) {
             if (idempotentMode && shouldDropDuplicate(partitionId, key, payload)) return COMPLETED_FUTURE;
             return pipeline(partitionId).submitPublish(correlationId, topic, retries, payload);
         }
 
-        // forward
-        final RemoteBrokerClient ownerClient = clusterNodes.get(ownerNode);
-        if (ownerClient == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("No client for owner " + ownerNode));
-        }
-
         final BrokerApi.Envelope env = buildPublishEnvelope(correlationId, topic, key, payload, partitionId, retries);
-        return forwardWithRetry(ownerClient, env, partitionId, 0);
+        return forwardWithRetry(env, partitionId, 0);
     }
 
     public CompletableFuture<Void> publish(final String topic, final byte[] key, final byte[] payload) {
         final long defaultCorrelationId = (myRole == BrokerRole.INGESTION) ? System.nanoTime() : 0L;
         return publish(defaultCorrelationId, topic, key, 0, payload);
+    }
+
+    public CompletableFuture<Void> publish(final long correlationId,
+                                           final String topic,
+                                           final com.google.protobuf.ByteString key,
+                                           final int retries,
+                                           final com.google.protobuf.ByteString payload) {
+        return publish(
+                correlationId,
+                topic,
+                byteStringToArrayOrNull(key),
+                retries,
+                byteStringToArray(payload)
+        );
+    }
+
+    @FunctionalInterface
+    public interface MessageViewHandler {
+        void accept(long lsn, ByteBuffer payload);
     }
 
     /**
@@ -328,33 +366,83 @@ public final class ClusteredIngress {
                                                       final byte[] key,
                                                       final int retries,
                                                       final byte[] payload) {
-        final int ownerNode = Math.floorMod(partitionId, clusterSize);
+        if (!isValidPartitionId(partitionId)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("partition_id out of range: " + partitionId)
+            );
+        }
+
+        final int ownerNode = resolveWriteOwner(partitionId);
 
         if (ownerNode == myNodeId) {
             if (idempotentMode && shouldDropDuplicate(partitionId, key, payload)) return COMPLETED_FUTURE;
             return pipeline(partitionId).submitPublish(correlationId, topic, retries, payload);
         }
 
-        final RemoteBrokerClient ownerClient = clusterNodes.get(ownerNode);
-        if (ownerClient == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("No client for owner " + ownerNode));
-        }
-
         final BrokerApi.Envelope env = buildPublishEnvelope(correlationId, topic, key, payload, partitionId, retries);
-        return forwardWithRetry(ownerClient, env, partitionId, 0);
+        return forwardWithRetry(env, partitionId, 0);
+    }
+
+    public CompletableFuture<Void> publishToPartition(final long correlationId,
+                                                      final String topic,
+                                                      final int partitionId,
+                                                      final com.google.protobuf.ByteString key,
+                                                      final int retries,
+                                                      final com.google.protobuf.ByteString payload) {
+        return publishToPartition(
+                correlationId,
+                topic,
+                partitionId,
+                byteStringToArrayOrNull(key),
+                retries,
+                byteStringToArray(payload)
+        );
+    }
+
+    private boolean isValidPartitionId(final int partitionId) {
+        return partitionId >= 0 && partitionId < totalPartitions;
     }
 
     public void subscribeTopic(final String topic, final String group, final BiConsumer<Long, byte[]> handler) {
         if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
 
-        for (final Map.Entry<Integer, Delivery> entry : deliveryMap.entrySet()) {
-            final int partitionId = entry.getKey();
-            final long committed = Math.max(0L, offsetStore.fetch(topic, group, partitionId));
+        for (final int partitionId : ingressMap.keySet()) {
+            ioExecutor.submit(() -> runSubscriptionLoop(
+                    topic,
+                    group,
+                    partitionId,
+                    handler::accept,
+                    payload -> payload,
+                    (segBuf, payloadPos, payloadLen) -> {
+                        final byte[] payload = new byte[payloadLen];
+                        final var dup = segBuf.duplicate();
+                        dup.position(payloadPos);
+                        dup.get(payload, 0, payloadLen);
+                        return payload;
+                    }
+            ));
+        }
+    }
 
-            entry.getValue().subscribe(committed, (sequence, message) -> {
-                handler.accept(sequence, message);
-                offsetStore.commit(topic, group, partitionId, sequence);
-            });
+    public void subscribeTopicZeroCopy(final String topic,
+                                       final String group,
+                                       final MessageViewHandler handler) {
+        if (!registry.contains(topic)) throw new IllegalArgumentException("Unknown topic: " + topic);
+
+        for (final int partitionId : ingressMap.keySet()) {
+            ioExecutor.submit(() -> runSubscriptionLoop(
+                    topic,
+                    group,
+                    partitionId,
+                    handler::accept,
+                    payload -> ByteBuffer.wrap(payload).asReadOnlyBuffer(),
+                    (segBuf, payloadPos, payloadLen) -> {
+                        final ByteBuffer view = segBuf.duplicate();
+                        view.position(payloadPos);
+                        view.limit(payloadPos + payloadLen);
+                        return view.slice().asReadOnlyBuffer();
+                    }
+            ));
         }
     }
 
@@ -388,9 +476,7 @@ public final class ClusteredIngress {
         return pipeline(s.getPartitionId()).submitSeal(s);
     }
 
-    /**
-     * NEW: async, do NOT block Netty event loop threads.
-     */
+    /** Runs metadata updates asynchronously to keep Netty event loops non-blocking. */
     public CompletableFuture<BrokerApi.ReplicationAck> handleMetadataUpdateAsync(final BrokerApi.MetadataUpdate upd) {
         return pipeline(upd.getPartitionId()).submitMetadataUpdate(upd);
     }
@@ -414,34 +500,36 @@ public final class ClusteredIngress {
 
     private final class PartitionPipeline implements Runnable {
         private static final int OFFER_SPIN_LIMIT = 256;
-        private static final long OFFER_PARK_NANOS = 1_000L; // 1µs backoff when full
+        private static final long OFFER_PARK_NANOS = 1_000L;
+        private static final int FUTURE_ARRAY_POOL_MAX = 64;
 
         private final int pid;
         private final MpscQueue queue;
         private final Thread thread;
 
-        // internal “never block” queue for commit completions (unbounded)
+        // Internal queue for commit completions.
         private final ConcurrentLinkedQueue<Object> internalQ = new ConcurrentLinkedQueue<>();
 
-        // one-item defer slot for the (single) consumer thread (used by batching)
+        // One deferred slot for the pipeline consumer.
         private Object deferred;
 
-        // batch scratch (reused) — never allow 0-length
+        // Batch scratch.
         private final int maxDrain = Math.max(1, Math.min(PIPELINE_MAX_DRAIN, Math.max(1, batchSize)));
         private final byte[][] payloads = new byte[maxDrain][];
         @SuppressWarnings("unchecked")
         private final CompletableFuture<Void>[] publishFuts =
                 (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
+        private final ArrayDeque<CompletableFuture<Void>[]> futureArrayPool = new ArrayDeque<>();
 
-        // replication targets scratch (avoid per-publish allocation)
+        // Replication targets scratch.
         private int[] replicaScratch = new int[Math.max(1, clusterSize)];
 
-        // NEW: in-flight tracking for correctness + backpressure
+        // In-flight tracking for backpressure.
         private final ArrayDeque<PendingBatch> pending = new ArrayDeque<>();
         private int inflightBatches = 0;
         private long inflightBytes = 0;
 
-        // NEW: ensure per-partition replication happens in-order even though it’s off-thread
+        // Keep per-partition replication ordered, even when executed off-thread.
         private CompletableFuture<Void> replTail = COMPLETED_FUTURE;
 
         PartitionPipeline(final int pid, final int capacityPow2) {
@@ -483,20 +571,15 @@ public final class ClusteredIngress {
         }
 
         private boolean enqueueOrFail(final Object task, final CompletableFuture<?> f) {
-            int spins = 0;
-            while (!queue.offer(task)) {
-                if (closed.get() || Thread.currentThread().isInterrupted()) {
-                    f.completeExceptionally(new IllegalStateException("Broker is closed"));
-                    return false;
-                }
-                if (spins++ < OFFER_SPIN_LIMIT) {
-                    Thread.onSpinWait();
-                } else {
-                    spins = 0;
-                    LockSupport.parkNanos(OFFER_PARK_NANOS);
-                }
+            if (closed.get() || Thread.currentThread().isInterrupted()) {
+                f.completeExceptionally(new IllegalStateException("Broker is closed"));
+                return false;
             }
-            return true;
+            if (queue.offer(task)) return true;
+
+            f.completeExceptionally(new RejectedExecutionException(
+                    "Partition pipeline queue full (pid=" + pid + ")"));
+            return false;
         }
 
         CompletableFuture<Void> submitPublish(final long correlationId,
@@ -589,7 +672,7 @@ public final class ClusteredIngress {
                 // Fail pending publish batches
                 PendingBatch pb;
                 while ((pb = pending.pollFirst()) != null) {
-                    pb.fail(stop);
+                    completePendingFailure(pb, stop);
                 }
                 inflightBatches = 0;
                 inflightBytes = 0;
@@ -606,10 +689,13 @@ public final class ClusteredIngress {
 
                 Object in;
                 while ((in = internalQ.poll()) != null) {
-                    if (in instanceof CommitDoneTask cd) {
-                        cd.pending.fail(stop);
+                    if (in instanceof CommitDoneTask) {
+                        // Pending batches were already failed above. Commit callbacks can race
+                        // with shutdown and enqueue duplicate completion notifications here.
+                        // Draining without re-completing avoids double-releasing pooled arrays.
                     }
                 }
+                futureArrayPool.clear();
             }
         }
 
@@ -655,14 +741,42 @@ public final class ClusteredIngress {
             inflightBatches = Math.max(0, inflightBatches - 1);
             inflightBytes = Math.max(0L, inflightBytes - cd.pending.bytes);
 
-            if (cd.error == null) cd.pending.succeed();
-            else cd.pending.fail(unwrap(cd.error));
+            if (cd.error == null) completePendingSuccess(cd.pending);
+            else completePendingFailure(cd.pending, unwrap(cd.error));
         }
 
         private Throwable unwrap(final Throwable t) {
             if (t instanceof CompletionException ce && ce.getCause() != null) return ce.getCause();
             if (t instanceof ExecutionException ee && ee.getCause() != null) return ee.getCause();
             return t;
+        }
+
+        @SuppressWarnings("unchecked")
+        private CompletableFuture<Void>[] acquireFutureArray() {
+            final CompletableFuture<Void>[] arr = futureArrayPool.pollFirst();
+            if (arr != null) return arr;
+            return (CompletableFuture<Void>[]) new CompletableFuture<?>[maxDrain];
+        }
+
+        private void releaseFutureArray(final CompletableFuture<Void>[] arr, final int used) {
+            Arrays.fill(arr, 0, used, null);
+            if (futureArrayPool.size() < FUTURE_ARRAY_POOL_MAX) {
+                futureArrayPool.offerFirst(arr);
+            }
+        }
+
+        private void completePendingSuccess(final PendingBatch pb) {
+            for (int i = 0; i < pb.futureCount; i++) {
+                pb.futures[i].complete(null);
+            }
+            releaseFutureArray(pb.futures, pb.futureCount);
+        }
+
+        private void completePendingFailure(final PendingBatch pb, final Throwable t) {
+            for (int i = 0; i < pb.futureCount; i++) {
+                pb.futures[i].completeExceptionally(t);
+            }
+            releaseFutureArray(pb.futures, pb.futureCount);
         }
 
         private void drainAndProcessPublish(final PublishTask first) {
@@ -687,14 +801,14 @@ public final class ClusteredIngress {
             count++;
 
             while (count < payloads.length) {
-                final Object o = queue.poll(); // IMPORTANT: do not consume deferred here
+                final Object o = queue.poll(); // Do not consume deferred here.
                 if (o == null) break;
 
                 if (!(o instanceof PublishTask p)) {
                     deferOne(o);
                     break;
                 }
-                if (!Objects.equals(topic, p.topic) || retries != p.retries) {
+                if (!topic.equals(p.topic) || retries != p.retries) {
                     deferOne(p);
                     break;
                 }
@@ -755,9 +869,7 @@ public final class ClusteredIngress {
                 final Ingress ing = getOrCreateIngress(pid, epoch);
 
                 // enqueue into ingress queue (fast)
-                for (int i = 0; i < count; i++) {
-                    ing.publishForEpoch(epoch, payloads[i]);
-                }
+                ing.publishBatchForEpoch(epoch, payloads, count);
 
                 // figure replication targets
                 final EpochPlacement placementCache = pe.activePlacement;
@@ -778,12 +890,11 @@ public final class ClusteredIngress {
                     if (id != myNodeId) replicaScratch[rc++] = id;
                 }
 
-                // copy futures for this batch into a stable array (scratch will be cleared)
-                @SuppressWarnings("unchecked")
-                final CompletableFuture<Void>[] futs = (CompletableFuture<Void>[]) new CompletableFuture<?>[count];
+                // copy futures for this batch into a stable pooled array (scratch will be cleared)
+                final CompletableFuture<Void>[] futs = acquireFutureArray();
                 System.arraycopy(publishFuts, 0, futs, 0, count);
 
-                final PendingBatch pb = new PendingBatch(epoch, lastSeq, batchBytes, futs);
+                final PendingBatch pb = new PendingBatch(epoch, lastSeq, batchBytes, futs, count);
                 pending.addLast(pb);
                 inflightBatches++;
                 inflightBytes += batchBytes;
@@ -851,26 +962,24 @@ public final class ClusteredIngress {
         }
     }
 
-    // ---- NEW: pending publish batch ----
+    // Pending publish batch.
     private static final class PendingBatch {
         final long epoch;
         final long lastSeq;
         final long bytes;
         final CompletableFuture<Void>[] futures;
+        final int futureCount;
 
-        PendingBatch(final long epoch, final long lastSeq, final long bytes, final CompletableFuture<Void>[] futures) {
+        PendingBatch(final long epoch,
+                     final long lastSeq,
+                     final long bytes,
+                     final CompletableFuture<Void>[] futures,
+                     final int futureCount) {
             this.epoch = epoch;
             this.lastSeq = lastSeq;
             this.bytes = bytes;
             this.futures = futures;
-        }
-
-        void succeed() {
-            for (final CompletableFuture<Void> f : futures) f.complete(null);
-        }
-
-        void fail(final Throwable t) {
-            for (final CompletableFuture<Void> f : futures) f.completeExceptionally(t);
+            this.futureCount = futureCount;
         }
     }
 
@@ -882,6 +991,12 @@ public final class ClusteredIngress {
     private record OpenEpochTask(BrokerApi.OpenEpochRequest req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record MetadataUpdateTask(BrokerApi.MetadataUpdate req, CompletableFuture<BrokerApi.ReplicationAck> future) {}
     private record CommitDoneTask(PendingBatch pending, Throwable error) {}
+
+    private static final class SubscriptionCommitState {
+        long pendingLsn = Long.MIN_VALUE;
+        int pendingCount = 0;
+        long lastCommitNanos = System.nanoTime();
+    }
 
     /**
      * Low-allocation MPSC ring queue.
@@ -898,8 +1013,8 @@ public final class ClusteredIngress {
         private final long[] sequence;
         private final Object[] buffer;
 
-        private final AtomicLong tail = new AtomicLong(0);
-        private final AtomicLong head = new AtomicLong(0);
+        private final PaddedCounter tail = new PaddedCounter(0L);
+        private final PaddedCounter head = new PaddedCounter(0L);
 
         MpscQueue(final int capacityPow2) {
             if (Integer.bitCount(capacityPow2) != 1) throw new IllegalArgumentException("capacity must be pow2");
@@ -951,11 +1066,41 @@ public final class ClusteredIngress {
             final int idx = (int) (h & mask);
             final Object item = BUF.getAcquire(buffer, idx);
 
-            // IMPORTANT: clear BEFORE making slot available
+            // Clear before making the slot available.
             BUF.setRelease(buffer, idx, null);
             SEQ.setRelease(sequence, idx, h + capacity);
 
             return item;
+        }
+
+        private static final class PaddedCounter {
+            private static final VarHandle VALUE;
+
+            static {
+                try {
+                    VALUE = MethodHandles.lookup().findVarHandle(PaddedCounter.class, "value", long.class);
+                } catch (final ReflectiveOperationException e) {
+                    throw new ExceptionInInitializerError(e);
+                }
+            }
+
+            @SuppressWarnings("unused")
+            private long p1, p2, p3, p4, p5, p6, p7;
+            private volatile long value;
+            @SuppressWarnings("unused")
+            private long q1, q2, q3, q4, q5, q6, q7;
+
+            PaddedCounter(final long initial) {
+                VALUE.setRelease(this, initial);
+            }
+
+            long get() {
+                return (long) VALUE.getVolatile(this);
+            }
+
+            boolean compareAndSet(final long expect, final long update) {
+                return VALUE.compareAndSet(this, expect, update);
+            }
         }
     }
 
@@ -1012,7 +1157,7 @@ public final class ClusteredIngress {
         }
 
         try {
-            ing.publishForEpoch(epoch, a.getPayload().toByteArray());
+            ing.publishForEpoch(epoch, byteStringToArray(a.getPayload()));
         } catch (final Throwable t) {
             return BrokerApi.ReplicationAck.newBuilder()
                     .setStatus(BrokerApi.ReplicationAck.Status.ERROR_PERSISTENCE_FAILED)
@@ -1102,8 +1247,15 @@ public final class ClusteredIngress {
         }
 
         try {
-            for (int i = startIdx; i < n; i++) {
-                ing.publishForEpoch(epoch, payloads.get(i).toByteArray());
+            final int toWrite = n - startIdx;
+            final byte[][] scratch = ensureReplicaAppendScratch(toWrite);
+            try {
+                for (int i = 0; i < toWrite; i++) {
+                    scratch[i] = byteStringToArray(payloads.get(startIdx + i));
+                }
+                ing.publishBatchForEpoch(epoch, scratch, toWrite);
+            } finally {
+                Arrays.fill(scratch, 0, toWrite, null);
             }
         } catch (final Throwable t) {
             return BrokerApi.ReplicationAck.newBuilder()
@@ -1143,16 +1295,25 @@ public final class ClusteredIngress {
                 .build();
     }
 
-    private CompletableFuture<Void> forwardWithRetry(final RemoteBrokerClient client,
-                                                     final BrokerApi.Envelope env,
+    private CompletableFuture<Void> forwardWithRetry(final BrokerApi.Envelope env,
                                                      final int partitionId,
                                                      final int attempt) {
+        final int ownerNode = resolveWriteOwner(partitionId);
+        final RemoteBrokerClient client = clusterNodes.get(ownerNode);
+        if (client == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("No client for owner " + ownerNode));
+        }
+
         final CompletableFuture<Void> result = new CompletableFuture<>();
-        client.sendEnvelopeWithAck(env).whenComplete((ack, err) -> {
+        final long timeoutMs = Math.max(1L, replicator.getTimeoutMillis());
+        final CompletableFuture<BrokerApi.ReplicationAck> send = client.sendEnvelopeWithAck(env);
+
+        send.orTimeout(timeoutMs, TimeUnit.MILLISECONDS).whenComplete((ack, err) -> {
             if (err != null) {
-                if (attempt < 1) {
+                send.cancel(true);
+                if (attempt < FORWARD_MAX_RETRIES) {
                     refreshEpochFromMetadata(partitionId);
-                    forwardWithRetry(client, env, partitionId, attempt + 1).whenComplete((v, e2) -> {
+                    forwardWithRetry(env, partitionId, attempt + 1).whenComplete((v, e2) -> {
                         if (e2 != null) result.completeExceptionally(e2);
                         else result.complete(null);
                     });
@@ -1162,6 +1323,14 @@ public final class ClusteredIngress {
                 return;
             }
             if (ack.getStatus() != BrokerApi.ReplicationAck.Status.SUCCESS) {
+                if (attempt < FORWARD_MAX_RETRIES) {
+                    refreshEpochFromMetadata(partitionId);
+                    forwardWithRetry(env, partitionId, attempt + 1).whenComplete((v, e2) -> {
+                        if (e2 != null) result.completeExceptionally(e2);
+                        else result.complete(null);
+                    });
+                    return;
+                }
                 result.completeExceptionally(new RuntimeException("Forwarding failed: " + ack.getStatus()));
                 return;
             }
@@ -1182,74 +1351,84 @@ public final class ClusteredIngress {
                 final long epoch = em.epoch();
                 if (!em.isSealed()) continue;
                 if (!em.placement().getStorageNodes().contains(myNodeId)) continue;
-                if (ing.getVirtualLog().hasEpoch(epoch)) continue;
 
+                long nextOffset = 0L;
+                if (ing.getVirtualLog().hasEpoch(epoch)) {
+                    final long localHwm = ing.getVirtualLog().forEpoch(epoch).getHighWaterMark();
+                    if (localHwm >= em.endSeq()) {
+                        backfillPlanner.markPresent(pid, epoch);
+                        continue;
+                    }
+                    nextOffset = Math.max(0L, localHwm + 1);
+                }
+
+                boolean done = false;
                 for (final int target : em.placement().getStorageNodesArray()) {
                     if (target == myNodeId) continue;
                     final RemoteBrokerClient client = clusterNodes.get(target);
                     if (client == null) continue;
                     try {
-                        final BrokerApi.Envelope req = BrokerApi.Envelope.newBuilder()
-                                .setBackfill(BrokerApi.BackfillRequest.newBuilder()
-                                        .setPartitionId(pid)
-                                        .setEpoch(epoch)
-                                        .setOffset(0)
-                                        .setMaxBytes(256 * 1024)
-                                        .build())
-                                .build();
-                        final BrokerApi.BackfillReply reply = client.sendBackfill(req).get(5, TimeUnit.SECONDS);
-                        if (!reply.getRedirectNodesList().isEmpty()) continue;
-                        final byte[] payload = reply.getPayload().toByteArray();
-                        if (payload.length == 0) continue;
+                        for (;;) {
+                            final BrokerApi.Envelope req = BrokerApi.Envelope.newBuilder()
+                                    .setBackfill(BrokerApi.BackfillRequest.newBuilder()
+                                            .setPartitionId(pid)
+                                            .setEpoch(epoch)
+                                            .setOffset(nextOffset)
+                                            .setMaxBytes(256 * 1024)
+                                            .build())
+                                    .build();
+                            final BrokerApi.BackfillReply reply = client.sendBackfill(req).get(5, TimeUnit.SECONDS);
+                            if (!reply.getRedirectNodesList().isEmpty()) break;
 
-                        int pos = 0;
-                        int count = 0;
-                        final byte[][] batch = new byte[backfillBatchSize][];
-                        while (pos + Integer.BYTES <= payload.length && count < backfillBatchSize) {
-                            final int len = (payload[pos] & 0xFF) |
-                                    ((payload[pos + 1] & 0xFF) << 8) |
-                                    ((payload[pos + 2] & 0xFF) << 16) |
-                                    ((payload[pos + 3] & 0xFF) << 24);
-                            pos += Integer.BYTES;
-                            if (pos + len > payload.length) break;
-                            final byte[] rec = new byte[len];
-                            System.arraycopy(payload, pos, rec, 0, len);
-                            batch[count++] = rec;
-                            pos += len;
+                            final int count = ing.appendBackfillEncodedBatch(
+                                    epoch,
+                                    reply.getPayload().asReadOnlyByteBuffer(),
+                                    backfillBatchSize
+                            );
+                            if (count > 0) {
+                                nextOffset += count;
+                            }
+
+                            if (reply.getEndOfEpoch()) {
+                                backfillPlanner.markPresent(pid, epoch);
+                                done = true;
+                                break;
+                            }
+
+                            // Avoid tight loops on malformed/empty responses.
+                            if (count == 0) break;
                         }
-                        if (count > 0) {
-                            ing.appendBackfillBatch(epoch, batch, count);
-                            backfillPlanner.markPresent(pid, epoch);
-                        }
-                        if (reply.getEndOfEpoch()) break;
+                        if (done) break;
                     } catch (final Exception ignored) {
                     }
                 }
+                if (done) continue;
             }
         }
     }
 
     private void loadFenceState(final Path partitionDir, final PartitionEpochs pe) {
         try {
-            Files.list(partitionDir)
-                    .filter(p -> p.getFileName().toString().endsWith(".fence"))
-                    .forEach(p -> {
-                        final String name = p.getFileName().toString();
-                        try {
-                            final String epochStr = name.substring("epoch-".length(), name.indexOf(".fence"));
-                            final long epoch = Long.parseLong(epochStr);
-                            final FenceStore.PartitionFence fence = FenceStore.loadEpochFence(partitionDir, epoch);
-                            if (fence != null) {
-                                final PartitionEpochState pes = new PartitionEpochState();
-                                pes.sealed.set(fence.sealed());
-                                pes.sealedEndSeq = fence.sealedEndSeq();
-                                pes.lastSeq.set(fence.lastSeq());
-                                pe.epochFences.put(epoch, pes);
-                                pe.highestSeenEpoch.accumulateAndGet(epoch, Math::max);
+            try (var files = Files.list(partitionDir)) {
+                files.filter(p -> p.getFileName().toString().endsWith(".fence"))
+                        .forEach(p -> {
+                            final String name = p.getFileName().toString();
+                            try {
+                                final String epochStr = name.substring("epoch-".length(), name.indexOf(".fence"));
+                                final long epoch = Long.parseLong(epochStr);
+                                final FenceStore.PartitionFence fence = FenceStore.loadEpochFence(partitionDir, epoch);
+                                if (fence != null) {
+                                    final PartitionEpochState pes = new PartitionEpochState();
+                                    pes.sealed.set(fence.sealed());
+                                    pes.sealedEndSeq = fence.sealedEndSeq();
+                                    pes.lastSeq.set(fence.lastSeq());
+                                    pe.epochFences.put(epoch, pes);
+                                    pe.highestSeenEpoch.accumulateAndGet(epoch, Math::max);
+                                }
+                            } catch (final Exception ignored) {
                             }
-                        } catch (final Exception ignored) {
-                        }
-                    });
+                        });
+            }
         } catch (final IOException ignored) {
         }
     }
@@ -1401,7 +1580,7 @@ public final class ClusteredIngress {
         final int pid = req.getPartitionId();
         final long epoch = req.getEpoch();
         final long offset = req.getOffset();
-        final int maxBytes = Math.max(1, req.getMaxBytes());
+        final int maxBytes = Math.max(1, Math.min(req.getMaxBytes(), MAX_BACKFILL_REPLY_BYTES));
 
         final BrokerApi.BackfillReply.Builder reply = BrokerApi.BackfillReply.newBuilder();
 
@@ -1412,20 +1591,21 @@ public final class ClusteredIngress {
             return reply.build();
         }
 
-        final int[] written = new int[]{0};
-        final byte[][] scratch = new byte[backfillBatchSize][];
+        final byte[] out = ensureBackfillScratch(maxBytes);
+        final int[] encodedBytes = new int[]{0};
         final int[] count = new int[]{0};
 
         ing.fetchEpoch(epoch, offset, backfillBatchSize, (off, segBuf, payloadPos, payloadLen) -> {
-            if (written[0] + payloadLen + Integer.BYTES > maxBytes) return;
-            final byte[] buf = new byte[payloadLen + Integer.BYTES];
-            buf[0] = (byte) (payloadLen);
-            buf[1] = (byte) (payloadLen >>> 8);
-            buf[2] = (byte) (payloadLen >>> 16);
-            buf[3] = (byte) (payloadLen >>> 24);
-            segBuf.position(payloadPos).get(buf, Integer.BYTES, payloadLen);
-            scratch[count[0]++] = buf;
-            written[0] += buf.length;
+            if (count[0] >= backfillBatchSize) return;
+
+            final int frameBytes = Integer.BYTES + payloadLen;
+            if (encodedBytes[0] + frameBytes > maxBytes) return;
+
+            writeLittleEndianInt(out, encodedBytes[0], payloadLen);
+            encodedBytes[0] += Integer.BYTES;
+            segBuf.get(payloadPos, out, encodedBytes[0], payloadLen);
+            encodedBytes[0] += payloadLen;
+            count[0]++;
         });
 
         if (count[0] == 0) {
@@ -1433,18 +1613,8 @@ public final class ClusteredIngress {
             return reply.build();
         }
 
-        int total = 0;
-        for (int i = 0; i < count[0]; i++) total += scratch[i].length;
-        final byte[] out = new byte[total];
-        int pos = 0;
-        for (int i = 0; i < count[0]; i++) {
-            final byte[] src = scratch[i];
-            System.arraycopy(src, 0, out, pos, src.length);
-            pos += src.length;
-        }
-
         final long hwm = ing.getVirtualLog().forEpoch(epoch).getHighWaterMark();
-        reply.setPayload(com.google.protobuf.ByteString.copyFrom(out));
+        reply.setPayload(ByteString.copyFrom(out, 0, encodedBytes[0]));
         reply.setEndOfEpoch(offset + count[0] > hwm);
 
         return reply.build();
@@ -1470,7 +1640,7 @@ public final class ClusteredIngress {
                         new io.ringbroker.ledger.orchestrator.VirtualLog(partDir, (int) segmentCapacity);
                 vLog.discoverOnDisk();
 
-                final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable);
+                final Ingress ingress = Ingress.create(registry, ring, vLog, epoch, batchSize, forceDurable, true);
 
                 deliveryMap.putIfAbsent(pid, new Delivery(ring));
                 if (idempotentMode) {
@@ -1516,6 +1686,191 @@ public final class ClusteredIngress {
         final EpochMetadata meta = cfg.get().epoch(epoch);
         if (meta == null) return Optional.empty();
         return Optional.of(meta.placement().getStorageNodes());
+    }
+
+    private int resolveWriteOwner(final int partitionId) {
+        Optional<LogConfiguration> cfg = metadataStore.current(partitionId);
+        if (cfg.isEmpty()) {
+            try {
+                cfg = Optional.of(bootstrapMetadataIfMissing(partitionId));
+            } catch (final Throwable ignored) {
+            }
+        }
+        if (cfg.isPresent()) {
+            final int[] nodes = cfg.get().activeEpoch().placement().getStorageNodesArray();
+            if (nodes.length > 0) {
+                final int preferred = nodes[0];
+                if (preferred == myNodeId || clusterNodes.containsKey(preferred)) return preferred;
+                for (final int nodeId : nodes) {
+                    if (nodeId == myNodeId || clusterNodes.containsKey(nodeId)) return nodeId;
+                }
+                return preferred;
+            }
+        }
+        return Math.floorMod(partitionId, clusterSize);
+    }
+
+    private LogConfiguration bootstrapMetadataIfMissing(final int partitionId) {
+        final Optional<LogConfiguration> existing = metadataStore.current(partitionId);
+        if (existing.isPresent()) return existing.get();
+
+        final List<Integer> placement = replicaResolver.replicas(partitionId);
+        final EpochPlacement ep = new EpochPlacement(0L, placement, replicator.getAckQuorum());
+        return metadataStore.bootstrapIfAbsent(partitionId, ep, 0L);
+    }
+
+    @FunctionalInterface
+    private interface SubscriptionConsumer<T> {
+        void accept(long lsn, T payload);
+    }
+
+    @FunctionalInterface
+    private interface RingPayloadMapper<T> {
+        T map(byte[] payload);
+    }
+
+    @FunctionalInterface
+    private interface LedgerPayloadMapper<T> {
+        T map(MappedByteBuffer segmentBuffer, int payloadPos, int payloadLen);
+    }
+
+    private <T> void runSubscriptionLoop(final String topic,
+                                         final String group,
+                                         final int partitionId,
+                                         final SubscriptionConsumer<T> consumer,
+                                         final RingPayloadMapper<T> ringMapper,
+                                         final LedgerPayloadMapper<T> ledgerMapper) {
+        long cursor = Math.max(0L, offsetStore.fetch(topic, group, partitionId));
+        if (cursor <= ((1L << 40) - 1)) {
+            cursor = Lsn.encode(0L, cursor);
+        }
+        final long[] nextSeq = new long[1];
+        final SubscriptionCommitState commitState = new SubscriptionCommitState();
+
+        for (;;) {
+            if (closed.get() || Thread.currentThread().isInterrupted()) {
+                flushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                return;
+            }
+            try {
+                final Ingress ing = ingressMap.get(partitionId);
+                if (ing == null) {
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                    LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
+                    continue;
+                }
+
+                refreshEpochFromMetadata(partitionId);
+
+                final long epoch = Lsn.epoch(cursor);
+                final long seq = Lsn.seq(cursor);
+                final PartitionEpochs pe = partitionEpochs(partitionId);
+                final EpochState active = pe.active;
+                final long activeEpoch = (active != null) ? active.epochId : ing.getActiveEpoch();
+
+                if (epoch == activeEpoch && ing.hasRingMapping()) {
+                    final long ringSeq = ing.ringSeqForLedgerSeq(seq);
+                    final long ringCursor = ing.getRing().getCursor();
+                    final long minRingSeq = Math.max(0L, ringCursor - ringSize + 1L);
+
+                    if (ringSeq >= minRingSeq && ringSeq <= ringCursor) {
+                        final byte[] msg = ing.getRing().get(ringSeq);
+                        final long mappedSeq = ing.ledgerSeqForRingSeq(ringSeq);
+                        if (mappedSeq == seq) {
+                            final long lsn = Lsn.encode(epoch, seq);
+                            consumer.accept(lsn, ringMapper.map(msg));
+                            markSubscriptionDelivered(lsn, commitState);
+                            cursor = Lsn.encode(epoch, seq + 1);
+                            maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                            continue;
+                        }
+                    }
+                }
+
+                if (!ing.getVirtualLog().hasEpoch(epoch)) {
+                    final Long nextStart = nextEpochStartSeq(partitionId, epoch);
+                    if (nextStart != null) {
+                        cursor = Lsn.encode(epoch + 1, nextStart);
+                        continue;
+                    }
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                    LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
+                    continue;
+                }
+
+                nextSeq[0] = seq;
+                final int visited = ing.fetchEpoch(epoch, seq, SUBSCRIBE_FETCH_BATCH, (off, segBuf, payloadPos, payloadLen) -> {
+                    final long lsn = Lsn.encode(epoch, off);
+                    consumer.accept(lsn, ledgerMapper.map(segBuf, payloadPos, payloadLen));
+                    markSubscriptionDelivered(lsn, commitState);
+                    nextSeq[0] = off + 1;
+                });
+
+                if (visited > 0) {
+                    cursor = Lsn.encode(epoch, nextSeq[0]);
+                    maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                    continue;
+                }
+
+                final Long nextStart = nextEpochStartSeq(partitionId, epoch);
+                if (nextStart != null) {
+                    cursor = Lsn.encode(epoch + 1, nextStart);
+                    continue;
+                }
+
+                maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
+            } catch (final InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                flushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                return;
+            } catch (final Throwable t) {
+                log.warn("Subscription loop error for topic={} group={} partition={}: {}",
+                        topic, group, partitionId, t.toString());
+                maybeFlushSubscriptionCommit(topic, group, partitionId, commitState, System.nanoTime());
+                LockSupport.parkNanos(SUBSCRIBE_IDLE_NANOS);
+            }
+        }
+    }
+
+    private static void markSubscriptionDelivered(final long lsn, final SubscriptionCommitState state) {
+        state.pendingLsn = lsn;
+        state.pendingCount++;
+    }
+
+    private static boolean shouldFlushSubscriptionCommit(final SubscriptionCommitState state, final long nowNanos) {
+        if (state.pendingCount <= 0) return false;
+        if (state.pendingCount >= SUBSCRIBE_COMMIT_BATCH) return true;
+        return (nowNanos - state.lastCommitNanos) >= SUBSCRIBE_COMMIT_MAX_DELAY_NANOS;
+    }
+
+    private void maybeFlushSubscriptionCommit(final String topic,
+                                              final String group,
+                                              final int partitionId,
+                                              final SubscriptionCommitState state,
+                                              final long nowNanos) {
+        if (!shouldFlushSubscriptionCommit(state, nowNanos)) return;
+        flushSubscriptionCommit(topic, group, partitionId, state, nowNanos);
+    }
+
+    private void flushSubscriptionCommit(final String topic,
+                                         final String group,
+                                         final int partitionId,
+                                         final SubscriptionCommitState state,
+                                         final long nowNanos) {
+        if (state.pendingCount <= 0) return;
+        offsetStore.commit(topic, group, partitionId, state.pendingLsn);
+        state.pendingCount = 0;
+        state.pendingLsn = Long.MIN_VALUE;
+        state.lastCommitNanos = nowNanos;
+    }
+
+    private Long nextEpochStartSeq(final int partitionId, final long epoch) {
+        final Optional<LogConfiguration> cfg = metadataStore.current(partitionId);
+        if (cfg.isEmpty()) return null;
+        final EpochMetadata next = cfg.get().epoch(epoch + 1);
+        if (next == null) return null;
+        return next.startSeq();
     }
 
     private EpochState ensureEpochState(final int partitionId, final long epoch) {
@@ -1666,10 +2021,74 @@ public final class ClusteredIngress {
         }
     }
 
+    private static byte[] byteStringToArray(final com.google.protobuf.ByteString bytes) {
+        if (bytes == null || bytes.isEmpty()) return EMPTY_BYTES;
+        final int len = bytes.size();
+        final byte[] out = new byte[len];
+        bytes.copyTo(out, 0);
+        return out;
+    }
+
+    private static byte[] byteStringToArrayOrNull(final com.google.protobuf.ByteString bytes) {
+        if (bytes == null || bytes.isEmpty()) return null;
+        return byteStringToArray(bytes);
+    }
+
     private long computeMessageId(final int partitionId, final byte[] key, final byte[] payload) {
-        final int keyHash = (key != null ? Arrays.hashCode(key) : 0);
-        final int payloadHash = Arrays.hashCode(payload);
-        final int combined = 31 * keyHash + payloadHash;
-        return (((long) partitionId) << 32) ^ (combined & 0xFFFF_FFFFL);
+        final CRC32C crc = MESSAGE_ID_CRC.get();
+        crc.reset();
+        crcUpdateInt(crc, partitionId);
+
+        if (key != null) {
+            crcUpdateInt(crc, key.length);
+            crc.update(key, 0, key.length);
+        } else {
+            crcUpdateInt(crc, 0);
+        }
+
+        crcUpdateInt(crc, payload.length);
+        crc.update(payload, 0, payload.length);
+
+        return (((long) partitionId) << 32) ^ (crc.getValue() & 0xFFFF_FFFFL);
+    }
+
+    private static void writeLittleEndianInt(final byte[] dst, final int pos, final int value) {
+        dst[pos] = (byte) (value);
+        dst[pos + 1] = (byte) (value >>> 8);
+        dst[pos + 2] = (byte) (value >>> 16);
+        dst[pos + 3] = (byte) (value >>> 24);
+    }
+
+    private static void crcUpdateInt(final CRC32C crc, final int value) {
+        final byte[] scratch = MESSAGE_ID_INT_SCRATCH.get();
+        scratch[0] = (byte) (value);
+        scratch[1] = (byte) (value >>> 8);
+        scratch[2] = (byte) (value >>> 16);
+        scratch[3] = (byte) (value >>> 24);
+        crc.update(scratch, 0, Integer.BYTES);
+    }
+
+    private static byte[] ensureBackfillScratch(final int minSize) {
+        byte[] out = BACKFILL_SCRATCH.get();
+        if (out.length >= minSize) return out;
+        int next = out.length;
+        while (next < minSize) {
+            next <<= 1;
+        }
+        out = new byte[next];
+        BACKFILL_SCRATCH.set(out);
+        return out;
+    }
+
+    private static byte[][] ensureReplicaAppendScratch(final int minSize) {
+        byte[][] scratch = REPLICA_APPEND_SCRATCH.get();
+        if (scratch.length >= minSize) return scratch;
+        int next = scratch.length;
+        while (next < minSize) {
+            next <<= 1;
+        }
+        scratch = new byte[next][];
+        REPLICA_APPEND_SCRATCH.set(scratch);
+        return scratch;
     }
 }

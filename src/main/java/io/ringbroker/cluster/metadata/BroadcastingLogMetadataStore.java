@@ -5,6 +5,7 @@ import io.ringbroker.cluster.client.RemoteBrokerClient;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -23,15 +24,18 @@ public final class BroadcastingLogMetadataStore implements LogMetadataStore {
     private final java.util.function.Supplier<Collection<Integer>> clusterView;
 
     public static LogConfiguration fromProto(final BrokerApi.MetadataUpdate update) {
-        final List<EpochMetadata> epochs = update.getEpochsList().stream()
-                .map(ec -> new EpochMetadata(
-                        ec.getEpoch(),
-                        ec.getStartSeq(),
-                        ec.getEndSeq(),
-                        new EpochPlacement(ec.getEpoch(), ec.getStorageNodesList(), ec.getAckQuorum()),
-                        ec.getTieBreaker()
-                ))
-                .toList();
+        final int size = update.getEpochsCount();
+        final List<EpochMetadata> epochs = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            final BrokerApi.EpochConfig ec = update.getEpochs(i);
+            epochs.add(new EpochMetadata(
+                    ec.getEpoch(),
+                    ec.getStartSeq(),
+                    ec.getEndSeq(),
+                    new EpochPlacement(ec.getEpoch(), ec.getStorageNodesList(), ec.getAckQuorum()),
+                    ec.getTieBreaker()
+            ));
+        }
         return new LogConfiguration(update.getPartitionId(), update.getConfigVersion(), epochs);
     }
 

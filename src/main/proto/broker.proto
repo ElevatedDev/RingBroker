@@ -40,7 +40,7 @@ message Message {
   int32  retries = 2;
   bytes  payload = 3;
   bytes  key = 4;
-  int32  partition_id = 5;
+  optional int32 partition_id = 5;
 }
 
 message PublishReply {

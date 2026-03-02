@@ -3,7 +3,6 @@ package io.ringbroker.cluster.metadata;
 import lombok.Getter;
 import lombok.ToString;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -30,12 +29,16 @@ public final class EpochPlacement {
         }
         this.epoch = epoch;
         this.storageNodes = List.copyOf(storageNodes);
-        this.storageNodesArray = storageNodes.stream().mapToInt(Integer::intValue).toArray();
+        final int size = this.storageNodes.size();
+        this.storageNodesArray = new int[size];
+        for (int i = 0; i < size; i++) {
+            this.storageNodesArray[i] = this.storageNodes.get(i);
+        }
         this.ackQuorum = ackQuorum;
     }
 
     public List<Integer> getStorageNodes() {
-        return Collections.unmodifiableList(storageNodes);
+        return storageNodes;
     }
 
     public int[] getStorageNodesArray() {
