@@ -6,9 +6,7 @@ import lombok.experimental.UtilityClass;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * Highest‑Random‑Weight hashing, stable under membership churn.
@@ -49,18 +47,67 @@ public final class HashingProvider {
     public List<Integer> topN(final int key,
                               final int n,
                               final Collection<Member> members) {
-        final List<Member> persistenceOnly = members.stream()
-                .filter(m -> m.role() == BrokerRole.PERSISTENCE)
-                .toList();
+        if (n <= 0 || members.isEmpty()) {
+            return List.of();
+        }
 
-        final List<Member> candidates = persistenceOnly.isEmpty()
-                ? new ArrayList<>(members) // fallback: no persistence nodes; use all
-                : persistenceOnly;
+        final Member[] candidateBuf = new Member[members.size()];
+        int candidateCount = 0;
 
-        return candidates.stream()
-                .sorted(Comparator.comparingLong(m -> -score(key, m.brokerId())))
-                .limit(n)
-                .map(Member::brokerId)
-                .collect(Collectors.toList());
+        for (final Member m : members) {
+            if (m.role() == BrokerRole.PERSISTENCE) {
+                candidateBuf[candidateCount++] = m;
+            }
+        }
+
+        if (candidateCount == 0) {
+            for (final Member m : members) {
+                candidateBuf[candidateCount++] = m;
+            }
+        }
+
+        final int limit = Math.min(n, candidateCount);
+        final int[] bestIds = new int[limit];
+        final long[] bestScores = new long[limit];
+        int bestCount = 0;
+
+        for (int i = 0; i < candidateCount; i++) {
+            final int brokerId = candidateBuf[i].brokerId();
+            final long s = score(key, brokerId);
+
+            int insertAt = bestCount;
+            while (insertAt > 0) {
+                final int prev = insertAt - 1;
+                final long prevScore = bestScores[prev];
+                final int prevId = bestIds[prev];
+
+                final boolean shouldShift =
+                        s > prevScore || (s == prevScore && brokerId < prevId);
+                if (!shouldShift) break;
+                insertAt--;
+            }
+
+            if (insertAt >= limit) {
+                continue;
+            }
+
+            final int upper = Math.min(bestCount, limit - 1);
+            for (int j = upper; j > insertAt; j--) {
+                bestScores[j] = bestScores[j - 1];
+                bestIds[j] = bestIds[j - 1];
+            }
+
+            bestScores[insertAt] = s;
+            bestIds[insertAt] = brokerId;
+            if (bestCount < limit) {
+                bestCount++;
+            }
+        }
+
+        final ArrayList<Integer> out = new ArrayList<>(bestCount);
+        for (int i = 0; i < bestCount; i++) {
+            out.add(bestIds[i]);
+        }
+        return out;
     }
 }

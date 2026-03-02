@@ -4,7 +4,7 @@ import io.ringbroker.core.barrier.Barrier;
 import io.ringbroker.core.sequence.Sequence;
 
 /**
- * Spins briefly, then blocks on the Barrier’s condition to reduce CPU burn.
+ * Spins briefly, then blocks on the barrier condition to reduce CPU burn.
  */
 public final class AdaptiveSpin implements WaitStrategy {
     private static final int SPIN_LIMIT = 1000;
@@ -15,11 +15,14 @@ public final class AdaptiveSpin implements WaitStrategy {
         int counter = 0;
         long available;
         while ((available = cursor.getValue()) < seq) {
+            if (barrier.isAlerted()) {
+                throw new RuntimeException("Consumer alerted");
+            }
             if (counter < SPIN_LIMIT) {
                 Thread.onSpinWait();
             } else {
-                barrier.block();    // park on barrier’s condition
-                counter = 0;        // reset spinning after wake
+                barrier.block(seq);
+                counter = 0;
             }
             counter++;
         }

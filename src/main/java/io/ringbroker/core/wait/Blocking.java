@@ -20,7 +20,7 @@ public final class Blocking implements WaitStrategy {
             if (barrier.isAlerted()) {
                 throw new RuntimeException("Consumer alerted");
             }
-            barrier.block(); // wait on the barrier's condition
+            barrier.block(seq);
         }
         return available;
     }

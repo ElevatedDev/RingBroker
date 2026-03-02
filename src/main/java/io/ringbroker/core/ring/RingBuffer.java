@@ -120,6 +120,24 @@ public final class RingBuffer<E> {
     }
 
     /**
+     * Publish a batch when the caller is the only publisher for this ring.
+     * Skips inter-publisher ordering spin because there is no concurrent publisher.
+     */
+    @SuppressWarnings("unchecked")
+    public void publishBatchSingleProducer(final long endSeq, final int count, final E[] batch) {
+        final Object[] localEntries = this.entries;
+        final int m = this.mask;
+
+        long seq = endSeq - count + 1;
+        for (int i = 0; i < count; i++, seq++) {
+            ARRAY_HANDLE.setRelease(localEntries, (int) (seq & m), batch[i]);
+        }
+
+        cursor.setValue(endSeq);
+        barrier.signal();
+    }
+
+    /**
      * Retrieve an entry, blocking until it’s published.
      *
      * @param seq the sequence to retrieve (≤ published cursor)
@@ -142,10 +160,11 @@ public final class RingBuffer<E> {
 
 final class PaddedSequence {
     private final AtomicLong value;
-    // 7 longs of pre‐padding
+
+    // 7 longs of pre-padding
     @SuppressWarnings("unused")
     private long p1, p2, p3, p4, p5, p6, p7;
-    // 7 longs of post‐padding
+    // 7 longs of post-padding
     @SuppressWarnings("unused")
     private long p8, p9, p10, p11, p12, p13, p14;
 
@@ -157,7 +176,7 @@ final class PaddedSequence {
      * Atomically increments by one and returns the updated value.
      */
     public long incrementAndGet() {
-        return value.incrementAndGet();
+        return addAndGet(1L);
     }
 
     /**
